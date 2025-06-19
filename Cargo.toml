@@ -12,14 +12,14 @@ categories = ["api-bindings", "multimedia::audio"]
 
 [dependencies]
 easer = "0.3"
-ferrous-opencc = "*"
+ferrous-opencc = "0"
 log = "0"
 once_cell = "1"
 rubato = "0.16"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 
-windows = { git = "https://github.com/microsoft/windows-rs.git", tag = "66", features = [
+windows = { version = "0.61", features = [
     "Media_Control",
     "Storage_Streams",
     "Win32_Media_Audio",
@@ -31,4 +31,8 @@ windows = { git = "https://github.com/microsoft/windows-rs.git", tag = "66", fea
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",
 ]}
+windows-future = { version = "0.2" }
+
+[patch.crates-io]
+windows = { git = "https://github.com/microsoft/windows-rs.git", tag = "66" }
 windows-future = { git = "https://github.com/microsoft/windows-rs.git", tag = "66" }
