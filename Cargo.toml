@@ -1,17 +1,22 @@
 [package]
 name = "smtc-suite"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2024"
 authors = ["apoint123 <vpnzaph@outlook.com>"]
 description = "一个用于与 Windows 系统媒体控件 (SMTC) 和系统音频进行交互的 Rust 库。"
+documentation = "https://docs.rs/crate/smtc-suite"
 license = "MIT"
 repository = "https://github.com/apoint123/smtc-suite"
 readme = "README.md"
 keywords = ["windows", "smtc", "audio", "media-control", "wasapi"]
 categories = ["api-bindings", "multimedia::audio"]
 
+[lib]
+crate-type = ["cdylib", "staticlib", "rlib"]
+
 [dependencies]
 easer = "0.3"
+env_logger = "0.11.8"
 ferrous-opencc = "0"
 log = "0"
 once_cell = "1"
@@ -33,6 +38,5 @@ windows = { version = "0.61", features = [
 ]}
 windows-future = { version = "0.2" }
 
-[patch.crates-io]
-windows = { git = "https://github.com/microsoft/windows-rs.git", tag = "66" }
-windows-future = { git = "https://github.com/microsoft/windows-rs.git", tag = "66" }
+[build-dependencies]
+cbindgen = "0.29.0"

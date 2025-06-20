@@ -1,0 +1,20 @@
+language = "C"
+include_guard = "SMTC_SUITE_H"
+pragma_once = true
+
+[export]
+include = [
+    "CControlCommandType",
+    "ControlCommandData",
+    "CSmtcControlCommand",
+    "CUpdateType",
+    "CNowPlayingInfo",
+    "CSessionInfo",
+    "CSessionList",
+    "CAudioDataPacket",
+    "CVolumeChangedEvent",
+]
+
+[parse]
+parse_deps = true
+include = ["smtc-suite"]

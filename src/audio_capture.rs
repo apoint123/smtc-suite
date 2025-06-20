@@ -9,27 +9,15 @@ use std::{
 };
 
 use rubato::{
-    Resampler,
-    SincFixedIn,
-    SincInterpolationParameters,
-    SincInterpolationType,
-    WindowFunction,
+    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
 use windows::{
     Win32::{
         Media::{
             Audio::{
-                AUDCLNT_BUFFERFLAGS_SILENT,
-                AUDCLNT_SHAREMODE_SHARED,
-                AUDCLNT_STREAMFLAGS_LOOPBACK,
-                IAudioCaptureClient,
-                IAudioClient,
-                IMMDeviceEnumerator,
-                MMDeviceEnumerator,
-                WAVEFORMATEX,
-                WAVEFORMATEXTENSIBLE,
-                eConsole,
-                eRender,
+                AUDCLNT_BUFFERFLAGS_SILENT, AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_LOOPBACK,
+                IAudioCaptureClient, IAudioClient, IMMDeviceEnumerator, MMDeviceEnumerator,
+                WAVEFORMATEX, WAVEFORMATEXTENSIBLE, eConsole, eRender,
             },
             KernelStreaming::WAVE_FORMAT_EXTENSIBLE,
             Multimedia::{
@@ -40,10 +28,7 @@ use windows::{
         },
         System::{
             Com::{
-                CLSCTX_INPROC_SERVER,
-                COINIT_APARTMENTTHREADED,
-                CoCreateInstance,
-                CoInitializeEx,
+                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
                 CoUninitialize,
             },
             Threading::AvSetMmThreadCharacteristicsW,

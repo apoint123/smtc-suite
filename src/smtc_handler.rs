@@ -367,64 +367,48 @@ async fn volume_easing_task(
         "[音量缓动任务][ID:{task_id}] 启动。目标音量: {target_vol:.2}，会话: '{session_id}'"
     );
 
-    if let Some(pid) = volume_control::get_pid_from_identifier(&session_id) {
-        if let Ok(Ok((initial_vol, _))) =
-            tokio::task::spawn_blocking(move || volume_control::get_process_volume_by_pid(pid))
-                .await
-        {
-            if (target_vol - initial_vol).abs() < VOLUME_EASING_THRESHOLD {
-                let _ = tokio::task::spawn_blocking(move || {
-                    volume_control::set_process_volume_by_pid(pid, Some(target_vol), None)
-                })
-                .await;
-                return;
-            }
+    if let Ok((initial_vol, _)) = volume_control::get_volume_for_identifier(&session_id) {
+        if (target_vol - initial_vol).abs() < VOLUME_EASING_THRESHOLD {
+            let _ = volume_control::set_volume_for_identifier(&session_id, Some(target_vol), None);
+            return;
+        }
 
-            log::trace!("[音量缓动任务][ID:{task_id}] 初始音量: {initial_vol:.2}");
-            let animation_duration_ms = VOLUME_EASING_DURATION_MS;
-            let steps = VOLUME_EASING_STEPS;
-            let step_duration =
-                TokioDuration::from_millis((animation_duration_ms / steps as f32) as u64);
+        log::trace!("[音量缓动任务][ID:{task_id}] 初始音量: {initial_vol:.2}");
+        let animation_duration_ms = VOLUME_EASING_DURATION_MS;
+        let steps = VOLUME_EASING_STEPS;
+        let step_duration =
+            TokioDuration::from_millis((animation_duration_ms / steps as f32) as u64);
 
-            for s in 0..=steps {
-                let current_time = (s as f32 / steps as f32) * animation_duration_ms;
-                let change_in_vol = target_vol - initial_vol;
-                let current_vol = easer::functions::Quad::ease_out(
-                    current_time,
-                    initial_vol,
-                    change_in_vol,
-                    animation_duration_ms,
-                );
+        for s in 0..=steps {
+            let current_time = (s as f32 / steps as f32) * animation_duration_ms;
+            let change_in_vol = target_vol - initial_vol;
+            let current_vol = easer::functions::Quad::ease_out(
+                current_time,
+                initial_vol,
+                change_in_vol,
+                animation_duration_ms,
+            );
 
-                let set_res = tokio::task::spawn_blocking(move || {
-                    volume_control::set_process_volume_by_pid(pid, Some(current_vol), None)
-                })
-                .await;
-
-                if set_res.is_err() || set_res.as_ref().unwrap().is_err() {
-                    log::warn!("[音量缓动任务][ID:{task_id}] 设置音量失败，任务中止。");
-                    break;
-                }
-                tokio::time::sleep(step_duration).await;
-            }
-
-            // 任务结束后，获取最终的音量状态并报告
-            if let Ok(Ok((final_vol, final_mute))) =
-                tokio::task::spawn_blocking(move || volume_control::get_process_volume_by_pid(pid))
-                    .await
+            if volume_control::set_volume_for_identifier(&session_id, Some(current_vol), None)
+                .is_err()
             {
-                log::debug!("[音量缓动任务][ID:{task_id}] 完成。最终音量: {final_vol:.2}");
-                let _ = connector_tx.send(InternalUpdate::AudioSessionVolumeChanged {
-                    session_id,
-                    volume: final_vol,
-                    is_muted: final_mute,
-                });
+                log::warn!("[音量缓动任务][ID:{task_id}] 设置音量失败，任务中止。");
+                break;
             }
-        } else {
-            log::warn!("[音量缓动任务][ID:{task_id}] 无法获取初始音量，任务中止。");
+            tokio::time::sleep(step_duration).await;
+        }
+
+        if let Ok((final_vol, final_mute)) = volume_control::get_volume_for_identifier(&session_id)
+        {
+            log::debug!("[音量缓动任务][ID:{task_id}] 完成。最终音量: {final_vol:.2}");
+            let _ = connector_tx.send(InternalUpdate::AudioSessionVolumeChanged {
+                session_id,
+                volume: final_vol,
+                is_muted: final_mute,
+            });
         }
     } else {
-        log::warn!("[音量缓动任务][ID:{task_id}] 无法从会话ID '{session_id}' 获取PID，任务中止。");
+        log::warn!("[音量缓动任务][ID:{task_id}] 无法获取初始音量，任务中止。");
     }
 }
 
@@ -465,7 +449,7 @@ fn handle_sessions_changed(
             sessions_info_list.push(SmtcSessionInfo {
                 source_app_user_model_id: id_str.clone(),
                 session_id: id_str.clone(),
-                display_name: id_str.split('!').next_back().unwrap_or(&id_str).to_string(),
+                display_name: crate::utils::get_display_name_from_smtc_id(&id_str),
             });
             session_candidates.push((id_str, s.clone()));
         }
@@ -564,8 +548,8 @@ fn handle_sessions_changed(
             state.current_listener_tokens = Some(tokens);
             state.current_monitored_session = Some(new_s);
 
-            // 切换后立即获取一次全量信息，确保UI快速更新
-            log::info!("[会话处理器] 会话切换完成，立即获取初始状态。");
+            // 切换后立即获取一次所有信息，确保UI快速更新
+            log::info!("[会话处理器] 会话切换完成，正在获取所有初始状态。");
             let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
             let _ = smtc_event_tx.try_send(SmtcEventSignal::PlaybackInfo);
             let _ = smtc_event_tx.try_send(SmtcEventSignal::TimelineProperties);
@@ -742,7 +726,7 @@ pub fn run_smtc_listener(
             AsyncTaskResult::ManagerReady,
         );
 
-        log::info!("[SMTC 主循环] 进入 select! 事件循环...");
+        log::debug!("[SMTC 主循环] 进入 select! 事件循环...");
 
         // 8. 核心事件循环
         loop {
@@ -949,8 +933,19 @@ pub fn run_smtc_listener(
                             let artist = get_prop_string(props.Artist(), "Artist");
                             let album = get_prop_string(props.AlbumTitle(), "AlbumTitle");
 
+                            const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
+                            let is_placeholder_title = IGNORED_TITLES.iter().any(|&ignored| title == ignored);
+
                             // 更新文本信息
-                            let update_fn = Box::new(move |state: &mut SharedPlayerState| { state.title = title; state.artist = artist; state.album = album; });
+                            let update_fn = Box::new(move |state: &mut SharedPlayerState| {
+                                if !is_placeholder_title {
+                                    log::trace!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist, &title);
+                                    state.title = title;
+                                    state.artist = artist;
+                                    state.album = album;
+                                }
+                            });
+
                             match state_update_tx.try_send(update_fn) {
                                 Ok(_) => {} // 发送成功
                                 Err(TrySendError::Full(_)) => {

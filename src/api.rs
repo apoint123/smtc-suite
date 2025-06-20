@@ -61,6 +61,35 @@ pub enum SmtcControlCommand {
     SetVolume(f32),
 }
 
+/// C-ABI 兼容的命令类型标签。
+#[repr(C)]
+#[allow(dead_code)]
+pub enum CControlCommandType {
+    Pause,
+    Play,
+    SkipNext,
+    SkipPrevious,
+    SeekTo,
+    SetVolume,
+}
+
+/// C-ABI 兼容的联合体，用于存放不同命令的数据。
+#[repr(C)]
+pub union ControlCommandData {
+    pub seek_to_ms: u64,
+    pub volume_level: f32,
+}
+
+/// C-ABI 兼容的、完整的控制命令结构体。
+/// 这个结构体可以安全地在 C 和 Rust 之间传递。
+#[repr(C)]
+pub struct CSmtcControlCommand {
+    /// 命令的类型
+    pub command_type: CControlCommandType,
+    /// 命令关联的数据
+    pub data: ControlCommandData,
+}
+
 /// 发送给媒体库后台服务的命令。
 ///
 /// 这是与媒体库交互的主要方式，由 `MediaController` 发送。

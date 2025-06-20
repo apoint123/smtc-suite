@@ -1,9 +1,6 @@
 use thiserror::Error;
 
 /// 定义库的统一错误枚举。
-///
-/// 使用 `thiserror` 宏可以方便地为每个错误变体自动派生 `Display` 和 `Error` trait 的实现。
-/// `#[from]` 属性使得底层的错误类型可以被 `?` 操作符自动转换为此枚举的相应变体。
 #[derive(Debug, Error)]
 pub enum SmtcError {
     /// 无法启动后台工作线程。

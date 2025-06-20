@@ -14,6 +14,7 @@ use crate::{
     error::{Result, SmtcError},
     smtc_handler::{self, SharedPlayerState},
 };
+
 /// 在 `MediaWorker` 内部使用的命令，用于控制其子模块。
 ///
 /// 这个枚举定义了 `MediaWorker` 与其管理的后台任务（如 `smtc_handler`）之间的通信协议。
@@ -99,7 +100,7 @@ impl MediaWorker {
         command_rx_from_app: StdReceiver<MediaCommand>,
         update_tx_to_app: StdSender<MediaUpdate>,
     ) -> Result<()> {
-        log::info!("[MediaWorker] 媒体服务工作线程正在启动...");
+        log::info!("[MediaWorker] Worker 正在启动...");
 
         // 1. 创建 Tokio 运行时和 LocalSet。
         // LocalSet 对于运行那些不是 `Send` 的 Future 至关重要，例如与 Windows COM/WinRT 交互的任务。
@@ -126,8 +127,17 @@ impl MediaWorker {
         // 桥接：外部命令 (std) -> 内部事件循环 (tokio)
         rt_clone_for_bridges.spawn(async move {
             while let Ok(cmd) = command_rx_from_app.recv() {
+                // 检查命令是否为 Shutdown，以便我们可以主动退出循环
+                let is_shutdown = matches!(cmd, MediaCommand::Shutdown);
+
                 if command_tx_async.send(cmd).await.is_err() {
                     log::error!("[桥接任务-主命令] 无法将命令发送至异步通道，接收端可能已关闭。");
+                    break;
+                }
+
+                // 如果我们刚刚发送的是 Shutdown 命令，那么我们的任务也完成了，退出循环。
+                if is_shutdown {
+                    log::debug!("[桥接任务-主命令] 收到并转发了关闭命令，任务即将结束。");
                     break;
                 }
             }
@@ -162,22 +172,25 @@ impl MediaWorker {
         // 5. 启动所有子系统。
         worker_instance.start_smtc_handler_thread(smtc_control_rx_sync, smtc_update_tx_sync);
 
-        log::info!("[MediaWorker] 初始化完成，即将进入核心异步事件循环。");
+        log::debug!("[MediaWorker] 初始化完成，即将进入核心异步事件循环。");
 
         // 6. 使用 `block_on` 在当前线程上驱动异步主循环，直到它完成。
         //    使用 `async move` 将 `worker_instance` 的所有权移入闭包，以解决借用冲突。
         local_set.block_on(&tokio_runtime, async move {
             worker_instance.main_event_loop().await;
+
+            // 在事件循环结束后，但在函数返回之前，显式地关闭所有子系统。
+            log::trace!("[MediaWorker] 核心事件循环已退出，正在执行清理...");
+            worker_instance.shutdown_all_subsystems();
         });
 
-        log::info!("[MediaWorker] 核心事件循环已退出，工作线程即将终止。");
+        log::trace!("[MediaWorker] 核心事件循环已退出，工作线程即将终止。");
         Ok(())
     }
 
     /// `MediaWorker` 的核心异步事件循环。
     ///
     /// 使用 `tokio::select!` 宏以非阻塞方式高效地等待来自所有来源的事件。
-    /// 当没有事件发生时，此循环会使线程进入休眠状态，CPU 占用率接近零，从而实现高效的事件驱动架构。
     async fn main_event_loop(&mut self) {
         loop {
             tokio::select! {
@@ -190,7 +203,7 @@ impl MediaWorker {
                     log::trace!("[MediaWorker] 收到外部命令: {command:?}");
                     // 立即处理 Shutdown 命令以跳出循环
                     if let MediaCommand::Shutdown = command {
-                        log::info!("[MediaWorker] 收到外部关闭命令，准备退出...");
+                        log::debug!("[MediaWorker] 收到外部关闭命令，准备退出...");
                         break;
                     }
                     self.handle_command_from_app(command);
@@ -243,14 +256,13 @@ impl MediaWorker {
                 self.stop_audio_capture_internal();
             }
             MediaCommand::Shutdown => {
-                // 此命令已在 `select!` 循环中被优先处理，这里仅作穷举匹配，不会被执行。
+                // 已在上面循环中优先处理
             }
         }
     }
 
     /// 辅助函数，用于处理来自子模块的内部更新，并将其转换为公共更新发送出去。
     fn handle_internal_update(&mut self, internal_update: InternalUpdate, source: &str) {
-        // 使用 .into() (由 From trait 提供) 进行转换，代码更简洁、更符合惯例。
         let public_update: MediaUpdate = internal_update.into();
 
         if self.update_tx.send(public_update).is_err() {
@@ -307,7 +319,16 @@ impl MediaWorker {
 
     /// 优雅地停止 SMTC 处理程序线程。
     fn stop_smtc_handler_thread(&mut self) {
-        // 1. 发送关闭信号
+        // 1. **首先 drop 掉控制通道的发送端。**
+        //    `take()` 会将 `Some(sender)` 变为 `None`，这个 sender 随即被 drop。
+        //    一旦所有 sender (这里只有一个) 都被 drop，`smtc_handler` 中桥接任务的
+        //    `control_rx.recv()` 就会立即返回 `Err(Disconnected)`，从而让桥接任务退出。
+        if self.smtc_control_tx.take().is_some() {
+            log::debug!("[MediaWorker] SMTC 控制通道已清理，这将通知桥接任务退出。");
+        }
+
+        // 2. 发送明确的关闭信号。
+        //    这会让 smtc_handler 的主 select! 循环退出。
         if let Some(tx) = self.smtc_shutdown_tx.take() {
             log::debug!("[MediaWorker] 正在向 SMTC 处理器发送关闭信号...");
             if tx.send(()).is_err() {
@@ -315,7 +336,9 @@ impl MediaWorker {
             }
         }
 
-        // 2. 等待线程结束
+        // 3. **最后再 join 线程。**
+        //    此时，smtc_handler 的主循环和所有桥接任务都收到了退出信号或通道已关闭，
+        //    它们都可以顺利地结束，所以 join() 不会再被阻塞。
         if let Some(handle) = self.smtc_handler_thread_handle.take() {
             log::debug!("[MediaWorker] 正在等待 SMTC Handler 线程退出...");
             match handle.join() {
@@ -323,9 +346,6 @@ impl MediaWorker {
                 Err(e) => log::warn!("[MediaWorker] 等待 SMTC Handler 线程退出失败: {e:?}"),
             }
         }
-
-        // 3. 清理控制通道
-        self.smtc_control_tx.take();
     }
 
     /// 启动音频捕获子系统。
@@ -339,7 +359,7 @@ impl MediaWorker {
         // 为音频捕获创建专用的 std 通道，并桥接到异步世界
         let (audio_update_tx_sync, audio_update_rx_sync) = std::sync::mpsc::channel();
         let (audio_update_tx_async, audio_update_rx_async) =
-            tokio::sync::mpsc::channel::<InternalUpdate>(256); // 音频数据包可能很多，缓冲区大一些
+            tokio::sync::mpsc::channel::<InternalUpdate>(256);
 
         let rt_clone = self.tokio_runtime.clone();
         rt_clone.spawn(async move {
@@ -391,11 +411,13 @@ impl MediaWorker {
 
 /// `MediaWorker` 的 `Drop` 实现。
 ///
-/// 这是一个安全保障，确保即使 `MediaWorker` 的实例因为 panic 等意外情况被丢弃时，
+/// 这是一个安全保障，确保即使 `MediaWorker` 的实例因为意外情况被丢弃时，
 /// 其管理的子系统也能被尝试关闭，防止线程泄漏。
 impl Drop for MediaWorker {
     fn drop(&mut self) {
-        log::trace!("[MediaWorker] 正在丢弃 MediaWorker 实例，确保关闭子系统...");
+        log::warn!(
+            "[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)，正在关闭所有子系统..."
+        );
         self.shutdown_all_subsystems();
     }
 }
@@ -419,7 +441,6 @@ pub(crate) fn start_media_worker_thread(
                 log::error!("[MediaWorker Thread] Worker 运行失败: {e}");
             }
         })
-        // 将线程创建错误映射到我们的自定义错误类型。
         .map_err(|e| SmtcError::WorkerThread(e.to_string()))
 }
 
