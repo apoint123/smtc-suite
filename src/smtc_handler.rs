@@ -8,6 +8,7 @@ use std::{
 };
 
 use easer::functions::Easing;
+use ferrous_opencc::OpenCC;
 use tokio::{
     sync::{
         Mutex as TokioMutex,
@@ -24,6 +25,7 @@ use windows::{
         GlobalSystemMediaTransportControlsSessionMediaProperties,
         GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     },
+    Media::MediaPlaybackAutoRepeatMode,
     Storage::Streams::{
         Buffer, DataReader, IRandomAccessStreamReference, IRandomAccessStreamWithContentType,
         InputStreamOptions,
@@ -40,9 +42,8 @@ use windows::{
 use windows_future::IAsyncOperation;
 
 use crate::{
-    api::{NowPlayingInfo, SmtcControlCommand, SmtcSessionInfo},
+    api::{NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo, TextConversionMode},
     error::Result,
-    utils::convert_traditional_to_simplified,
     volume_control,
     worker::{InternalCommand, InternalUpdate},
 };
@@ -92,6 +93,10 @@ pub(crate) struct SharedPlayerState {
     pub can_skip_previous: bool,
     /// SMTC 报告是否支持跳转操作。
     pub can_seek: bool,
+    /// 当前是否处于随机播放模式。
+    pub is_shuffle_active: bool,
+    /// 当前的重复播放模式。
+    pub repeat_mode: RepeatMode,
     /// 封面图片数据。
     pub cover_data: Option<Vec<u8>>,
     /// 封面图片数据的哈希值。
@@ -132,6 +137,8 @@ impl From<&SharedPlayerState> for NowPlayingInfo {
             duration_ms: Some(state.song_duration_ms),
             position_ms: Some(state.get_estimated_current_position_ms()),
             is_playing: Some(state.is_playing),
+            is_shuffle_active: Some(state.is_shuffle_active),
+            repeat_mode: Some(state.repeat_mode),
             cover_data: state.cover_data.clone(),
             cover_data_hash: state.cover_data_hash,
             position_report_time: state.last_known_position_report_time,
@@ -203,6 +210,10 @@ struct SmtcState {
     current_listener_tokens: Option<(i64, i64, i64)>,
     /// 用户通过 `SelectSession` 命令指定的目标会话 ID。
     target_session_id: Option<String>,
+    /// 当前的文本转换模式。
+    text_conversion_mode: TextConversionMode,
+    /// 根据当前模式创建的 OpenCC 转换器实例。
+    text_converter: Option<OpenCC>,
     /// 当前活动的音量缓动任务的句柄。
     active_volume_easing_task: Option<JoinHandle<()>>,
     /// 当前活动的封面获取任务的句柄。
@@ -220,6 +231,8 @@ impl SmtcState {
             current_monitored_session: None,
             current_listener_tokens: None,
             target_session_id: None,
+            text_conversion_mode: TextConversionMode::default(),
+            text_converter: None,
             active_volume_easing_task: None,
             active_cover_fetch_task: None,
             next_easing_task_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -743,6 +756,37 @@ pub fn run_smtc_listener(
                 Some(command) = control_rx_async.recv() => {
                     log::debug!("[SMTC 主循环] 收到外部命令: {command:?}");
                     match command {
+                        InternalCommand::SetTextConversion(mode) => {
+                            if state.text_conversion_mode != mode {
+                                log::info!("[SMTC 主循环] 切换文本转换模式 -> {mode:?}");
+                                state.text_conversion_mode = mode;
+
+                                // 根据模式名称获取 OpenCC 配置文件名
+                                let config_name = match mode {
+                                    TextConversionMode::Off => None,
+                                    TextConversionMode::TraditionalToSimplified => Some("t2s.json"),
+                                    TextConversionMode::SimplifiedToTraditional => Some("s2t.json"),
+                                    TextConversionMode::SimplifiedToTaiwan => Some("s2tw.json"),
+                                    TextConversionMode::TaiwanToSimplified => Some("tw2s.json"),
+                                    TextConversionMode::SimplifiedToHongKong => Some("s2hk.json"),
+                                    TextConversionMode::HongKongToSimplified => Some("hk2s.json"),
+                                };
+
+                                // 创建新的转换器实例
+                                state.text_converter = config_name.and_then(|name| {
+                                    match OpenCC::from_config_name(name) {
+                                        Ok(converter) => Some(converter),
+                                        Err(e) => {
+                                            log::error!("[SMTC 主循环] 加载 OpenCC 配置 '{name}' 失败: {e}");
+                                            None
+                                        }
+                                    }
+                                });
+
+                                // 触发一次属性更新，以使用新的转换器重新转换当前显示的文本
+                                let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
+                            }
+                        },
                         InternalCommand::SelectSmtcSession(id) => {
                             let new_target = if id.is_empty() { None } else { Some(id) };
                             log::info!("[SMTC 主循环] 切换目标会话 -> {new_target:?}");
@@ -750,43 +794,66 @@ pub fn run_smtc_listener(
                             let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
                         }
                         InternalCommand::MediaControl(media_cmd) => {
-                             if let Some(session) = &state.current_monitored_session {
-                                log::debug!("[SMTC 主循环] 正在执行媒体控制指令: {media_cmd:?}");
-                                match media_cmd {
-                                    SmtcControlCommand::SetVolume(level) => {
-                                        if let Ok(id_hstr) = session.SourceAppUserModelId() {
-                                            let session_id_str = hstring_to_string(&id_hstr);
-                                            if !session_id_str.is_empty() {
-                                                if let Some(old_task) = state.active_volume_easing_task.take() {
-                                                    old_task.abort();
-                                                }
-                                                let task_id = state.next_easing_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                                state.active_volume_easing_task = Some(tokio::task::spawn_local(
-                                                    volume_easing_task(
-                                                        task_id,
-                                                        level,
-                                                        session_id_str,
-                                                        connector_update_tx.clone()
-                                                    )
-                                                ));
+                            let Some(session) = &state.current_monitored_session else {
+                                continue;
+                            };
+                            log::debug!("[SMTC 主循环] 正在执行媒体控制指令: {media_cmd:?}");
+                            match media_cmd {
+                                SmtcControlCommand::SetVolume(level) => {
+                                    if let Ok(id_hstr) = session.SourceAppUserModelId() {
+                                        let session_id_str = hstring_to_string(&id_hstr);
+                                        if !session_id_str.is_empty() {
+                                            if let Some(old_task) = state.active_volume_easing_task.take() {
+                                                old_task.abort();
                                             }
+                                            let task_id = state.next_easing_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                            state.active_volume_easing_task = Some(tokio::task::spawn_local(
+                                                volume_easing_task(
+                                                    task_id,
+                                                    level,
+                                                    session_id_str,
+                                                    connector_update_tx.clone()
+                                                )
+                                            ));
                                         }
                                     }
-                                    other_cmd => {
-                                        let async_op = match other_cmd {
-                                            SmtcControlCommand::Play => session.TryPlayAsync(),
-                                            SmtcControlCommand::Pause => session.TryPauseAsync(),
-                                            SmtcControlCommand::SkipNext => session.TrySkipNextAsync(),
-                                            SmtcControlCommand::SkipPrevious => session.TrySkipPreviousAsync(),
-                                            SmtcControlCommand::SeekTo(pos) => session.TryChangePlaybackPositionAsync(pos as i64 * 10000),
-                                            _ => unreachable!(),
-                                        };
+                                }
+                                SmtcControlCommand::SetShuffle(is_active) => {
+                                        let async_op = session.TryChangeShuffleActiveAsync(is_active);
                                         spawn_async_op(async_op, &async_result_tx, move |res| {
-                                            AsyncTaskResult::MediaControlCompleted(other_cmd, res)
+                                            AsyncTaskResult::MediaControlCompleted(media_cmd, res)
                                         });
                                     }
+                                    SmtcControlCommand::SetRepeatMode(repeat_mode) => {
+                                        let win_repeat_mode = match repeat_mode {
+                                            RepeatMode::Off => MediaPlaybackAutoRepeatMode::None,
+                                            RepeatMode::One => MediaPlaybackAutoRepeatMode::Track,
+                                            RepeatMode::All => MediaPlaybackAutoRepeatMode::List,
+                                        };
+                                        let async_op = session.TryChangeAutoRepeatModeAsync(win_repeat_mode);
+                                         spawn_async_op(async_op, &async_result_tx, move |res| {
+                                            AsyncTaskResult::MediaControlCompleted(media_cmd, res)
+                                        });
+                                    }
+                                other_cmd => {
+                                    let async_op = match other_cmd {
+                                        SmtcControlCommand::Play => session.TryPlayAsync(),
+                                        SmtcControlCommand::Pause => session.TryPauseAsync(),
+                                        SmtcControlCommand::SkipNext => session.TrySkipNextAsync(),
+                                        SmtcControlCommand::SkipPrevious => session.TrySkipPreviousAsync(),
+                                        SmtcControlCommand::SeekTo(pos) => session.TryChangePlaybackPositionAsync(pos as i64 * 10000),
+                                        _ => unreachable!(),
+                                    };
+                                    spawn_async_op(async_op, &async_result_tx, move |res| {
+                                        AsyncTaskResult::MediaControlCompleted(other_cmd, res)
+                                    });
                                 }
                             }
+                        }
+                        InternalCommand::RequestStateUpdate => {
+                            log::debug!("[SMTC 主循环] 收到状态更新请求，将重新获取所有状态。");
+                            // 触发会话检查，这将连锁触发其他所有更新（包括曲目信息）
+                            let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
                         }
                     }
                 },
@@ -826,6 +893,20 @@ pub fn run_smtc_listener(
                                             |status| status == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing,
                                         );
 
+                                        let is_shuffle_now = info.IsShuffleActive()
+                                            .and_then(|iref| iref.Value())
+                                            .unwrap_or(false);
+
+                                        let repeat_mode_now = info.AutoRepeatMode()
+                                            .and_then(|iref| iref.Value())
+                                            .map(|rm| match rm {
+                                                MediaPlaybackAutoRepeatMode::None => RepeatMode::Off,
+                                                MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
+                                                MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
+                                                _ => RepeatMode::Off,
+                                            })
+                                            .unwrap_or(RepeatMode::Off);
+
                                         let update_fn = Box::new(move |state: &mut SharedPlayerState| {
                                             if state.is_playing != is_playing_now {
                                                 log::trace!("[State Update] 播放状态改变: {} -> {}", state.is_playing, is_playing_now);
@@ -834,6 +915,8 @@ pub fn run_smtc_listener(
                                                 state.last_known_position_report_time = Some(Instant::now());
                                             }
                                             state.is_playing = is_playing_now;
+                                            state.is_shuffle_active = is_shuffle_now;
+                                            state.repeat_mode = repeat_mode_now;
 
                                             if let Ok(c) = info.Controls() {
                                                 state.can_pause = c.IsPauseEnabled().unwrap_or(false);
@@ -925,7 +1008,12 @@ pub fn run_smtc_listener(
                                         log::warn!("[SMTC 主循环] 获取媒体属性 '{name}' 失败: {e:?}");
                                         String::new()
                                     },
-                                    |hstr| convert_traditional_to_simplified(&hstring_to_string(&hstr))
+                                    |hstr| {
+                                        crate::utils::convert_text(
+                                            &hstring_to_string(&hstr),
+                                            state.text_converter.as_ref(),
+                                        )
+                                    },
                                 )
                             };
 
@@ -937,22 +1025,21 @@ pub fn run_smtc_listener(
                             let is_placeholder_title = IGNORED_TITLES.iter().any(|&ignored| title == ignored);
 
                             // 更新文本信息
-                            let update_fn = Box::new(move |state: &mut SharedPlayerState| {
-                                if !is_placeholder_title {
+                            if !is_placeholder_title {
+                                let update_fn = Box::new(move |state: &mut SharedPlayerState| {
                                     log::trace!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist, &title);
                                     state.title = title;
                                     state.artist = artist;
                                     state.album = album;
-                                }
-                            });
-
-                            match state_update_tx.try_send(update_fn) {
-                                Ok(_) => {} // 发送成功
-                                Err(TrySendError::Full(_)) => {
-                                    log::warn!("[SMTC 主循环] 状态更新通道已满，丢弃了一次文本信息更新。");
-                                }
-                                Err(TrySendError::Closed(_)) => {
-                                    log::error!("[SMTC 主循环] 状态更新通道已关闭，无法发送文本信息更新。");
+                                });
+                                match state_update_tx.try_send(update_fn) {
+                                    Ok(_) => {} // 发送成功
+                                    Err(TrySendError::Full(_)) => {
+                                        log::warn!("[SMTC 主循环] 状态更新通道已满，丢弃了一次文本信息更新。");
+                                    }
+                                    Err(TrySendError::Closed(_)) => {
+                                        log::error!("[SMTC 主循环] 状态更新通道已关闭，无法发送文本信息更新。");
+                                    }
                                 }
                             }
 
@@ -969,16 +1056,9 @@ pub fn run_smtc_listener(
                             } else {
                                 // 如果没有缩略图引用，清空封面
                                 let update_fn = Box::new(|state: &mut SharedPlayerState| { state.cover_data = None; state.cover_data_hash = None; });
-                                match state_update_tx.try_send(update_fn) {
-                                    Ok(_) => {} // 发送成功
-                                    Err(TrySendError::Full(_)) => {
-                                        log::warn!("[SMTC 主循环] 状态更新通道已满，丢弃了一次清空封面更新。");
-                                    }
-                                    Err(TrySendError::Closed(_)) => {
-                                        log::error!("[SMTC 主循环] 状态更新通道已关闭，无法发送清空封面更新。");
-                                    }
+                                if state_update_tx.try_send(update_fn).is_err() {
+                                    log::warn!("[SMTC 主循环] 无法发送清空封面更新。");
                                 }
-
                             }
                         }
                         AsyncTaskResult::MediaPropertiesReady(Err(e)) => {

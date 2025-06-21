@@ -1,13 +1,61 @@
+use serde::Serialize;
 use std::{
     sync::mpsc::{self, Receiver, Sender},
     time::Instant,
 };
 
+/// 一个辅助模块，用于将 Option<Vec<u8>> 序列化为 Base64 字符串。
+mod base64_serialization {
+    use base64::Engine;
+    use base64::engine::general_purpose::STANDARD;
+    use serde::{Serialize, Serializer};
+
+    pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let base64_string: Option<String> = bytes.as_ref().map(|b| STANDARD.encode(b));
+        base64_string.serialize(serializer)
+    }
+}
+
+/// 定义重复播放模式的枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum RepeatMode {
+    #[default]
+    /// 不重复播放。
+    Off,
+    /// 单曲循环。
+    One,
+    /// 歌单循环。
+    All,
+}
+
+/// 定义文本转换模式的枚举。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum TextConversionMode {
+    #[default]
+    /// 关闭转换功能。
+    Off,
+    /// 繁体转简体 (t2s.json)。
+    TraditionalToSimplified,
+    /// 简体转繁体 (s2t.json)。
+    SimplifiedToTraditional,
+    /// 简体转台湾正体 (s2tw.json)。
+    SimplifiedToTaiwan,
+    /// 台湾正体转简体 (tw2s.json)。
+    TaiwanToSimplified,
+    /// 简体转香港繁体 (s2hk.json)。
+    SimplifiedToHongKong,
+    /// 香港繁体转简体 (hk2s.json)。
+    HongKongToSimplified,
+}
+
 /// 包含当前正在播放曲目的详细信息。
 ///
 /// 这个结构体聚合了从系统媒体传输控件 (SMTC) 获取的所有相关信息，
 /// 例如歌曲标题、艺术家、时长、播放状态和封面艺术。
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct NowPlayingInfo {
     /// 曲目标题。
     pub title: Option<String>,
@@ -23,18 +71,24 @@ pub struct NowPlayingInfo {
     pub position_ms: Option<u64>,
     /// 是否正在播放。
     pub is_playing: Option<bool>,
+    /// 是否处于随机播放模式。
+    pub is_shuffle_active: Option<bool>,
+    /// 当前的重复播放模式。
+    pub repeat_mode: Option<RepeatMode>,
     /// 封面图片的原始字节数据。
+    #[serde(serialize_with = "base64_serialization::serialize")]
     pub cover_data: Option<Vec<u8>>,
     /// 封面数据的哈希值，用于快速比较封面是否已更改。
     pub cover_data_hash: Option<u64>,
     /// SMTC 上次报告播放位置的时间点。
+    #[serde(skip)]
     pub position_report_time: Option<Instant>,
 }
 
 /// 表示一个可用的系统媒体传输控件 (SMTC) 会话。
 ///
 /// 每个支持媒体控制的应用（如 Spotify, Windows Media Player）都会创建一个会话。
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct SmtcSessionInfo {
     /// 会话的唯一标识符，通常与其 AUMID (Application User Model ID) 相同。
     pub session_id: String,
@@ -59,11 +113,16 @@ pub enum SmtcControlCommand {
     SeekTo(u64),
     /// 设置音量（0.0 到 1.0）。
     SetVolume(f32),
+    /// 设置随机播放模式。
+    SetShuffle(bool),
+    /// 设置重复播放模式。
+    SetRepeatMode(RepeatMode),
 }
 
 /// C-ABI 兼容的命令类型标签。
 #[repr(C)]
 #[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CControlCommandType {
     Pause,
     Play,
@@ -71,23 +130,80 @@ pub enum CControlCommandType {
     SkipPrevious,
     SeekTo,
     SetVolume,
+    SetShuffle,
+    SetRepeatMode,
+}
+
+// C-ABI 兼容的重复模式枚举。
+#[repr(u8)]
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CRepeatMode {
+    Off = 0,
+    One = 1,
+    All = 2,
 }
 
 /// C-ABI 兼容的联合体，用于存放不同命令的数据。
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub union ControlCommandData {
     pub seek_to_ms: u64,
     pub volume_level: f32,
+    pub is_shuffle_active: bool,
+    pub repeat_mode: CRepeatMode,
 }
 
 /// C-ABI 兼容的、完整的控制命令结构体。
+///
 /// 这个结构体可以安全地在 C 和 Rust 之间传递。
 #[repr(C)]
+#[derive(Clone, Copy)]
 pub struct CSmtcControlCommand {
     /// 命令的类型
     pub command_type: CControlCommandType,
     /// 命令关联的数据
     pub data: ControlCommandData,
+}
+
+/// C-ABI 兼容的文本转换模式枚举。
+///
+/// 这个枚举可以安全地在 C 和 Rust 之间传递。
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CTextConversionMode {
+    /// 关闭转换功能。
+    Off = 0,
+    /// 繁体转简体 (t2s.json)。
+    TraditionalToSimplified = 1,
+    /// 简体转繁体 (s2t.json)。
+    SimplifiedToTraditional = 2,
+    /// 简体转台湾正体 (s2tw.json)。
+    SimplifiedToTaiwan = 3,
+    /// 台湾正体转简体 (tw2s.json)。
+    TaiwanToSimplified = 4,
+    /// 简体转香港繁体 (s2hk.json)。
+    SimplifiedToHongKong = 5,
+    /// 香港繁体转简体 (hk2s.json)。
+    HongKongToSimplified = 6,
+}
+
+impl From<CTextConversionMode> for TextConversionMode {
+    fn from(c_mode: CTextConversionMode) -> Self {
+        match c_mode {
+            CTextConversionMode::Off => TextConversionMode::Off,
+            CTextConversionMode::TraditionalToSimplified => {
+                TextConversionMode::TraditionalToSimplified
+            }
+            CTextConversionMode::SimplifiedToTraditional => {
+                TextConversionMode::SimplifiedToTraditional
+            }
+            CTextConversionMode::SimplifiedToTaiwan => TextConversionMode::SimplifiedToTaiwan,
+            CTextConversionMode::TaiwanToSimplified => TextConversionMode::TaiwanToSimplified,
+            CTextConversionMode::SimplifiedToHongKong => TextConversionMode::SimplifiedToHongKong,
+            CTextConversionMode::HongKongToSimplified => TextConversionMode::HongKongToSimplified,
+        }
+    }
 }
 
 /// 发送给媒体库后台服务的命令。
@@ -105,6 +221,12 @@ pub enum MediaCommand {
     StartAudioCapture,
     /// 停止捕获系统音频输出。
     StopAudioCapture,
+    /// 设置 SMTC 数据的文本转换模式。
+    SetTextConversion(TextConversionMode),
+    /// 请求后台服务立即发送一次所有关键状态的更新（例如会话列表和当前曲目）。
+    ///
+    /// 后台服务将异步地发送 `SessionsChanged` 和 `TrackChanged` 事件作为响应。
+    RequestUpdate,
     /// 请求关闭整个媒体服务后台线程。
     Shutdown,
 }
@@ -112,13 +234,15 @@ pub enum MediaCommand {
 /// 从媒体库后台服务接收的事件和状态更新。
 ///
 /// 使用者通过 `MediaController` 的 `update_rx` 通道接收这些更新。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "type", content = "payload")]
 pub enum MediaUpdate {
     /// 当前播放的曲目信息已发生变化。
     TrackChanged(NowPlayingInfo),
     /// 可用的媒体会话列表已更新。
     SessionsChanged(Vec<SmtcSessionInfo>),
     /// 接收到一个音频数据包（如果音频捕获已启动）。
+    #[serde(skip)]
     AudioData(Vec<u8>),
     /// 报告一个非致命的运行时错误。
     Error(String),

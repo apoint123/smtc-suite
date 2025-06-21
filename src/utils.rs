@@ -1,52 +1,25 @@
-use ferrous_opencc::{OpenCC, error::OpenCCError};
-use log::{error, info, trace};
-use once_cell::sync::Lazy;
+use ferrous_opencc::OpenCC;
 
-// 全局静态变量，用于存储一次性初始化后的 OpenCC 转换器实例或初始化错误。
-// Lazy 块仅在首次访问时执行。
-static OPENCC_T2S_CONVERTER: Lazy<Result<OpenCC, OpenCCError>> = Lazy::new(|| {
-    trace!("[简繁转换] 首次尝试初始化 ferrous-opencc T2S 转换器 (Lazy 模式)...");
-    OpenCC::from_config_name("t2s.json")
-});
-
-/// 获取对已初始化的 T2S (繁体转简体) OpenCC 转换器的静态引用。
-fn get_t2s_converter() -> Result<&'static OpenCC, &'static OpenCCError> {
-    OPENCC_T2S_CONVERTER.as_ref()
-}
-
-/// 将文本从繁体中文转换为简体中文。
-///
-/// 如果转换器初始化失败，或者在转换过程中发生错误，会记录一条错误日志并返回原始文本，
-/// 确保程序的健壮性。
+/// 使用指定的 OpenCC 实例转换文本。
 ///
 /// # 参数
-/// * `text`: 需要进行转换的字符串切片。
+/// * `text`: 需要转换的字符串切片。
+/// * `converter`: 一个 `Option<&OpenCC>`，如果为 `Some`，则用其转换；如果为 `None`，则不进行任何转换。
 ///
 /// # 返回
-/// - 返回转换后的简体中文字符串。
-/// - 如果输入为空字符串，直接返回空字符串。
-/// - 如果转换失败，返回原始输入字符串。
-pub fn convert_traditional_to_simplified(text: &str) -> String {
+/// - 如果提供了转换器，则返回转换后的字符串。
+/// - 如果转换器为 `None`，则返回原始输入字符串。
+pub fn convert_text(text: &str, converter: Option<&OpenCC>) -> String {
     if text.is_empty() {
         return String::new();
     }
 
-    match get_t2s_converter() {
-        Ok(converter) => {
-            let simplified_text = converter.convert(text);
-
-            if text != simplified_text {
-                info!("[简繁转换] 原文: '{text}' -> 简体: '{simplified_text}'");
-            } else if !text.is_empty() && text.chars().any(|c| c as u32 > 127 && c != ' ') {
-                trace!("[简繁转换] 文本 '{text}' 转换为简体后无变化 (可能已是简体或无对应转换)。");
-            }
-            simplified_text
-        }
-        Err(e) => {
-            // 初始化或获取转换器失败
-            error!("[简繁转换] 获取 OpenCC T2S 转换器失败: {e}。繁简转换功能将不可用。返回原文。");
-            text.to_string()
-        }
+    if let Some(converter) = converter {
+        // 使用传入的转换器实例进行转换
+        converter.convert(text)
+    } else {
+        // 如果没有提供转换器，直接返回原文
+        text.to_string()
     }
 }
 

@@ -1,4 +1,5 @@
-/* smtc-suite: C-API, auto-generated, DO NOT EDIT */
+#ifndef SMTC_SUITE_H
+#define SMTC_SUITE_H
 
 #pragma once
 
@@ -17,7 +18,53 @@ typedef enum CControlCommandType {
   SkipPrevious,
   SeekTo,
   SetVolume,
+  SetShuffle,
+  SetRepeatMode,
 } CControlCommandType;
+
+enum CRepeatMode {
+  Off = 0,
+  One = 1,
+  All = 2,
+};
+typedef uint8_t CRepeatMode;
+
+/**
+ * C-ABI 兼容的文本转换模式枚举。
+ *
+ * 这个枚举可以安全地在 C 和 Rust 之间传递。
+ */
+enum CTextConversionMode {
+  /**
+   * 关闭转换功能。
+   */
+  Off = 0,
+  /**
+   * 繁体转简体 (t2s.json)。
+   */
+  TraditionalToSimplified = 1,
+  /**
+   * 简体转繁体 (s2t.json)。
+   */
+  SimplifiedToTraditional = 2,
+  /**
+   * 简体转台湾正体 (s2tw.json)。
+   */
+  SimplifiedToTaiwan = 3,
+  /**
+   * 台湾正体转简体 (tw2s.json)。
+   */
+  TaiwanToSimplified = 4,
+  /**
+   * 简体转香港繁体 (s2hk.json)。
+   */
+  SimplifiedToHongKong = 5,
+  /**
+   * 香港繁体转简体 (hk2s.json)。
+   */
+  HongKongToSimplified = 6,
+};
+typedef uint8_t CTextConversionMode;
 
 /**
  * 定义从 Rust 发送到 C 的更新事件类型。
@@ -72,6 +119,14 @@ typedef enum SmtcResult {
 } SmtcResult;
 
 /**
+ * 与媒体库后台服务交互的控制器。
+ *
+ * 这是库的公共入口点。它包含一个命令发送端和一个更新接收端，
+ * 用于与在后台运行的 `MediaWorker` 进行通信。
+ */
+typedef struct MediaController MediaController;
+
+/**
  * Rust 端的核心控制器句柄。对于 C 端来说，这是一个不透明指针。
  * 该结构体封装了所有 Rust 资源，包括后台线程和通信通道。
  */
@@ -93,10 +148,13 @@ typedef void (*UpdateCallback)(enum CUpdateType update_type, const void *data, v
 typedef union ControlCommandData {
   uint64_t seek_to_ms;
   float volume_level;
+  bool is_shuffle_active;
+  CRepeatMode repeat_mode;
 } ControlCommandData;
 
 /**
  * C-ABI 兼容的、完整的控制命令结构体。
+ *
  * 这个结构体可以安全地在 C 和 Rust 之间传递。
  */
 typedef struct CSmtcControlCommand {
@@ -109,6 +167,132 @@ typedef struct CSmtcControlCommand {
    */
   union ControlCommandData data;
 } CSmtcControlCommand;
+
+/**
+ * C-ABI 兼容的“正在播放”信息结构体。
+ *
+ * # 数据生命周期
+ * **此结构体及其指向的所有数据（包括字符串和封面数据）仅在回调函数作用域内有效。**
+ * 如果需要在回调函数返回后继续使用这些数据，必须在回调函数内部进行深拷贝。
+ * **调用者不应也无需手动释放任何指针。**
+ */
+typedef struct CNowPlayingInfo {
+  /**
+   * 曲目标题 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *title;
+  /**
+   * 艺术家 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *artist;
+  /**
+   * 专辑标题 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *album_title;
+  /**
+   * 歌曲总时长（毫秒）。
+   */
+  uint64_t duration_ms;
+  /**
+   * 当前播放位置（毫秒）。
+   */
+  uint64_t position_ms;
+  /**
+   * 当前是否正在播放。
+   */
+  bool is_playing;
+  /**
+   * 指向封面图片原始数据的指针。仅在回调内有效。
+   */
+  const uint8_t *cover_data;
+  /**
+   * 封面图片数据的长度（字节）。
+   */
+  uintptr_t cover_data_len;
+  /**
+   * 封面图片数据的哈希值，可用于快速比较封面是否变化。
+   */
+  uint64_t cover_data_hash;
+} CNowPlayingInfo;
+
+/**
+ * C-ABI 兼容的 SMTC 会话信息结构体。
+ *
+ * # 数据生命周期
+ * **此结构体及其指向的所有字符串数据仅在回调函数作用域内有效。**
+ * 如果需要保留，必须在回调函数内部进行深拷贝。
+ * **调用者不应也无需手动释放任何指针。**
+ */
+typedef struct CSessionInfo {
+  /**
+   * 会话的唯一 ID (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *session_id;
+  /**
+   * 来源应用的 AUMID (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *source_app_user_model_id;
+  /**
+   * 用于 UI 显示的名称 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *display_name;
+} CSessionInfo;
+
+/**
+ * C-ABI 兼容的会话列表结构体，用于在回调中传递会话数组。
+ *
+ * # 数据生命周期
+ * **此结构体及其指向的 `sessions` 数组和数组内所有数据仅在回调函数作用域内有效。**
+ */
+typedef struct CSessionList {
+  /**
+   * 指向 `CSessionInfo` 数组头部的指针。
+   */
+  const struct CSessionInfo *sessions;
+  /**
+   * 数组中的元素数量。
+   */
+  uintptr_t count;
+} CSessionList;
+
+/**
+ * C-ABI 兼容的音频数据包结构体。
+ *
+ * # 数据生命周期
+ * **此结构体及其指向的 `data` 数组仅在回调函数作用域内有效。**
+ */
+typedef struct CAudioDataPacket {
+  /**
+   * 指向音频 PCM 数据的指针。
+   */
+  const uint8_t *data;
+  /**
+   * 数据长度（字节）。
+   */
+  uintptr_t len;
+} CAudioDataPacket;
+
+/**
+ * C-ABI 兼容的音量变化事件结构体。
+ *
+ * # 数据生命周期
+ * **此结构体及其指向的 `session_id` 字符串仅在回调函数作用域内有效。**
+ * **调用者不应也无需手动释放任何指针。**
+ */
+typedef struct CVolumeChangedEvent {
+  /**
+   * 发生音量变化的会话 ID (UTF-8 编码, Null 结尾)。仅在回调内有效。
+   */
+  const char *session_id;
+  /**
+   * 新的音量级别 (0.0 到 1.0)。
+   */
+  float volume;
+  /**
+   * 新的静音状态。
+   */
+  bool is_muted;
+} CVolumeChangedEvent;
 
 /**
  * 创建一个新的 SMTC 控制器实例。
@@ -204,6 +388,19 @@ enum SmtcResult smtc_suite_select_session(struct SmtcHandle *handle_ptr,
                                           const char *session_id);
 
 /**
+ * 设置 SMTC 元数据的文本转换模式。
+ *
+ * 这是从 C 语言调用以控制简繁转换行为的函数。
+ *
+ * # 安全性
+ *
+ * 调用者必须确保 `controller_ptr` 是一个由 `smtc_start` 返回的有效指针，
+ * 并且在调用此函数时没有被释放。
+ */
+bool smtc_set_text_conversion_mode(struct MediaController *controller_ptr,
+                                   CTextConversionMode mode);
+
+/**
  * 请求开始音频捕获。
  *
  * # 安全性
@@ -229,3 +426,5 @@ enum SmtcResult smtc_suite_stop_audio_capture(struct SmtcHandle *handle_ptr);
  * 传入 `NULL` 是安全的。
  */
 void smtc_suite_free_string(char *s);
+
+#endif  /* SMTC_SUITE_H */

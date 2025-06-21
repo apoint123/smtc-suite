@@ -4,10 +4,15 @@ pragma_once = true
 
 [export]
 include = [
+    # 枚举
     "CControlCommandType",
+    "CUpdateType",
+    "CTextConversionMode",
+    "CRepeatMode",
+
+    # 结构体和联合体
     "ControlCommandData",
     "CSmtcControlCommand",
-    "CUpdateType",
     "CNowPlayingInfo",
     "CSessionInfo",
     "CSessionList",

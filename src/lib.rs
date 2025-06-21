@@ -99,7 +99,8 @@ mod worker;
 use std::sync::mpsc;
 
 pub use api::{
-    MediaCommand, MediaController, MediaUpdate, NowPlayingInfo, SmtcControlCommand, SmtcSessionInfo,
+    MediaCommand, MediaController, MediaUpdate, NowPlayingInfo, RepeatMode, SmtcControlCommand,
+    SmtcSessionInfo, TextConversionMode,
 };
 pub use error::{Result, SmtcError};
 

@@ -141,90 +141,91 @@ fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSession
         // 遍历系统中所有的音频会话
         for i in 0..count {
             if let Ok(session_control) = session_enumerator.GetSession(i)
-                && let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>() {
-                    // --- UWP 应用匹配策略 ---
-                    if let Some((name_part, publisher_id)) = uwp_name_and_publisher_id {
-                        let name_part_lower = name_part.to_lowercase();
-                        let publisher_id_lower = publisher_id.to_lowercase();
+                && let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>()
+            {
+                // --- UWP 应用匹配策略 ---
+                if let Some((name_part, publisher_id)) = uwp_name_and_publisher_id {
+                    let name_part_lower = name_part.to_lowercase();
+                    let publisher_id_lower = publisher_id.to_lowercase();
 
-                        // 策略 1A: 检查 SessionIdentifier (针对 Apple Music 等)
-                        if let Ok(hstring) = session_control2.GetSessionIdentifier()
-                            && let Ok(session_id_str) = hstring.to_string() {
-                                let session_id_lower = session_id_str.to_lowercase();
-                                if session_id_lower.contains(&name_part_lower)
-                                    && session_id_lower.contains(&publisher_id_lower)
-                                    && let Ok(state) = session_control2.GetState()
-                                        && state == AudioSessionStateActive
-                                    {
-                                        log::info!(
-                                            "[音量控制] 通过匹配 SessionIdentifier 中的组件找到UWP音频会话。"
-                                        );
-                                        return Ok(session_control2);
-                                    }
-                            }
-
-                        // 策略 1B: 检查 IconPath (针对某些特殊UWP应用)
-                        if let Ok(pwstr) = session_control2.GetIconPath()
-                            && !pwstr.is_null()
-                                && let Ok(icon_path_str) = pwstr.to_string() {
-                                    let icon_path_lower = icon_path_str.to_lowercase();
-                                    if icon_path_lower.contains(&name_part_lower)
-                                        && icon_path_lower.contains(&publisher_id_lower)
-                                        && let Ok(state) = session_control2.GetState()
-                                            && state == AudioSessionStateActive
-                                        {
-                                            log::info!(
-                                                "[音量控制] 通过匹配 IconPath 中的组件找到UWP音频会话。"
-                                            );
-                                            return Ok(session_control2);
-                                        }
-                                }
+                    // 策略 1A: 检查 SessionIdentifier (针对 Apple Music 等)
+                    if let Ok(hstring) = session_control2.GetSessionIdentifier()
+                        && let Ok(session_id_str) = hstring.to_string()
+                    {
+                        let session_id_lower = session_id_str.to_lowercase();
+                        if session_id_lower.contains(&name_part_lower)
+                            && session_id_lower.contains(&publisher_id_lower)
+                            && let Ok(state) = session_control2.GetState()
+                            && state == AudioSessionStateActive
+                        {
+                            log::info!(
+                                "[音量控制] 通过匹配 SessionIdentifier 中的组件找到UWP音频会话。"
+                            );
+                            return Ok(session_control2);
+                        }
                     }
 
-                    // --- 策略 2 (Win32 或后备): 按 PID 匹配 ---
-                    if let Some(pid) = target_pid
-                        && let Ok(session_pid) = session_control2.GetProcessId()
-                            && session_pid > 0 && session_pid == pid
-                                && let Ok(state) = session_control2.GetState()
-                                    && state == AudioSessionStateActive
-                                {
-                                    log::info!("[音量控制] 通过 PID {pid} 找到匹配的音频会话。");
-                                    return Ok(session_control2);
-                                }
+                    // 策略 1B: 检查 IconPath (针对某些特殊UWP应用)
+                    if let Ok(pwstr) = session_control2.GetIconPath()
+                        && !pwstr.is_null()
+                        && let Ok(icon_path_str) = pwstr.to_string()
+                    {
+                        let icon_path_lower = icon_path_str.to_lowercase();
+                        if icon_path_lower.contains(&name_part_lower)
+                            && icon_path_lower.contains(&publisher_id_lower)
+                            && let Ok(state) = session_control2.GetState()
+                            && state == AudioSessionStateActive
+                        {
+                            log::info!("[音量控制] 通过匹配 IconPath 中的组件找到UWP音频会话。");
+                            return Ok(session_control2);
+                        }
+                    }
+                }
 
-                    // --- 调试信息收集 ---
-                    // 如果日志级别足够高，则收集所有会话信息，以便在最终失败时打印。
-                    if log::max_level() >= log::LevelFilter::Error
-                        && let Ok(state) = session_control2.GetState() {
-                            let pid = session_control2.GetProcessId().unwrap_or(0);
-                            let display_name = match session_control2.GetDisplayName() {
-                                Ok(s) if !s.is_null() => s
-                                    .to_string()
-                                    .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
-                                _ => String::new(),
-                            };
-                            let session_id = match session_control2.GetSessionIdentifier() {
-                                Ok(s) => s.to_string().unwrap_or_default(),
-                                Err(_) => String::new(),
-                            };
-                            let icon_path = match session_control2.GetIconPath() {
-                                Ok(s) if !s.is_null() => s
-                                    .to_string()
-                                    .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
-                                _ => String::new(),
-                            };
+                // --- 策略 2 (Win32 或后备): 按 PID 匹配 ---
+                if let Some(pid) = target_pid
+                    && let Ok(session_pid) = session_control2.GetProcessId()
+                    && session_pid > 0
+                    && session_pid == pid
+                    && let Ok(state) = session_control2.GetState()
+                    && state == AudioSessionStateActive
+                {
+                    log::info!("[音量控制] 通过 PID {pid} 找到匹配的音频会话。");
+                    return Ok(session_control2);
+                }
 
-                            all_sessions_for_debug.push(format!(
+                // --- 调试信息收集 ---
+                // 如果日志级别足够高，则收集所有会话信息，以便在最终失败时打印。
+                if log::max_level() >= log::LevelFilter::Error
+                    && let Ok(state) = session_control2.GetState()
+                {
+                    let pid = session_control2.GetProcessId().unwrap_or(0);
+                    let display_name = match session_control2.GetDisplayName() {
+                        Ok(s) if !s.is_null() => s
+                            .to_string()
+                            .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
+                        _ => String::new(),
+                    };
+                    let session_id = match session_control2.GetSessionIdentifier() {
+                        Ok(s) => s.to_string().unwrap_or_default(),
+                        Err(_) => String::new(),
+                    };
+                    let icon_path = match session_control2.GetIconPath() {
+                        Ok(s) if !s.is_null() => s
+                            .to_string()
+                            .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
+                        _ => String::new(),
+                    };
+
+                    all_sessions_for_debug.push(format!(
                                 "  > [会话 {i}] 状态: {state:?}, PID: {pid}, 显示名称: '{display_name}', 图标路径: '{icon_path}', 会话ID: '{session_id}'"
                             ));
-                        }
                 }
+            }
         }
 
         // 如果循环结束仍未找到匹配的会话，则打印所有收集到的会话信息。
-        log::error!(
-            "[音量控制] 未能为标识符 '{identifier}' 找到匹配的活动音频会话。"
-        );
+        log::error!("[音量控制] 未能为标识符 '{identifier}' 找到匹配的活动音频会话。");
         if !all_sessions_for_debug.is_empty() {
             log::info!("[音量控制] 以下是系统中所有（包括非活动）音频会话的快照:");
             for session_info in all_sessions_for_debug {
@@ -362,9 +363,10 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
         let current_exe_name_os = OsString::from_wide(&current_exe_name_wide[..len]);
 
         if let Some(current_exe_name_str) = current_exe_name_os.to_str()
-            && current_exe_name_str.eq_ignore_ascii_case(executable_name) {
-                return Some(process_entry.th32ProcessID);
-            }
+            && current_exe_name_str.eq_ignore_ascii_case(executable_name)
+        {
+            return Some(process_entry.th32ProcessID);
+        }
 
         // SAFETY: Process32NextW 用于移动到下一个进程。
         if unsafe { Process32NextW(snapshot_handle, &mut process_entry) }.is_err() {
@@ -395,27 +397,27 @@ fn find_pid_for_aumid_via_audio_sessions(target_pfn_from_aumid: &str) -> Result<
 
         for i in 0..count {
             if let Ok(session_control) = session_enumerator.GetSession(i)
-                && let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>() {
-                    // 仅处理活动的音频会话
-                    if let Ok(current_state) = session_control2.GetState()
-                        && current_state == AudioSessionStateActive
-                        && let Ok(pid) = session_control2.GetProcessId()
-                            && pid > 0
-                            && let Ok(icon_path_pwstr) = session_control2.GetIconPath()
-                                && !icon_path_pwstr.is_null()
-                                && let Ok(icon_path_str) = icon_path_pwstr.to_string() {
-                                    // 检查 IconPath 是否包含目标 PFN
-                                    if icon_path_str
-                                        .to_lowercase()
-                                        .contains(&target_pfn_from_aumid.to_lowercase())
-                                    {
-                                        log::debug!(
-                                            "[音量控制] 通过 IconPath 找到匹配的 PID: {pid}"
-                                        );
-                                        return Ok(Some(pid));
-                                    }
-                                }
+                && let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>()
+            {
+                // 仅处理活动的音频会话
+                if let Ok(current_state) = session_control2.GetState()
+                    && current_state == AudioSessionStateActive
+                    && let Ok(pid) = session_control2.GetProcessId()
+                    && pid > 0
+                    && let Ok(icon_path_pwstr) = session_control2.GetIconPath()
+                    && !icon_path_pwstr.is_null()
+                    && let Ok(icon_path_str) = icon_path_pwstr.to_string()
+                {
+                    // 检查 IconPath 是否包含目标 PFN
+                    if icon_path_str
+                        .to_lowercase()
+                        .contains(&target_pfn_from_aumid.to_lowercase())
+                    {
+                        log::debug!("[音量控制] 通过 IconPath 找到匹配的 PID: {pid}");
+                        return Ok(Some(pid));
+                    }
                 }
+            }
         }
     }
     Ok(None) // 未找到匹配的 PID

@@ -1,10 +1,10 @@
 // src/ffi.rs
 
 use crate::{
-    MediaController, MediaManager,
+    MediaController, MediaManager, TextConversionMode,
     api::{
-        CControlCommandType, CSmtcControlCommand, MediaCommand, MediaUpdate, NowPlayingInfo,
-        SmtcControlCommand, SmtcSessionInfo,
+        CControlCommandType, CRepeatMode, CSmtcControlCommand, CTextConversionMode, MediaCommand,
+        MediaUpdate, NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo,
     },
 };
 use std::{
@@ -477,6 +477,18 @@ pub unsafe extern "C" fn smtc_suite_control_command(
                 CControlCommandType::SetVolume => {
                     SmtcControlCommand::SetVolume(unsafe { command.data.volume_level })
                 }
+                CControlCommandType::SetShuffle => {
+                    SmtcControlCommand::SetShuffle(unsafe { command.data.is_shuffle_active })
+                }
+                CControlCommandType::SetRepeatMode => {
+                    let c_mode = unsafe { command.data.repeat_mode };
+                    let rust_mode = match c_mode {
+                        CRepeatMode::Off => RepeatMode::Off,
+                        CRepeatMode::One => RepeatMode::One,
+                        CRepeatMode::All => RepeatMode::All,
+                    };
+                    SmtcControlCommand::SetRepeatMode(rust_mode)
+                }
             };
             if controller
                 .command_tx
@@ -535,6 +547,31 @@ pub unsafe extern "C" fn smtc_suite_select_session(
         log::error!("[FFI] smtc_suite_select_session 内部发生 Panic！");
         SmtcResult::InternalError
     })
+}
+
+/// 设置 SMTC 元数据的文本转换模式。
+///
+/// 这是从 C 语言调用以控制简繁转换行为的函数。
+///
+/// # 安全性
+///
+/// 调用者必须确保 `controller_ptr` 是一个由 `smtc_start` 返回的有效指针，
+/// 并且在调用此函数时没有被释放。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smtc_set_text_conversion_mode(
+    controller_ptr: *mut MediaController,
+    mode: CTextConversionMode,
+) -> bool {
+    let Some(controller) = (unsafe { controller_ptr.as_ref() }) else {
+        return false;
+    };
+
+    // 将 C 枚举转换为 Rust 枚举
+    let rust_mode = TextConversionMode::from(mode);
+
+    // 创建并发送命令
+    let command = MediaCommand::SetTextConversion(rust_mode);
+    controller.command_tx.send(command).is_ok()
 }
 
 /// 请求开始音频捕获。

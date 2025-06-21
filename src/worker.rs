@@ -9,7 +9,10 @@ use std::{
 use tokio::{runtime::Runtime, sync::mpsc::Receiver as TokioReceiver, task::LocalSet};
 
 use crate::{
-    api::{MediaCommand, MediaUpdate, NowPlayingInfo, SmtcControlCommand, SmtcSessionInfo},
+    api::{
+        MediaCommand, MediaUpdate, NowPlayingInfo, SmtcControlCommand, SmtcSessionInfo,
+        TextConversionMode,
+    },
     audio_capture::AudioCapturer,
     error::{Result, SmtcError},
     smtc_handler::{self, SharedPlayerState},
@@ -25,6 +28,10 @@ pub(crate) enum InternalCommand {
     SelectSmtcSession(String),
     /// 向 `smtc_handler` 转发一个媒体控制指令（如播放、暂停等）。
     MediaControl(SmtcControlCommand),
+    /// 请求 `smtc_handler` 重新获取并广播其当前状态。
+    RequestStateUpdate,
+    /// 设置 SMTC 元数据的文本转换模式。
+    SetTextConversion(TextConversionMode),
 }
 
 /// 在 `MediaWorker` 内部使用的更新事件，由其子模块发出。
@@ -236,8 +243,6 @@ impl MediaWorker {
                 }
             }
         }
-        // 当循环结束后，统一关闭所有子系统。
-        self.shutdown_all_subsystems();
     }
 
     /// 辅助函数，用于处理从主应用接收到的单个命令。
@@ -255,6 +260,12 @@ impl MediaWorker {
             MediaCommand::StopAudioCapture => {
                 self.stop_audio_capture_internal();
             }
+            MediaCommand::SetTextConversion(mode) => {
+                self.send_internal_command_to_smtc(InternalCommand::SetTextConversion(mode));
+            }
+            MediaCommand::RequestUpdate => {
+                self.send_internal_command_to_smtc(InternalCommand::RequestStateUpdate);
+            }
             MediaCommand::Shutdown => {
                 // 已在上面循环中优先处理
             }
@@ -266,7 +277,7 @@ impl MediaWorker {
         let public_update: MediaUpdate = internal_update.into();
 
         if self.update_tx.send(public_update).is_err() {
-            log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败，主应用可能已关闭。");
+            log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败。");
         }
     }
 
@@ -274,7 +285,7 @@ impl MediaWorker {
     fn send_internal_command_to_smtc(&self, command: InternalCommand) {
         if let Some(sender) = &self.smtc_control_tx {
             if sender.send(command).is_err() {
-                log::error!("[MediaWorker] 发送命令到 SMTC 处理器内部通道失败。");
+                log::error!("[MediaWorker] 发送命令到 SMTC 处理器失败。");
             }
         } else {
             log::error!("[MediaWorker] SMTC 控制通道无效，无法发送命令。");
@@ -324,7 +335,7 @@ impl MediaWorker {
         //    一旦所有 sender (这里只有一个) 都被 drop，`smtc_handler` 中桥接任务的
         //    `control_rx.recv()` 就会立即返回 `Err(Disconnected)`，从而让桥接任务退出。
         if self.smtc_control_tx.take().is_some() {
-            log::debug!("[MediaWorker] SMTC 控制通道已清理，这将通知桥接任务退出。");
+            log::debug!("[MediaWorker] SMTC 控制通道已清理，将通知桥接任务退出。");
         }
 
         // 2. 发送明确的关闭信号。
@@ -415,10 +426,16 @@ impl MediaWorker {
 /// 其管理的子系统也能被尝试关闭，防止线程泄漏。
 impl Drop for MediaWorker {
     fn drop(&mut self) {
-        log::warn!(
-            "[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)，正在关闭所有子系统..."
-        );
-        self.shutdown_all_subsystems();
+        // 只有在正常关闭流程没有被执行的情况下，才执行备用关闭逻辑
+        if self.smtc_control_tx.is_some() {
+            log::warn!(
+                "[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)，正在关闭所有子系统..."
+            );
+            self.shutdown_all_subsystems();
+        } else {
+            // smtc_control_tx 是 None，说明正常关闭已执行
+            log::trace!("[MediaWorker] MediaWorker 实例被正常丢弃。");
+        }
     }
 }
 
