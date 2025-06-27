@@ -1,3 +1,4 @@
+use crossbeam_channel::{RecvTimeoutError, select};
 use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo};
 use std::time::Duration;
 
@@ -74,7 +75,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_known_info: Option<NowPlayingInfo> = None;
 
     loop {
-        match controller.update_rx.recv_timeout(Duration::from_secs(1)) {
+        let result = select! {
+            recv(controller.update_rx) -> msg => {
+                match msg {
+                    Ok(update) => Ok(update),
+                    Err(_) => Err(RecvTimeoutError::Disconnected),
+                }
+            },
+            default(Duration::from_secs(1)) => {
+                Err(RecvTimeoutError::Timeout)
+            }
+        };
+
+        match result {
             Ok(update) => match update {
                 MediaUpdate::SessionsChanged(sessions) => {
                     if sessions.is_empty() {
@@ -130,14 +143,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 MediaUpdate::AudioData(_) => {}
             },
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+            Err(RecvTimeoutError::Timeout) => {
                 if let Some(info) = &last_known_info {
                     if info.is_playing.unwrap_or(false) {
                         log_smtc_status(info);
                     }
                 }
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+            Err(RecvTimeoutError::Disconnected) => {
                 log::info!("媒体事件通道已关闭，程序退出。");
                 break;
             }

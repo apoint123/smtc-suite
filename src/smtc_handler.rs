@@ -1,12 +1,6 @@
-use std::{
-    future::IntoFuture,
-    sync::{
-        Arc,
-        mpsc::{Receiver as StdReceiver, Sender as StdSender},
-    },
-    time::Instant,
-};
+use std::{future::IntoFuture, sync::Arc, time::Instant};
 
+use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use easer::functions::Easing;
 use ferrous_opencc::OpenCC;
 use tokio::{
@@ -101,13 +95,19 @@ pub(crate) struct SharedPlayerState {
     pub cover_data: Option<Vec<u8>>,
     /// 封面图片数据的哈希值。
     pub cover_data_hash: Option<u64>,
+    /// 一个标志，表示正在等待来自SMTC的第一次更新。
+    /// 在此期间，应暂停进度计时器。
+    pub is_waiting_for_initial_update: bool,
 }
 
 impl SharedPlayerState {
     /// 将播放状态重置为空白/默认状态。
     /// 通常在没有活动媒体会话时调用。
     pub fn reset_to_empty(&mut self) {
-        *self = Self::default();
+        *self = Self {
+            is_waiting_for_initial_update: true,
+            ..Self::default()
+        };
     }
 
     /// 根据上次报告的播放位置和当前时间，估算实时的播放进度。
@@ -218,6 +218,8 @@ struct SmtcState {
     active_volume_easing_task: Option<JoinHandle<()>>,
     /// 当前活动的封面获取任务的句柄。
     active_cover_fetch_task: Option<JoinHandle<()>>,
+    /// 主动进度更新计时器任务的句柄。
+    active_progress_timer_task: Option<JoinHandle<()>>,
     /// 用于为音量缓动任务生成唯一 ID。
     next_easing_task_id: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -235,6 +237,7 @@ impl SmtcState {
             text_converter: None,
             active_volume_easing_task: None,
             active_cover_fetch_task: None,
+            active_progress_timer_task: None,
             next_easing_task_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -374,7 +377,7 @@ async fn volume_easing_task(
     task_id: u64,
     target_vol: f32,
     session_id: String,
-    connector_tx: StdSender<InternalUpdate>,
+    connector_tx: CrossbeamSender<InternalUpdate>,
 ) {
     log::debug!(
         "[音量缓动任务][ID:{task_id}] 启动。目标音量: {target_vol:.2}，会话: '{session_id}'"
@@ -425,6 +428,34 @@ async fn volume_easing_task(
     }
 }
 
+/// 一个独立的任务，用于定期计算并发送估算的播放进度。
+async fn progress_timer_task(
+    player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
+    connector_update_tx: CrossbeamSender<InternalUpdate>,
+) {
+    log::debug!("[Timer] 任务已启动。");
+    let mut interval = tokio::time::interval(TokioDuration::from_millis(100));
+
+    loop {
+        interval.tick().await;
+
+        let state_guard = player_state_arc.lock().await;
+
+        if state_guard.is_playing && !state_guard.is_waiting_for_initial_update {
+            let updated_info = NowPlayingInfo::from(&*state_guard);
+
+            if connector_update_tx
+                .send(InternalUpdate::NowPlayingTrackChanged(updated_info))
+                .is_err()
+            {
+                log::warn!("[Timer] 无法发送进度更新，主连接器可能已关闭。任务退出。");
+                break;
+            }
+        }
+    }
+    log::debug!("[Timer] 任务已结束。");
+}
+
 /// 处理 SMTC 会话列表发生变化的事件。
 ///
 /// 这是 SMTC 监听器的核心逻辑之一。它负责：
@@ -434,7 +465,7 @@ async fn volume_easing_task(
 /// 4. 如果没有可用的会话，它会重置播放状态。
 fn handle_sessions_changed(
     state: &mut SmtcState,
-    connector_update_tx: &StdSender<InternalUpdate>,
+    connector_update_tx: &CrossbeamSender<InternalUpdate>,
     smtc_event_tx: &TokioSender<SmtcEventSignal>,
     state_update_tx: &TokioSender<StateUpdateFn>,
 ) -> WinResult<()> {
@@ -558,6 +589,12 @@ fn handle_sessions_changed(
                 }))?,
             );
 
+            let _ = state_update_tx.try_send(Box::new(|state| {
+                state.reset_to_empty();
+                state.is_waiting_for_initial_update = true;
+                log::trace!("[会话处理器] 正在等待 SMTC 第一次更新。");
+            }));
+
             state.current_listener_tokens = Some(tokens);
             state.current_monitored_session = Some(new_s);
 
@@ -598,10 +635,10 @@ fn handle_sessions_changed(
 /// * `player_state_arc` - 指向共享播放器状态的原子引用计数指针。
 /// * `shutdown_rx` - 用于从 `MediaWorker` 接收关闭信号的通道。
 pub fn run_smtc_listener(
-    connector_update_tx: StdSender<InternalUpdate>,
-    control_rx: StdReceiver<InternalCommand>,
+    connector_update_tx: CrossbeamSender<InternalUpdate>,
+    control_rx: CrossbeamReceiver<InternalCommand>,
     player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
-    shutdown_rx: StdReceiver<()>,
+    shutdown_rx: CrossbeamReceiver<()>,
 ) -> Result<()> {
     log::info!("[SMTC Handler] 正在启动 SMTC 监听器");
 
@@ -855,6 +892,21 @@ pub fn run_smtc_listener(
                             // 触发会话检查，这将连锁触发其他所有更新（包括曲目信息）
                             let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
                         }
+                        InternalCommand::SetProgressTimer(enabled) => {
+                            if enabled {
+                                if state.active_progress_timer_task.is_none() {
+                                    log::info!("[SMTC 主循环] 启用进度计时器。");
+                                    let handle = tokio::task::spawn_local(progress_timer_task(
+                                        player_state_arc.clone(),
+                                        connector_update_tx.clone(),
+                                    ));
+                                    state.active_progress_timer_task = Some(handle);
+                                }
+                            } else if let Some(task) = state.active_progress_timer_task.take() {
+                                log::info!("[SMTC 主循环] 禁用进度计时器。");
+                                task.abort();
+                            }
+                        }
                     }
                 },
                 // 分支 3: 处理内部的 WinRT 事件信号
@@ -954,6 +1006,11 @@ pub fn run_smtc_listener(
                                             state.last_known_position_ms = pos_ms;
                                             if dur_ms > 0 { state.song_duration_ms = dur_ms; }
                                             state.last_known_position_report_time = Some(Instant::now());
+
+                                            if state.is_waiting_for_initial_update {
+                                                state.is_waiting_for_initial_update = false;
+                                                log::trace!("[SMTC 主循环] 收到第一次 SMTC 更新，已清除等待标志。");
+                                            }
                                         });
 
                                         match state_update_tx.try_send(update_fn) {
@@ -1028,6 +1085,10 @@ pub fn run_smtc_listener(
                             if !is_placeholder_title {
                                 let update_fn = Box::new(move |state: &mut SharedPlayerState| {
                                     log::trace!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist, &title);
+                                    if state.title != title || state.artist != artist {
+                                        state.is_waiting_for_initial_update = true;
+                                        log::trace!("[媒体属性] 曲目变化，正在等待第一次 SMTC 更新。");
+                                    }
                                     state.title = title;
                                     state.artist = artist;
                                     state.album = album;
@@ -1096,6 +1157,9 @@ pub fn run_smtc_listener(
         }
         if let Some(task) = state.active_cover_fetch_task.take() {
              task.abort();
+        }
+        if let Some(task) = state.active_progress_timer_task.take() {
+            task.abort();
         }
         state_manager_handle.abort();
 

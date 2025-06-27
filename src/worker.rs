@@ -1,11 +1,6 @@
-use std::{
-    sync::{
-        Arc,
-        mpsc::{Receiver as StdReceiver, Sender as StdSender},
-    },
-    thread,
-};
+use std::{sync::Arc, thread};
 
+use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
 use tokio::{runtime::Runtime, sync::mpsc::Receiver as TokioReceiver, task::LocalSet};
 
 use crate::{
@@ -32,6 +27,8 @@ pub(crate) enum InternalCommand {
     RequestStateUpdate,
     /// 设置 SMTC 元数据的文本转换模式。
     SetTextConversion(TextConversionMode),
+    /// 指示 smtc_handler 启动或停止其内部的进度模拟计时器。
+    SetProgressTimer(bool),
 }
 
 /// 在 `MediaWorker` 内部使用的更新事件，由其子模块发出。
@@ -68,15 +65,15 @@ pub(crate) struct MediaWorker {
     /// 异步接收器，用于从“桥接任务”接收外部传入的 `MediaCommand`。
     command_rx: TokioReceiver<MediaCommand>,
     /// 同步发送器，用于向外部（`MediaController`）发送 `MediaUpdate`。
-    update_tx: StdSender<MediaUpdate>,
+    update_tx: CrossbeamSender<MediaUpdate>,
 
     // --- SMTC 子系统 ---
     /// 向 SMTC 处理器线程发送内部控制命令。
-    smtc_control_tx: Option<StdSender<InternalCommand>>,
+    smtc_control_tx: Option<CrossbeamSender<InternalCommand>>,
     /// 从 SMTC 处理器的“桥接任务”异步接收内部更新。
     smtc_update_rx: TokioReceiver<InternalUpdate>,
     /// 向 SMTC 处理器线程发送关闭信号，用于优雅地停止它。
-    smtc_shutdown_tx: Option<StdSender<()>>,
+    smtc_shutdown_tx: Option<CrossbeamSender<()>>,
     /// SMTC 处理器线程的句柄，用于在关闭时 `join` 它。
     smtc_handler_thread_handle: Option<thread::JoinHandle<()>>,
 
@@ -104,8 +101,8 @@ impl MediaWorker {
     /// * `command_rx_from_app`: 从外部 `MediaController` 传入的同步命令接收器。
     /// * `update_tx_to_app`: 用于向外部 `MediaController` 发送更新的同步发送器。
     pub(crate) fn run(
-        command_rx_from_app: StdReceiver<MediaCommand>,
-        update_tx_to_app: StdSender<MediaUpdate>,
+        command_rx_from_app: CrossbeamReceiver<MediaCommand>,
+        update_tx_to_app: CrossbeamSender<MediaUpdate>,
     ) -> Result<()> {
         log::info!("[MediaWorker] Worker 正在启动...");
 
@@ -121,8 +118,8 @@ impl MediaWorker {
             tokio::sync::mpsc::channel::<InternalUpdate>(32);
 
         // b. 用于与子模块（在它们自己的线程中运行）通信的【同步】通道。
-        let (smtc_update_tx_sync, smtc_update_rx_sync) = std::sync::mpsc::channel();
-        let (smtc_control_tx_sync, smtc_control_rx_sync) = std::sync::mpsc::channel();
+        let (smtc_update_tx_sync, smtc_update_rx_sync) = crossbeam_channel::unbounded();
+        let (smtc_control_tx_sync, smtc_control_rx_sync) = crossbeam_channel::unbounded();
 
         // 3. 启动所有“桥接”任务。
         // 这些任务是连接同步世界和异步世界的桥梁。它们在后台运行，
@@ -266,6 +263,9 @@ impl MediaWorker {
             MediaCommand::RequestUpdate => {
                 self.send_internal_command_to_smtc(InternalCommand::RequestStateUpdate);
             }
+            MediaCommand::SetHighFrequencyProgressUpdates(enabled) => {
+                self.send_internal_command_to_smtc(InternalCommand::SetProgressTimer(enabled));
+            }
             MediaCommand::Shutdown => {
                 // 已在上面循环中优先处理
             }
@@ -295,8 +295,8 @@ impl MediaWorker {
     /// 启动 SMTC 处理程序线程，并建立与之通信的通道。
     fn start_smtc_handler_thread(
         &mut self,
-        control_rx_for_smtc: StdReceiver<InternalCommand>,
-        update_tx_for_smtc: StdSender<InternalUpdate>,
+        control_rx_for_smtc: CrossbeamReceiver<InternalCommand>,
+        update_tx_for_smtc: CrossbeamSender<InternalUpdate>,
     ) {
         if self.smtc_handler_thread_handle.is_some() {
             log::warn!("[MediaWorker] 尝试启动 SMTC 处理器，但它似乎已在运行。");
@@ -307,7 +307,7 @@ impl MediaWorker {
         let player_state_clone = Arc::clone(&self._shared_player_state);
 
         // 为 SMTC 处理器创建专用的关闭通道，以实现显式的生命周期管理。
-        let (shutdown_tx, shutdown_rx_for_smtc) = std::sync::mpsc::channel::<()>();
+        let (shutdown_tx, shutdown_rx_for_smtc) = crossbeam_channel::unbounded::<()>();
         self.smtc_shutdown_tx = Some(shutdown_tx);
 
         let handle = thread::Builder::new()
@@ -448,8 +448,8 @@ impl Drop for MediaWorker {
 /// - `Ok(JoinHandle)`: 成功启动后，返回线程的句柄。
 /// - `Err(SmtcError)`: 如果创建线程失败。
 pub(crate) fn start_media_worker_thread(
-    command_rx: StdReceiver<MediaCommand>,
-    update_tx: StdSender<MediaUpdate>,
+    command_rx: CrossbeamReceiver<MediaCommand>,
+    update_tx: CrossbeamSender<MediaUpdate>,
 ) -> Result<thread::JoinHandle<()>> {
     thread::Builder::new()
         .name("media_worker_thread".to_string())

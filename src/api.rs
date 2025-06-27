@@ -1,9 +1,6 @@
-use serde::Serialize;
-use std::{
-    sync::mpsc::{self, Receiver, Sender},
-    time::Instant,
-};
-
+use crossbeam_channel::{self, Receiver, SendError, Sender};
+use serde::{Deserialize, Serialize};
+use std::time::Instant;
 /// 一个辅助模块，用于将 Option<Vec<u8>> 序列化为 Base64 字符串。
 mod base64_serialization {
     use base64::Engine;
@@ -20,7 +17,7 @@ mod base64_serialization {
 }
 
 /// 定义重复播放模式的枚举。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum RepeatMode {
     #[default]
     /// 不重复播放。
@@ -227,6 +224,10 @@ pub enum MediaCommand {
     ///
     /// 后台服务将异步地发送 `SessionsChanged` 和 `TrackChanged` 事件作为响应。
     RequestUpdate,
+    /// 启用或禁用高频进度更新。
+    ///
+    /// 当启用时，smtc-suite 会以 100ms 的频率主动发送 TrackChanged 事件来模拟平滑进度。
+    SetHighFrequencyProgressUpdates(bool),
     /// 请求关闭整个媒体服务后台线程。
     Shutdown,
 }
@@ -276,7 +277,7 @@ impl MediaController {
     /// # 返回
     /// - `Ok(())`: 如果命令成功发送。
     /// - `Err(SendError)`: 如果后台线程已经关闭，无法接收命令。
-    pub fn shutdown(&self) -> std::result::Result<(), mpsc::SendError<MediaCommand>> {
+    pub fn shutdown(&self) -> Result<(), SendError<MediaCommand>> {
         self.command_tx.send(MediaCommand::Shutdown)
     }
 }

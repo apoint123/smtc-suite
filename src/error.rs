@@ -1,5 +1,5 @@
+use crossbeam_channel::SendError;
 use thiserror::Error;
-
 /// 定义库的统一错误枚举。
 #[derive(Debug, Error)]
 pub enum SmtcError {
@@ -31,7 +31,7 @@ pub enum SmtcError {
     ///
     /// 这通常意味着后台工作线程已经崩溃或关闭。
     #[error("向工作线程发送命令失败")]
-    CommandSendError(#[from] std::sync::mpsc::SendError<crate::MediaCommand>),
+    CommandSendError(#[from] SendError<crate::MediaCommand>),
 
     /// 音频捕获模块报告的特定逻辑错误。
     #[error("音频捕获失败: {0}")]

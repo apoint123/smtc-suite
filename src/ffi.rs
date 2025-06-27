@@ -7,6 +7,7 @@ use crate::{
         MediaUpdate, NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo,
     },
 };
+use crossbeam_channel::{Receiver as CrossbeamReceiver, select};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -349,22 +350,28 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
     validate_handle!(handle_ptr, mut);
     let handle = unsafe { &mut *handle_ptr };
 
-    let res = catch_unwind(AssertUnwindSafe(|| {
+    let result = catch_unwind(AssertUnwindSafe(|| {
+        // 锁定回调信息，以便安全地在多线程环境中更新它。
         if let Ok(mut cb_info_guard) = handle.callback_info.lock() {
+            // 将函数指针转换为 usize 以便检查是否为 NULL。
             let is_callback_present = (callback as usize) != 0;
-
             if is_callback_present {
+                // 如果提供了有效的回调，则存储它和用户数据。
                 *cb_info_guard = Some((callback, SendableVoidPtr(userdata)));
             } else {
+                // 如果传入 NULL，则清空回调信息，禁用回调。
                 *cb_info_guard = None;
             }
         } else {
+            // 如果互斥锁被“毒化”（即持有锁的线程 panic 了），这是一个严重的内部错误。
             log::error!("[FFI] 回调信息锁已被毒化，无法更新回调。");
             return SmtcResult::InternalError;
         }
 
         let is_callback_present = (callback as usize) != 0;
         if is_callback_present {
+            // 使用互斥锁确保创建监听线程的操作是原子的。
+            // 这可以防止在多线程环境中（尽管不常见）同时多次调用此函数导致创建多个监听线程。
             let _creation_guard = match handle.listener_creation_mutex.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -372,64 +379,110 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                     return SmtcResult::InternalError;
                 }
             };
+
+            // 只有在第一次注册有效回调且监听线程尚未运行时，才创建它。
             if handle.update_listener_handle.is_none() {
                 log::info!("[FFI] 首次注册回调，正在启动回调监听线程...");
 
-                let update_rx = match handle.controller.as_mut() {
-                    Some(c) => std::mem::replace(&mut c.update_rx, std::sync::mpsc::channel().1),
+                // 从 MediaController 中“拿走”更新接收器 (`update_rx`)。
+                // 我们使用 `std::mem::replace` 将其替换为一个新的、空的通道接收器，
+                // 以保持 MediaController 结构体的有效性，同时将接收器的所有权转移到新线程。
+                let update_rx: CrossbeamReceiver<MediaUpdate> = match handle.controller.as_mut() {
+                    Some(c) => {
+                        std::mem::replace(&mut c.update_rx, crossbeam_channel::unbounded().1)
+                    }
                     None => {
-                        log::error!("[FFI] MediaController 无效，无法启动监听线程。");
+                        log::error!("[FFI] MediaController 无效或已被销毁，无法启动监听线程。");
                         return SmtcResult::InternalError;
                     }
                 };
+
+                // 克隆需要在新线程中使用的共享资源。
                 let shutdown_signal = handle.shutdown_signal.clone();
                 let callback_info = handle.callback_info.clone();
 
+                // 创建并启动回调监听线程。
                 let join_handle = std::thread::spawn(move || {
-                    log::debug!("[FFI 回调线程] 线程已启动。");
+                    log::debug!(
+                        "[FFI 回调线程] 线程已启动 (ID: {:?})。",
+                        std::thread::current().id()
+                    );
+
+                    // --- 核心事件循环 ---
                     loop {
+                        // 优先检查关闭信号，确保能够快速响应关闭请求。
                         if shutdown_signal.load(Ordering::Acquire) {
                             log::debug!("[FFI 回调线程] 收到关闭信号，准备退出。");
                             break;
                         }
-                        match update_rx.recv_timeout(Duration::from_millis(100)) {
-                            Ok(update) => {
-                                if let Ok(cb_info_guard) = callback_info.lock()
-                                    && let Some((cb_fn, user_ptr_wrapper)) = *cb_info_guard
-                                {
-                                    let res = catch_unwind(|| unsafe {
-                                        process_and_invoke_callback(
-                                            update,
-                                            cb_fn,
-                                            user_ptr_wrapper.0,
-                                        );
-                                    });
-                                    if res.is_err() {
-                                        log::error!(
-                                            "[FFI 回调线程] C 端回调函数发生 Panic！线程将继续运行。"
-                                        );
+
+                        // 使用 `crossbeam_channel::select!` 宏来同时等待消息或超时。
+                        select! {
+                            // 分支 1: 尝试从 `update_rx` 接收消息。
+                            recv(update_rx) -> msg => {
+                                match msg {
+                                    Ok(update) => {
+                                        // 成功接收到一条更新消息。
+                                        // 再次锁定回调信息，以获取最新的回调函数指针和用户数据。
+                                        if let Ok(cb_info_guard) = callback_info.lock()
+                                            && let Some((cb_fn, user_ptr_wrapper)) = *cb_info_guard
+                                        {
+                                            // 使用 `catch_unwind` 包装对 C 回调的调用，
+                                            // 以防止 C 端的 panic 破坏我们的 Rust 线程。
+                                            let res = catch_unwind(|| unsafe {
+                                                process_and_invoke_callback(
+                                                    update,
+                                                    cb_fn,
+                                                    user_ptr_wrapper.0,
+                                                );
+                                            });
+                                            if res.is_err() {
+                                                log::error!(
+                                                    "[FFI 回调线程] C 端回调函数发生 Panic！线程将继续运行。"
+                                                );
+                                            }
+                                        }
+                                    },
+                                    Err(_) => {
+                                        // `recv` 返回 `Err` 意味着通道的发送端已经全部被丢弃（disconnected）。
+                                        // 这通常发生在 `MediaWorker` 线程退出时，是正常的关闭流程。
+                                        log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
+                                        break; // 退出循环，结束线程。
                                     }
                                 }
-                            }
-                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                                log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
-                                break;
+                            },
+                            // 分支 2: 等待超时。
+                            // `default(duration)` 是一个特殊的 select 分支，
+                            // 如果在指定的 `duration` 内没有任何其他分支准备好，它就会被执行。
+                            default(Duration::from_millis(100)) => {
+                                // 超时发生。我们什么都不做，直接进入下一次循环迭代。
+                                continue;
                             }
                         }
                     }
-                    log::debug!("[FFI 回调线程] 线程已结束。");
+                    log::debug!(
+                        "[FFI 回调线程] 线程已结束 (ID: {:?})。",
+                        std::thread::current().id()
+                    );
                 });
+
+                // 将新创建的线程句柄存储在 SmtcHandle 中，以便将来可以 `join` 它。
                 handle.update_listener_handle = Some(join_handle);
             }
         } else {
-            log::info!("[FFI] 传入 NULL 回调，回调功能已禁用。");
+            // 如果传入的回调是 NULL，仅打印一条日志信息。
+            // 线程的停止逻辑由 `smtc_suite_destroy` 统一处理，不需要主动停止线程。
+            log::info!(
+                "[FFI] 传入 NULL 回调，回调功能已禁用。监听线程（如果存在）将继续运行但不会调用任何回调。"
+            );
         }
+
         SmtcResult::Success
     }));
 
-    res.unwrap_or_else(|_| {
-        log::error!("[FFI] smtc_suite_register_update_callback 内部发生 Panic！");
+    // 如果 `catch_unwind` 捕获到了 panic，返回一个内部错误码。
+    result.unwrap_or_else(|_| {
+        log::error!("[FFI] `smtc_suite_register_update_callback` 内部发生 Panic！");
         SmtcResult::InternalError
     })
 }
@@ -504,6 +557,51 @@ pub unsafe extern "C" fn smtc_suite_control_command(
 
     res.unwrap_or_else(|_| {
         log::error!("[FFI] smtc_suite_control_command 内部发生 Panic！");
+        SmtcResult::InternalError
+    })
+}
+
+/// 启用或禁用高频进度更新。
+///
+/// 当启用时，库会以 100ms 的固定间隔主动发送 `TrackChanged` 更新事件，
+/// 以便实现平滑的进度条。禁用后，`TrackChanged` 事件仅在 SMTC
+/// 报告真实变化时才发送。
+///
+/// # 参数
+/// - `handle_ptr`: 一个由 `smtc_suite_create` 返回的有效句柄。
+/// - `enabled`: `true` 表示启用高频更新，`false` 表示禁用。
+///
+/// # 返回
+/// - `SmtcResult::Success` 表示命令已成功发送。
+/// - `SmtcResult::InvalidHandle` 如果句柄无效。
+/// - `SmtcResult::InternalError` 如果命令发送失败（例如后台线程已关闭）。
+///
+/// # 安全性
+/// `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
+/// 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smtc_suite_set_high_frequency_progress_updates(
+    handle_ptr: *mut SmtcHandle,
+    enabled: bool,
+) -> SmtcResult {
+    validate_handle!(handle_ptr);
+    let handle = unsafe { &*handle_ptr };
+
+    let res = catch_unwind(AssertUnwindSafe(|| {
+        if let Some(controller) = &handle.controller
+            && controller
+                .command_tx
+                .send(MediaCommand::SetHighFrequencyProgressUpdates(enabled))
+                .is_err()
+            {
+                log::error!("[FFI] 发送设置高频更新命令失败: 通道已关闭。");
+                return SmtcResult::InternalError;
+            }
+        SmtcResult::Success
+    }));
+
+    res.unwrap_or_else(|_| {
+        log::error!("[FFI] smtc_suite_set_high_frequency_progress_updates 内部发生 Panic！");
         SmtcResult::InternalError
     })
 }

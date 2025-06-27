@@ -96,8 +96,6 @@ mod utils;
 mod volume_control;
 mod worker;
 
-use std::sync::mpsc;
-
 pub use api::{
     MediaCommand, MediaController, MediaUpdate, NowPlayingInfo, RepeatMode, SmtcControlCommand,
     SmtcSessionInfo, TextConversionMode,
@@ -117,8 +115,8 @@ impl MediaManager {
     /// - `Ok(MediaController)`: 成功启动后，返回一个控制器用于后续的交互。
     /// - `Err(SmtcError)`: 如果在启动过程中发生严重错误（例如，无法创建后台线程或 Tokio 运行时）。
     pub fn start() -> Result<MediaController> {
-        let (command_tx, command_rx) = mpsc::channel::<MediaCommand>();
-        let (update_tx, update_rx) = mpsc::channel::<MediaUpdate>();
+        let (command_tx, command_rx) = crossbeam_channel::unbounded::<MediaCommand>();
+        let (update_tx, update_rx) = crossbeam_channel::unbounded::<MediaUpdate>();
 
         // 启动后台协调器线程
         worker::start_media_worker_thread(command_rx, update_tx)?;
