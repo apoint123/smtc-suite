@@ -889,8 +889,20 @@ pub fn run_smtc_listener(
                         }
                         InternalCommand::RequestStateUpdate => {
                             log::debug!("[SMTC 主循环] 收到状态更新请求，将重新获取所有状态。");
-                            // 触发会话检查，这将连锁触发其他所有更新（包括曲目信息）
+                            // 触发会话列表刷新
                             let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
+
+                            // 立即获取并发送当前缓存的曲目信息
+                            let state_arc_clone = player_state_arc.clone();
+                            let connector_tx_clone = connector_update_tx.clone();
+                            tokio::task::spawn_local(async move {
+                                let state_guard = state_arc_clone.lock().await;
+                                let info = NowPlayingInfo::from(&*state_guard);
+                                let forced_update = InternalUpdate::NowPlayingTrackChangedForced(info);
+                                if connector_tx_clone.send(forced_update).is_err() {
+                                    log::warn!("[SMTC 主循环] 无法发送曲目更新信息。");
+                                }
+                            });
                         }
                         InternalCommand::SetProgressTimer(enabled) => {
                             if enabled {

@@ -240,6 +240,8 @@ pub enum MediaCommand {
 pub enum MediaUpdate {
     /// 当前播放的曲目信息已发生变化。
     TrackChanged(NowPlayingInfo),
+    /// 因强制刷新而发送的曲目信息。
+    TrackChangedForced(NowPlayingInfo),
     /// 可用的媒体会话列表已更新。
     SessionsChanged(Vec<SmtcSessionInfo>),
     /// 接收到一个音频数据包（如果音频捕获已启动）。

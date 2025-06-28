@@ -39,6 +39,8 @@ pub(crate) enum InternalCommand {
 pub(crate) enum InternalUpdate {
     /// 由 `smtc_handler` 发出，表示当前播放的曲目信息已变更。
     NowPlayingTrackChanged(NowPlayingInfo),
+    /// 强制刷新并发送当前的曲目信息。
+    NowPlayingTrackChangedForced(NowPlayingInfo),
     /// 由 `smtc_handler` 发出，表示可用的 SMTC 会话列表已更新。
     SmtcSessionListChanged(Vec<SmtcSessionInfo>),
     /// 由 `smtc_handler` 发出，表示之前选中的会话已消失。
@@ -466,6 +468,9 @@ impl From<InternalUpdate> for MediaUpdate {
     fn from(internal: InternalUpdate) -> Self {
         match internal {
             InternalUpdate::NowPlayingTrackChanged(info) => MediaUpdate::TrackChanged(info),
+            InternalUpdate::NowPlayingTrackChangedForced(info) => {
+                MediaUpdate::TrackChangedForced(info)
+            }
             InternalUpdate::SmtcSessionListChanged(list) => MediaUpdate::SessionsChanged(list),
             InternalUpdate::AudioDataPacket(bytes) => MediaUpdate::AudioData(bytes),
             InternalUpdate::AudioSessionVolumeChanged {

@@ -142,6 +142,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::error!("运行时错误: {}", e);
                 }
                 MediaUpdate::AudioData(_) => {}
+                MediaUpdate::TrackChangedForced(info) => {
+                    let new_info = parse_combined_artist_album_info(info);
+
+                    let has_text_info_changed = match &last_known_info {
+                        Some(last) => {
+                            last.title != new_info.title
+                                || last.artist != new_info.artist
+                                || last.album_title != new_info.album_title
+                        }
+                        None => true,
+                    };
+
+                    if has_text_info_changed {
+                        let title = new_info.title.as_deref().unwrap_or("N/A");
+                        let artist = new_info.artist.as_deref().unwrap_or("N/A");
+                        let album = new_info.album_title.as_deref().unwrap_or("N/A");
+                        log::info!(
+                            "曲目信息变更(强制): {} - {} (专辑: {})",
+                            artist,
+                            title,
+                            album
+                        );
+                    }
+
+                    log_smtc_status(&new_info);
+                    last_known_info = Some(new_info);
+                }
             },
             Err(RecvTimeoutError::Timeout) => {
                 if let Some(info) = &last_known_info {

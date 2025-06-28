@@ -142,8 +142,10 @@ pub struct CVolumeChangedEvent {
 /// 定义从 Rust 发送到 C 的更新事件类型。
 #[repr(C)]
 pub enum CUpdateType {
-    /// data 指针类型: `*const CNowPlayingInfo`
+    /// data 指针类型: `*const CNowPlayingInfo` (常规更新)
     TrackChanged,
+    /// data 指针类型: `*const CNowPlayingInfo` (强制刷新)
+    TrackChangedForced,
     /// data 指针类型: `*const CSessionList`
     SessionsChanged,
     /// data 指针类型: `*const CAudioDataPacket`
@@ -504,6 +506,25 @@ pub unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
 // 命令函数
 // ================================================================================================
 
+/// 请求一次全面的状态刷新。
+/// 此函数会触发 `SessionsChanged` 和 `TrackChangedForced` 事件。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smtc_suite_request_update(handle_ptr: *mut SmtcHandle) -> SmtcResult {
+    validate_handle!(handle_ptr);
+    let handle = unsafe { &*handle_ptr };
+
+    if let Some(controller) = &handle.controller
+        && controller
+            .command_tx
+            .send(MediaCommand::RequestUpdate)
+            .is_err()
+    {
+        log::error!("[FFI] 发送刷新请求失败: 通道已关闭。");
+        return SmtcResult::InternalError;
+    }
+    SmtcResult::Success
+}
+
 /// 向 SMTC 套件发送一个媒体控制命令。
 ///
 /// # 安全性
@@ -593,10 +614,10 @@ pub unsafe extern "C" fn smtc_suite_set_high_frequency_progress_updates(
                 .command_tx
                 .send(MediaCommand::SetHighFrequencyProgressUpdates(enabled))
                 .is_err()
-            {
-                log::error!("[FFI] 发送设置高频更新命令失败: 通道已关闭。");
-                return SmtcResult::InternalError;
-            }
+        {
+            log::error!("[FFI] 发送设置高频更新命令失败: 通道已关闭。");
+            return SmtcResult::InternalError;
+        }
         SmtcResult::Success
     }));
 
@@ -799,6 +820,15 @@ unsafe fn process_and_invoke_callback(
             let _guard = NowPlayingInfoGuard(c_info);
             callback(
                 CUpdateType::TrackChanged,
+                &_guard.0 as *const _ as *const c_void,
+                userdata,
+            );
+        }
+        MediaUpdate::TrackChangedForced(info) => {
+            let c_info = convert_to_c_now_playing_info(&info);
+            let _guard = NowPlayingInfoGuard(c_info);
+            callback(
+                CUpdateType::TrackChangedForced,
                 &_guard.0 as *const _ as *const c_void,
                 userdata,
             );
