@@ -72,12 +72,19 @@ pub struct CNowPlayingInfo {
     pub position_ms: u64,
     /// 当前是否正在播放。
     pub is_playing: bool,
-    /// 指向封面图片原始数据的指针。仅在回调内有效。
-    pub cover_data: *const u8,
+}
+
+/// C-ABI 兼容的封面数据结构体。
+///
+/// # 数据生命周期
+/// **此结构体及其指向的 `data` 数组仅在回调函数作用域内有效。**
+#[repr(C)]
+#[derive(Debug)]
+pub struct CCoverData {
+    /// 指向封面图片原始数据的指针。如果为 NULL，表示没有封面。
+    pub data: *const u8,
     /// 封面图片数据的长度（字节）。
-    pub cover_data_len: usize,
-    /// 封面图片数据的哈希值，可用于快速比较封面是否变化。
-    pub cover_data_hash: u64,
+    pub len: usize,
 }
 
 /// C-ABI 兼容的 SMTC 会话信息结构体。
@@ -148,6 +155,8 @@ pub enum CUpdateType {
     TrackChangedForced,
     /// data 指针类型: `*const CSessionList`
     SessionsChanged,
+    /// data 指针类型: `*const CCoverData`
+    CoverData,
     /// data 指针类型: `*const CAudioDataPacket`
     AudioData,
     /// data 指针类型: `*const c_char` (错误信息字符串)
@@ -847,6 +856,17 @@ unsafe fn process_and_invoke_callback(
                 userdata,
             );
         }
+        MediaUpdate::CoverData(bytes_opt) => {
+            let cover_data_struct = CCoverData {
+                data: bytes_opt.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
+                len: bytes_opt.as_ref().map_or(0, |d| d.len()),
+            };
+            callback(
+                CUpdateType::CoverData,
+                &cover_data_struct as *const _ as *const c_void,
+                userdata,
+            );
+        }
         MediaUpdate::AudioData(bytes) => {
             let packet = CAudioDataPacket {
                 data: bytes.as_ptr(),
@@ -907,12 +927,6 @@ fn convert_to_c_now_playing_info(info: &NowPlayingInfo) -> CNowPlayingInfo {
         duration_ms: info.duration_ms.unwrap_or(0),
         position_ms: info.position_ms.unwrap_or(0),
         is_playing: info.is_playing.unwrap_or(false),
-        cover_data: info
-            .cover_data
-            .as_ref()
-            .map_or(std::ptr::null(), |d| d.as_ptr()),
-        cover_data_len: info.cover_data.as_ref().map_or(0, |d| d.len()),
-        cover_data_hash: info.cover_data_hash.unwrap_or(0),
     }
 }
 

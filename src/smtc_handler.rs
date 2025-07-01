@@ -91,10 +91,6 @@ pub(crate) struct SharedPlayerState {
     pub is_shuffle_active: bool,
     /// 当前的重复播放模式。
     pub repeat_mode: RepeatMode,
-    /// 封面图片数据。
-    pub cover_data: Option<Vec<u8>>,
-    /// 封面图片数据的哈希值。
-    pub cover_data_hash: Option<u64>,
     /// 一个标志，表示正在等待来自SMTC的第一次更新。
     /// 在此期间，应暂停进度计时器。
     pub is_waiting_for_initial_update: bool,
@@ -139,8 +135,6 @@ impl From<&SharedPlayerState> for NowPlayingInfo {
             is_playing: Some(state.is_playing),
             is_shuffle_active: Some(state.is_shuffle_active),
             repeat_mode: Some(state.repeat_mode),
-            cover_data: state.cover_data.clone(),
-            cover_data_hash: state.cover_data_hash,
             position_report_time: state.last_known_position_report_time,
         }
     }
@@ -154,15 +148,6 @@ fn hstring_to_string(hstr: &HSTRING) -> String {
     } else {
         hstr.to_string_lossy()
     }
-}
-
-/// 计算封面图片数据的哈希值 (u64)，用于高效地检测封面图片是否发生变化。
-pub fn calculate_cover_hash(data: &[u8]) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-    let mut hasher = DefaultHasher::new();
-    data.hash(&mut hasher);
-    hasher.finish()
 }
 
 /// 定义一个状态更新函数的类型别名。
@@ -303,7 +288,7 @@ fn spawn_async_op<T, F>(
 /// 获取成功后，它会构建一个 `StateUpdateFn` 闭包，并通过通道发送给状态管理器 Actor 进行更新。
 async fn fetch_cover_data_async(
     thumb_ref: IRandomAccessStreamReference,
-    state_update_tx: TokioSender<StateUpdateFn>,
+    connector_update_tx: CrossbeamSender<InternalUpdate>,
 ) {
     log::trace!("[Cover Fetcher] 开始异步获取封面数据...");
     let cover_result: WinResult<Option<Vec<u8>>> = async {
@@ -333,7 +318,7 @@ async fn fetch_cover_data_async(
     }
     .await;
 
-    match cover_result {
+    let update_to_send = match cover_result {
         Ok(Some(bytes)) => {
             if bytes.len() > MAX_COVER_SIZE_BYTES {
                 log::warn!(
@@ -341,34 +326,24 @@ async fn fetch_cover_data_async(
                     bytes.len(),
                     MAX_COVER_SIZE_BYTES
                 );
-                return;
-            }
-
-            log::debug!(
-                "[Cover Fetcher] 成功获取封面数据 ({} 字节)，将发送更新请求。",
-                bytes.len()
-            );
-            let update_closure: StateUpdateFn = Box::new(move |state| {
-                log::trace!("[State Update] 正在更新封面数据...");
-                state.cover_data_hash = Some(calculate_cover_hash(&bytes));
-                state.cover_data = Some(bytes);
-            });
-            match state_update_tx.try_send(update_closure) {
-                Ok(_) => {} // 发送成功
-                Err(TrySendError::Full(_)) => {
-                    log::warn!("[Cover Fetcher] 状态更新通道已满，本次封面更新可能被丢弃。");
-                }
-                Err(TrySendError::Closed(_)) => {
-                    log::warn!("[Cover Fetcher] 状态更新通道已关闭，无法发送封面数据。");
-                }
+                InternalUpdate::CoverData(None)
+            } else {
+                log::debug!("[Cover Fetcher] 成功获取封面数据 ({} 字节)", bytes.len());
+                InternalUpdate::CoverData(Some(bytes))
             }
         }
         Ok(None) => {
-            // 没有封面也算正常情况
+            log::info!("[Cover Fetcher] 媒体会话提供了空的封面流。");
+            InternalUpdate::CoverData(None)
         }
         Err(e) => {
             log::warn!("[Cover Fetcher] 异步获取封面数据失败: {e:?}");
+            InternalUpdate::CoverData(None)
         }
+    };
+
+    if connector_update_tx.send(update_to_send).is_err() {
+        log::warn!("[Cover Fetcher] 无法将封面数据转发给 Worker，通道可能已关闭。");
     }
 }
 
@@ -729,15 +704,12 @@ pub fn run_smtc_listener(
                 log::info!("[状态管理器 Actor] 任务已启动。");
                 while let Some(update_fn) = state_update_rx.recv().await {
                     log::trace!("[状态管理器 Actor] 收到状态更新请求。");
-
-                    let update_to_send = {
-                        let mut state_guard = player_state_clone.lock().await;
-                        update_fn(&mut state_guard);
-                        InternalUpdate::NowPlayingTrackChanged(NowPlayingInfo::from(&*state_guard))
-                    };
-
+                    let mut state_guard = player_state_clone.lock().await;
+                    update_fn(&mut state_guard);
+                    let update_to_send =
+                        InternalUpdate::NowPlayingTrackChanged(NowPlayingInfo::from(&*state_guard));
                     if connector_update_tx_clone.send(update_to_send).is_err() {
-                        log::warn!("[状态管理器 Actor] 无法发送状态更新通知，主连接器可能已关闭。");
+                        log::warn!("[状态管理器 Actor] 无法发送状态更新通知。");
                         break;
                     }
                 }
@@ -888,21 +860,23 @@ pub fn run_smtc_listener(
                             }
                         }
                         InternalCommand::RequestStateUpdate => {
-                            log::debug!("[SMTC 主循环] 收到状态更新请求，将重新获取所有状态。");
-                            // 触发会话列表刷新
-                            let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
-
-                            // 立即获取并发送当前缓存的曲目信息
-                            let state_arc_clone = player_state_arc.clone();
-                            let connector_tx_clone = connector_update_tx.clone();
-                            tokio::task::spawn_local(async move {
-                                let state_guard = state_arc_clone.lock().await;
-                                let info = NowPlayingInfo::from(&*state_guard);
-                                let forced_update = InternalUpdate::NowPlayingTrackChangedForced(info);
-                                if connector_tx_clone.send(forced_update).is_err() {
-                                    log::warn!("[SMTC 主循环] 无法发送曲目更新信息。");
+                            log::info!("[SMTC 主循环] 收到状态更新请求，将重新获取所有状态。");
+                            if let Some(old_session) = state.current_monitored_session.take()
+                                && let Some(tokens) = state.current_listener_tokens.take() {
+                                    log::debug!("[SMTC 主循环] 正在注销旧会话的事件监听器...");
+                                    let _ = old_session.RemoveMediaPropertiesChanged(tokens.0);
+                                    let _ = old_session.RemovePlaybackInfoChanged(tokens.1);
+                                    let _ = old_session.RemoveTimelinePropertiesChanged(tokens.2);
                                 }
-                            });
+
+                            if let Err(e) = handle_sessions_changed(
+                                &mut state,
+                                &connector_update_tx,
+                                &smtc_event_tx,
+                                &state_update_tx,
+                            ) {
+                                log::error!("[SMTC 主循环] 重建会话时出错: {e}");
+                            }
                         }
                         InternalCommand::SetProgressTimer(enabled) => {
                             if enabled {
@@ -1093,43 +1067,36 @@ pub fn run_smtc_listener(
                             const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
                             let is_placeholder_title = IGNORED_TITLES.iter().any(|&ignored| title == ignored);
 
-                            // 更新文本信息
                             if !is_placeholder_title {
                                 let update_fn = Box::new(move |state: &mut SharedPlayerState| {
                                     log::trace!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist, &title);
                                     if state.title != title || state.artist != artist {
                                         state.is_waiting_for_initial_update = true;
-                                        log::trace!("[媒体属性] 曲目变化，正在等待第一次 SMTC 更新。");
                                     }
                                     state.title = title;
                                     state.artist = artist;
                                     state.album = album;
                                 });
-                                match state_update_tx.try_send(update_fn) {
-                                    Ok(_) => {} // 发送成功
-                                    Err(TrySendError::Full(_)) => {
-                                        log::warn!("[SMTC 主循环] 状态更新通道已满，丢弃了一次文本信息更新。");
-                                    }
-                                    Err(TrySendError::Closed(_)) => {
-                                        log::error!("[SMTC 主循环] 状态更新通道已关闭，无法发送文本信息更新。");
-                                    }
+                                // 发送文本信息更新
+                                if state_update_tx.try_send(update_fn).is_err() {
+                                    log::warn!("[SMTC 主循环] 状态更新通道已满，丢弃了一次文本信息更新。");
                                 }
                             }
 
-                            // 1. 如果有旧的封面获取任务正在运行，先取消它
-                            if let Some(old_handle) = state.active_cover_fetch_task.take() {
-                                log::trace!("[SMTC 主循环] 检测到新歌曲，取消旧的封面获取任务...");
-                                old_handle.abort();
+                            // 封面获取逻辑
+                            if let Some(old_task) = state.active_cover_fetch_task.take() {
+                                old_task.abort();
                             }
 
-                            // 2. 启动新的封面获取任务
                             if let Ok(thumb_ref) = props.Thumbnail() {
-                                let new_handle = tokio::task::spawn_local(fetch_cover_data_async(thumb_ref, state_update_tx.clone()));
+                                let new_handle = tokio::task::spawn_local(fetch_cover_data_async(
+                                    thumb_ref,
+                                    connector_update_tx.clone(),
+                                ));
                                 state.active_cover_fetch_task = Some(new_handle);
                             } else {
-                                // 如果没有缩略图引用，清空封面
-                                let update_fn = Box::new(|state: &mut SharedPlayerState| { state.cover_data = None; state.cover_data_hash = None; });
-                                if state_update_tx.try_send(update_fn).is_err() {
+                                // 如果没有缩略图引用，发送一个空的封面更新
+                                if connector_update_tx.send(InternalUpdate::CoverData(None)).is_err() {
                                     log::warn!("[SMTC 主循环] 无法发送清空封面更新。");
                                 }
                             }

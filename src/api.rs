@@ -72,11 +72,6 @@ pub struct NowPlayingInfo {
     pub is_shuffle_active: Option<bool>,
     /// 当前的重复播放模式。
     pub repeat_mode: Option<RepeatMode>,
-    /// 封面图片的原始字节数据。
-    #[serde(serialize_with = "base64_serialization::serialize")]
-    pub cover_data: Option<Vec<u8>>,
-    /// 封面数据的哈希值，用于快速比较封面是否已更改。
-    pub cover_data_hash: Option<u64>,
     /// SMTC 上次报告播放位置的时间点。
     #[serde(skip)]
     pub position_report_time: Option<Instant>,
@@ -244,6 +239,9 @@ pub enum MediaUpdate {
     TrackChangedForced(NowPlayingInfo),
     /// 可用的媒体会话列表已更新。
     SessionsChanged(Vec<SmtcSessionInfo>),
+    /// 专门用于发送封面数据的事件。
+    /// 负载是 Base64 编码的图片数据或 null。
+    CoverData(#[serde(with = "base64_serialization")] Option<Vec<u8>>),
     /// 接收到一个音频数据包（如果音频捕获已启动）。
     #[serde(skip)]
     AudioData(Vec<u8>),
