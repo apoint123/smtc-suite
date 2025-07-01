@@ -1,20 +1,6 @@
 use crossbeam_channel::{self, Receiver, SendError, Sender};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
-/// 一个辅助模块，用于将 Option<Vec<u8>> 序列化为 Base64 字符串。
-mod base64_serialization {
-    use base64::Engine;
-    use base64::engine::general_purpose::STANDARD;
-    use serde::{Serialize, Serializer};
-
-    pub fn serialize<S>(bytes: &Option<Vec<u8>>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let base64_string: Option<String> = bytes.as_ref().map(|b| STANDARD.encode(b));
-        base64_string.serialize(serializer)
-    }
-}
 
 /// 定义重复播放模式的枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -48,10 +34,7 @@ pub enum TextConversionMode {
     HongKongToSimplified,
 }
 
-/// 包含当前正在播放曲目的详细信息。
-///
-/// 这个结构体聚合了从系统媒体传输控件 (SMTC) 获取的所有相关信息，
-/// 例如歌曲标题、艺术家、时长、播放状态和封面艺术。
+/// 包含当前正在播放曲目所有信息的、唯一的、完整的状态快照。
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct NowPlayingInfo {
     /// 曲目标题。
@@ -60,19 +43,41 @@ pub struct NowPlayingInfo {
     pub artist: Option<String>,
     /// 专辑标题。
     pub album_title: Option<String>,
+
     /// 曲目总时长（毫秒）。
     pub duration_ms: Option<u64>,
     /// 当前播放位置（毫秒）。
     ///
-    /// 这是一个估算值，结合了 SMTC 上次报告的位置和自那时起经过的时间。
+    /// 这是一个估算值，结合了 SMTC 上次报告的位置和自那时起经过的时间，
+    /// 以便在没有高频事件时也能提供相对平滑的进度。
     pub position_ms: Option<u64>,
-    /// 是否正在播放。
+
+    /// 当前是否正在播放。
     pub is_playing: Option<bool>,
-    /// 是否处于随机播放模式。
+    /// 当前是否处于随机播放模式。
     pub is_shuffle_active: Option<bool>,
     /// 当前的重复播放模式。
     pub repeat_mode: Option<RepeatMode>,
-    /// SMTC 上次报告播放位置的时间点。
+
+    /// 指示媒体源当前是否允许“播放”操作。
+    pub can_play: Option<bool>,
+    /// 指示媒体源当前是否允许“暂停”操作。
+    pub can_pause: Option<bool>,
+    /// 指示媒体源当前是否允许“下一首”操作。
+    pub can_skip_next: Option<bool>,
+    /// 指示媒体源当前是否允许“上一首”操作。
+    pub can_skip_previous: Option<bool>,
+
+    /// 封面图片的原始字节数据 (`Vec<u8>`)。
+    #[serde(skip)]
+    pub cover_data: Option<Vec<u8>>,
+    /// 封面数据的哈希值。
+    ///
+    /// 可用于快速比较封面是否已更改。
+    #[serde(skip)]
+    pub cover_data_hash: Option<u64>,
+
+    /// (内部使用) SMTC 上次报告播放位置的时间点。
     #[serde(skip)]
     pub position_report_time: Option<Instant>,
 }
@@ -233,17 +238,16 @@ pub enum MediaCommand {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum MediaUpdate {
-    /// 当前播放的曲目信息已发生变化。
+    /// 当媒体状态发生有意义的变化时发送。
+    ///
+    /// 负载是一个 `NowPlayingInfo` 结构体，包含了所有最新的媒体信息，
+    /// 包括元数据、播放状态、进度和封面数据。
     TrackChanged(NowPlayingInfo),
-    /// 因强制刷新而发送的曲目信息。
+    /// 响应 `RequestUpdate` 命令时发送，同样包含一个完整的状态快照。
     TrackChangedForced(NowPlayingInfo),
     /// 可用的媒体会话列表已更新。
     SessionsChanged(Vec<SmtcSessionInfo>),
-    /// 专门用于发送封面数据的事件。
-    /// 负载是 Base64 编码的图片数据或 null。
-    CoverData(#[serde(with = "base64_serialization")] Option<Vec<u8>>),
     /// 接收到一个音频数据包（如果音频捕获已启动）。
-    #[serde(skip)]
     AudioData(Vec<u8>),
     /// 报告一个非致命的运行时错误。
     Error(String),

@@ -142,7 +142,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     log::error!("运行时错误: {}", e);
                 }
                 MediaUpdate::AudioData(_) => {}
-                MediaUpdate::CoverData(_) => {}
                 MediaUpdate::TrackChangedForced(info) => {
                     let new_info = parse_combined_artist_album_info(info);
 

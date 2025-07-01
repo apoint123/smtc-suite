@@ -74,19 +74,6 @@ pub struct CNowPlayingInfo {
     pub is_playing: bool,
 }
 
-/// C-ABI 兼容的封面数据结构体。
-///
-/// # 数据生命周期
-/// **此结构体及其指向的 `data` 数组仅在回调函数作用域内有效。**
-#[repr(C)]
-#[derive(Debug)]
-pub struct CCoverData {
-    /// 指向封面图片原始数据的指针。如果为 NULL，表示没有封面。
-    pub data: *const u8,
-    /// 封面图片数据的长度（字节）。
-    pub len: usize,
-}
-
 /// C-ABI 兼容的 SMTC 会话信息结构体。
 ///
 /// # 数据生命周期
@@ -155,8 +142,6 @@ pub enum CUpdateType {
     TrackChangedForced,
     /// data 指针类型: `*const CSessionList`
     SessionsChanged,
-    /// data 指针类型: `*const CCoverData`
-    CoverData,
     /// data 指针类型: `*const CAudioDataPacket`
     AudioData,
     /// data 指针类型: `*const c_char` (错误信息字符串)
@@ -853,17 +838,6 @@ unsafe fn process_and_invoke_callback(
             callback(
                 CUpdateType::SessionsChanged,
                 &list as *const _ as *const c_void,
-                userdata,
-            );
-        }
-        MediaUpdate::CoverData(bytes_opt) => {
-            let cover_data_struct = CCoverData {
-                data: bytes_opt.as_ref().map_or(std::ptr::null(), |d| d.as_ptr()),
-                len: bytes_opt.as_ref().map_or(0, |d| d.len()),
-            };
-            callback(
-                CUpdateType::CoverData,
-                &cover_data_struct as *const _ as *const c_void,
                 userdata,
             );
         }

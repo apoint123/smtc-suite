@@ -51,8 +51,6 @@ pub(crate) enum InternalUpdate {
         volume: f32,
         is_muted: bool,
     },
-    /// 专门用于从 smtc_handler 接收封面数据的内部事件。
-    CoverData(Option<Vec<u8>>),
 }
 
 /// `MediaWorker` 是整个媒体库的核心协调器。
@@ -482,7 +480,6 @@ impl From<InternalUpdate> for MediaUpdate {
             InternalUpdate::SelectedSmtcSessionVanished(session_id) => {
                 MediaUpdate::SelectedSessionVanished(session_id)
             }
-            InternalUpdate::CoverData(bytes) => MediaUpdate::CoverData(bytes),
         }
     }
 }
