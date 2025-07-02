@@ -150,25 +150,12 @@ fn process_and_send_audio_data(
     };
 
     if !final_samples_f32_for_conversion.is_empty() {
-        // --- 步骤 2: 将 f32 样本 (-1.0 到 1.0) 转换为 u16 样本 (0 到 65535) ---
-        let audio_data_u16: Vec<u16> = final_samples_f32_for_conversion
+        let audio_data_bytes: Vec<u8> = final_samples_f32_for_conversion
             .iter()
-            .map(|&sample_f32| {
-                // 将 f32 样本从 [-1.0, 1.0] 范围映射到 [0.0, 1.0] 范围
-                let normalized_sample = (sample_f32.clamp(-1.0, 1.0) + 1.0) / 2.0;
-                // 将 [0.0, 1.0] 范围的样本缩放到 u16 的完整范围 [0, 65535]
-                let scaled_sample = normalized_sample * (u16::MAX as f32);
-                scaled_sample.round() as u16
-            })
+            .flat_map(|&sample_f32| sample_f32.to_le_bytes())
             .collect();
 
-        // --- 步骤 3: 将 u16 样本转换为字节流 (Vec<u8>) ---
-        let audio_data_bytes: Vec<u8> = audio_data_u16
-            .iter()
-            .flat_map(|&sample_u16| sample_u16.to_le_bytes()) // 使用小端序 (Little-Endian)
-            .collect();
-
-        // --- 步骤 4: 通过通道发送数据包 ---
+        // 通过通道发送数据包
         if update_tx
             .send(InternalUpdate::AudioDataPacket(audio_data_bytes))
             .is_err()
