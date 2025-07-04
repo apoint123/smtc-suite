@@ -1,6 +1,6 @@
 [package]
 name = "smtc-suite"
-version = "2.3.1"
+version = "2.3.2"
 edition = "2024"
 authors = ["apoint123 <vpnzaph@outlook.com>"]
 description = "一个用于与 Windows 系统媒体控件 (SMTC) 和系统音频进行交互的 Rust 库。"

@@ -93,9 +93,13 @@ pub(crate) struct SharedPlayerState {
     pub repeat_mode: RepeatMode,
     pub cover_data: Option<Vec<u8>>,
     pub cover_data_hash: Option<u64>,
+    /// 用于防止竞争获取封面的计数器。
+    pub cover_fetch_counter: u64,
     /// 一个标志，表示正在等待来自SMTC的第一次更新。
     /// 在此期间，应暂停进度计时器。
     pub is_waiting_for_initial_update: bool,
+    /// 用于防止对同一曲目并发获取封面的标志。
+    pub cover_fetch_in_progress: Option<(String, String)>,
 }
 
 impl SharedPlayerState {
@@ -306,6 +310,7 @@ fn spawn_async_op<T, F>(
 async fn fetch_cover_data_async(
     thumb_ref: IRandomAccessStreamReference,
     state_update_tx: TokioSender<StateUpdateFn>,
+    counter: u64,
 ) {
     log::debug!("[Cover Fetcher] 开始异步获取封面数据...");
 
@@ -348,6 +353,12 @@ async fn fetch_cover_data_async(
 
     // 根据获取结果，构建一个状态更新闭包
     let update_closure: StateUpdateFn = Box::new(move |state| {
+        if state.cover_fetch_counter != counter {
+            return;
+        }
+
+        state.cover_fetch_in_progress = None;
+
         match cover_result {
             Ok(Some(bytes)) => {
                 // 检查数据大小是否超出限制
@@ -1146,34 +1157,62 @@ pub fn run_smtc_listener(
                             const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
                             let is_placeholder_title = IGNORED_TITLES.iter().any(|&ignored| title == ignored);
 
-                            if !is_placeholder_title {
+                            let title_clone = title.clone();
+                            let artist_clone = artist.clone();
+                            let album_clone = album.clone();
+
+                            if let Ok(thumb_ref) = props.Thumbnail() {
+                                let state_update_tx_clone = state_update_tx.clone();
+                                let player_state_arc_clone = player_state_arc.clone();
+
+                                tokio::task::spawn_local(async move {
+                                    let mut state_guard = player_state_arc_clone.lock().await;
+
+                                    let current_track_identity = (title.clone(), artist.clone());
+                                    if state_guard.cover_fetch_in_progress.as_ref() == Some(&current_track_identity) {
+                                        return;
+                                    }
+
+                                    if !is_placeholder_title {
+                                        log::info!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist, &title);
+                                        if state_guard.title != title || state_guard.artist != artist {
+                                            state_guard.cover_data_hash = None;
+                                            state_guard.is_waiting_for_initial_update = true;
+                                        }
+                                        state_guard.title = title;
+                                        state_guard.artist = artist;
+                                        state_guard.album = album;
+                                    }
+
+                                    state_guard.cover_fetch_in_progress = Some(current_track_identity);
+                                    state_guard.cover_fetch_counter += 1;
+                                    let current_generation = state_guard.cover_fetch_counter;
+
+                                    drop(state_guard);
+
+                                    tokio::task::spawn_local(fetch_cover_data_async(
+                                        thumb_ref,
+                                        state_update_tx_clone,
+                                        current_generation,
+                                    ));
+                                });
+
+                            } else if !is_placeholder_title {
                                 let update_fn = Box::new(move |state: &mut SharedPlayerState| {
-                                    log::info!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist, &title);
-                                    if state.title != title || state.artist != artist {
+                                    log::info!("[SMTC 主循环] 接收到新曲目信息: '{}' - '{}'", &artist_clone, &title_clone);
+                                    if state.title != title_clone || state.artist != artist_clone {
+                                        state.cover_data = None;
                                         state.cover_data_hash = None;
                                         state.is_waiting_for_initial_update = true;
                                     }
-                                    state.title = title;
-                                    state.artist = artist;
-                                    state.album = album;
+                                    state.title = title_clone;
+                                    state.artist = artist_clone;
+                                    state.album = album_clone;
                                 });
                                 // 发送文本信息更新
                                 if state_update_tx.try_send(update_fn).is_err() {
                                     log::warn!("[SMTC 主循环] 状态更新通道已满，丢弃了一次文本信息更新。");
                                 }
-                            }
-
-                            // 封面获取逻辑
-                            if let Some(old_task) = state.active_cover_fetch_task.take() {
-                                old_task.abort();
-                            }
-
-                            if let Ok(thumb_ref) = props.Thumbnail() {
-                                let new_handle = tokio::task::spawn_local(fetch_cover_data_async(
-                                    thumb_ref,
-                                    state_update_tx.clone(),
-                                ));
-                                state.active_cover_fetch_task = Some(new_handle);
                             }
                         }
                         AsyncTaskResult::MediaPropertiesReady(Err(e)) => {
