@@ -1,7 +1,11 @@
 use std::{sync::Arc, thread};
 
 use crossbeam_channel::{Receiver as CrossbeamReceiver, Sender as CrossbeamSender};
-use tokio::{runtime::Runtime, sync::mpsc::Receiver as TokioReceiver, task::LocalSet};
+use tokio::{
+    runtime::Runtime,
+    sync::{mpsc::Receiver as TokioReceiver, watch},
+    task::LocalSet,
+};
 
 use crate::{
     api::{
@@ -37,8 +41,6 @@ pub(crate) enum InternalCommand {
 /// 然后将它们转换为外部可见的 `MediaUpdate`。
 #[derive(Debug, Clone)]
 pub(crate) enum InternalUpdate {
-    /// 由 `smtc_handler` 发出，表示当前播放的曲目信息已变更。
-    NowPlayingTrackChanged(NowPlayingInfo),
     /// 由 `smtc_handler` 发出，表示可用的 SMTC 会话列表已更新。
     SmtcSessionListChanged(Vec<SmtcSessionInfo>),
     /// 由 `smtc_handler` 发出，表示之前选中的会话已消失。
@@ -72,6 +74,8 @@ pub(crate) struct MediaWorker {
     smtc_control_tx: Option<CrossbeamSender<InternalCommand>>,
     /// 从 SMTC 处理器的“桥接任务”异步接收内部更新。
     smtc_update_rx: TokioReceiver<InternalUpdate>,
+    /// 从 SMTC 处理器接收"正在播放"状态的广播
+    now_playing_rx: watch::Receiver<NowPlayingInfo>,
     /// 向 SMTC 处理器线程发送关闭信号，用于优雅地停止它。
     smtc_shutdown_tx: Option<CrossbeamSender<()>>,
     /// SMTC 处理器线程的句柄，用于在关闭时 `join` 它。
@@ -116,6 +120,7 @@ impl MediaWorker {
         let (command_tx_async, command_rx_async) = tokio::sync::mpsc::channel::<MediaCommand>(32);
         let (smtc_update_tx_async, smtc_update_rx_async) =
             tokio::sync::mpsc::channel::<InternalUpdate>(32);
+        let (now_playing_tx, now_playing_rx) = watch::channel(NowPlayingInfo::default());
 
         // b. 用于与子模块（在它们自己的线程中运行）通信的【同步】通道。
         let (smtc_update_tx_sync, smtc_update_rx_sync) = crossbeam_channel::unbounded();
@@ -165,6 +170,7 @@ impl MediaWorker {
             update_tx: update_tx_to_app,
             smtc_control_tx: Some(smtc_control_tx_sync),
             smtc_update_rx: smtc_update_rx_async,
+            now_playing_rx,
             smtc_shutdown_tx: None,
             smtc_handler_thread_handle: None,
             audio_capturer: None,
@@ -174,7 +180,11 @@ impl MediaWorker {
         };
 
         // 5. 启动所有子系统。
-        worker_instance.start_smtc_handler_thread(smtc_control_rx_sync, smtc_update_tx_sync);
+        worker_instance.start_smtc_handler_thread(
+            smtc_control_rx_sync,
+            smtc_update_tx_sync,
+            now_playing_tx,
+        );
 
         log::debug!("[MediaWorker] 初始化完成，即将进入核心异步事件循环。");
 
@@ -211,6 +221,16 @@ impl MediaWorker {
                         break;
                     }
                     self.handle_command_from_app(command);
+                },
+
+                // 处理来自 SMTC 的 NowPlayingInfo 状态广播
+                // 当 watch 通道的值发生变化时，这个分支会被唤醒
+                Ok(_) = self.now_playing_rx.changed() => {
+                    let info = self.now_playing_rx.borrow().clone();
+                    if info.title.is_some()
+                        && self.update_tx.send(MediaUpdate::TrackChanged(info)).is_err() {
+                            log::error!("[MediaWorker] 发送 TrackChanged 更新到外部失败。");
+                        }
                 },
 
                 // --- 分支 2: 处理来自 SMTC 处理器的更新 ---
@@ -297,6 +317,7 @@ impl MediaWorker {
         &mut self,
         control_rx_for_smtc: CrossbeamReceiver<InternalCommand>,
         update_tx_for_smtc: CrossbeamSender<InternalUpdate>,
+        now_playing_tx: watch::Sender<NowPlayingInfo>,
     ) {
         if self.smtc_handler_thread_handle.is_some() {
             log::warn!("[MediaWorker] 尝试启动 SMTC 处理器，但它似乎已在运行。");
@@ -319,6 +340,7 @@ impl MediaWorker {
                     control_rx_for_smtc,
                     player_state_clone,
                     shutdown_rx_for_smtc, // 传递关闭信号接收端
+                    now_playing_tx,
                 ) {
                     log::error!("[SMTC Handler Thread] SMTC Handler 运行出错: {e}");
                 }
@@ -465,7 +487,6 @@ pub(crate) fn start_media_worker_thread(
 impl From<InternalUpdate> for MediaUpdate {
     fn from(internal: InternalUpdate) -> Self {
         match internal {
-            InternalUpdate::NowPlayingTrackChanged(info) => MediaUpdate::TrackChanged(info),
             InternalUpdate::SmtcSessionListChanged(list) => MediaUpdate::SessionsChanged(list),
             InternalUpdate::AudioDataPacket(bytes) => MediaUpdate::AudioData(bytes),
             InternalUpdate::AudioSessionVolumeChanged {

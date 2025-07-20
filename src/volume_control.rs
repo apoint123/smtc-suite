@@ -227,9 +227,9 @@ fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSession
         // 如果循环结束仍未找到匹配的会话，则打印所有收集到的会话信息。
         log::error!("[音量控制] 未能为标识符 '{identifier}' 找到匹配的活动音频会话。");
         if !all_sessions_for_debug.is_empty() {
-            log::info!("[音量控制] 以下是系统中所有（包括非活动）音频会话的快照:");
+            log::trace!("[音量控制] 以下是系统中所有（包括非活动）音频会话的快照:");
             for session_info in all_sessions_for_debug {
-                log::info!("{session_info}");
+                log::trace!("{session_info}");
             }
         }
     }

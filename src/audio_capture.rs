@@ -42,6 +42,25 @@ use crate::{
     worker::InternalUpdate,
 };
 
+struct AudioClientGuard<'a> {
+    client: &'a IAudioClient,
+}
+
+impl<'a> AudioClientGuard<'a> {
+    fn new(client: &'a IAudioClient) -> Result<Self> {
+        unsafe { client.Start()? };
+        Ok(Self { client })
+    }
+}
+
+impl<'a> Drop for AudioClientGuard<'a> {
+    fn drop(&mut self) {
+        if let Err(e) = unsafe { self.client.Stop() } {
+            log::warn!("[AudioClientGuard] 停止音频客户端失败: {e:?}");
+        }
+    }
+}
+
 // --- 模块常量定义 ---
 
 /// 目标采样率 (单位: Hz)。所有捕获的音频最终会重采样到这个频率。
@@ -99,7 +118,7 @@ pub struct AudioCapturer {
 
 // --- 音频数据处理与发送辅助函数 ---
 
-/// 辅助函数：处理音频数据的声道转换、格式转换 (f32 -> u16)，并通过通道发送。
+/// 辅助函数：处理音频数据的声道转换，并通过通道发送。
 ///
 /// # 参数
 /// * `audio_f32_interleaved`: 经过可选重采样后的交错 `f32` 音频数据。
@@ -405,9 +424,9 @@ impl AudioCapturer {
             log::trace!("[音频捕获线程] IAudioCaptureClient 服务获取成功。");
 
             // --- 步骤 5: 启动音频流 ---
-            audio_client.Start()?;
+            let _client_guard = AudioClientGuard::new(&audio_client)?;
             log::debug!(
-                "[音频捕获线程] 音频捕获流已启动。目标输出格式: {TARGET_SAMPLE_RATE}Hz, {TARGET_CHANNELS}声道 (u16 PCM)。"
+                "[音频捕获线程] 音频捕获流已启动。目标输出格式: {TARGET_SAMPLE_RATE}Hz, {TARGET_CHANNELS}声道。"
             );
 
             // --- 步骤 6: 初始化重采样器 (如果需要) ---
@@ -721,10 +740,6 @@ impl AudioCapturer {
                 }
             }
 
-            // --- 步骤 10: 停止音频客户端并清理 ---
-            log::debug!("[音频捕获线程] 停止信号已收到或发生发送错误，正在停止音频客户端...");
-            audio_client.Stop()?;
-            log::trace!("[音频捕获线程] 音频客户端已成功停止。");
             Ok(())
         } // unsafe 块结束
     }

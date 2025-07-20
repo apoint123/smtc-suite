@@ -1,0 +1,227 @@
+use crossbeam_channel::{RecvTimeoutError, select};
+use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo, RepeatMode};
+use std::time::Duration;
+
+fn parse_combined_artist_album_info(mut info: NowPlayingInfo) -> NowPlayingInfo {
+    if let Some(original_artist_field) = info.artist.take() {
+        if let Some((artist, album)) = original_artist_field.split_once(" — ") {
+            info.artist = Some(artist.trim().to_string());
+            if info.album_title.as_deref().unwrap_or("").is_empty() {
+                info.album_title = Some(album.trim().to_string());
+            }
+        } else {
+            info.artist = Some(original_artist_field);
+        }
+    }
+    info
+}
+
+fn get_estimated_pos(info: &NowPlayingInfo) -> Option<u64> {
+    if info.is_playing.unwrap_or(false) {
+        if let (Some(last_pos_ms), Some(report_time)) =
+            (info.position_ms, info.position_report_time)
+        {
+            let elapsed_ms = report_time.elapsed().as_millis() as u64;
+            let estimated_pos = last_pos_ms + elapsed_ms;
+            if let Some(duration_ms) = info.duration_ms {
+                if duration_ms > 0 {
+                    return Some(estimated_pos.min(duration_ms));
+                }
+            }
+            return Some(estimated_pos);
+        }
+    }
+    info.position_ms
+}
+
+fn ms_to_hms(ms: u64) -> String {
+    let secs = ms / 1000;
+    let millis = ms % 1000;
+    let mins = secs / 60;
+    let secs = secs % 60;
+    format!("{:02}:{:02}.{:03}", mins, secs, millis)
+}
+
+fn controls_status(info: &NowPlayingInfo) {
+    let to_symbol = |flag: Option<bool>| {
+        if flag.unwrap_or(false) {
+            "True"
+        } else {
+            "False"
+        }
+    };
+
+    log::info!(
+        "可用操作: [播放: {}], [暂停: {}], [上一首: {}], [下一首: {}], [跳转: {}], [随机: {}], [循环: {}]",
+        to_symbol(info.can_play),
+        to_symbol(info.can_pause),
+        to_symbol(info.can_skip_previous),
+        to_symbol(info.can_skip_next),
+        to_symbol(info.can_seek),
+        to_symbol(info.can_change_shuffle),
+        to_symbol(info.can_change_repeat)
+    );
+}
+
+fn timeline_status(info: &NowPlayingInfo) {
+    let estimated_pos_ms = get_estimated_pos(info).unwrap_or(0);
+    let duration_ms = info.duration_ms.unwrap_or(0);
+
+    log::info!(
+        "时间线: {} / {}",
+        ms_to_hms(estimated_pos_ms),
+        ms_to_hms(duration_ms),
+    );
+}
+
+fn log_playback_status(info: &NowPlayingInfo) {
+    let play_state = if info.is_playing.unwrap_or(false) {
+        "正在播放"
+    } else {
+        "已暂停"
+    };
+    let shuffle_state = if info.is_shuffle_active.unwrap_or(false) {
+        "True"
+    } else {
+        "False"
+    };
+    let repeat_state = match info.repeat_mode {
+        Some(RepeatMode::Off) => "关闭",
+        Some(RepeatMode::One) => "单曲",
+        Some(RepeatMode::All) => "列表",
+        None => "未知",
+    };
+
+    log::info!(
+        "播放状态: {} | 随机: {} | 循环: {}",
+        play_state,
+        shuffle_state,
+        repeat_state
+    );
+}
+
+fn handle_track_changed(
+    info: NowPlayingInfo,
+    last_known_info: &mut Option<NowPlayingInfo>,
+    is_forced: bool,
+) {
+    let new_info = parse_combined_artist_album_info(info);
+
+    let has_text_info_changed = match last_known_info {
+        Some(last) => {
+            last.title != new_info.title
+                || last.artist != new_info.artist
+                || last.album_title != new_info.album_title
+        }
+        None => true,
+    };
+
+    let has_controls_changed = match last_known_info {
+        Some(last) => {
+            last.can_play != new_info.can_play
+                || last.can_pause != new_info.can_pause
+                || last.can_skip_next != new_info.can_skip_next
+                || last.can_skip_previous != new_info.can_skip_previous
+                || last.can_seek != new_info.can_seek
+                || last.can_change_shuffle != new_info.can_change_shuffle
+                || last.can_change_repeat != new_info.can_change_repeat
+        }
+        None => true,
+    };
+
+    let has_playback_state_changed = match last_known_info {
+        Some(last) => {
+            last.is_playing != new_info.is_playing
+                || last.is_shuffle_active != new_info.is_shuffle_active
+                || last.repeat_mode != new_info.repeat_mode
+        }
+        None => true,
+    };
+
+    if has_text_info_changed {
+        let title = new_info.title.as_deref().unwrap_or("N/A");
+        let artist = new_info.artist.as_deref().unwrap_or("N/A");
+        let album = new_info.album_title.as_deref().unwrap_or("N/A");
+        let force_str = if is_forced { "(强制)" } else { "" };
+        log::info!(
+            "曲目信息变更{}: {} - {} (专辑: {})",
+            force_str,
+            artist,
+            title,
+            album
+        );
+    }
+
+    if has_controls_changed {
+        controls_status(&new_info);
+    }
+
+    if has_playback_state_changed {
+        log_playback_status(&new_info);
+    }
+
+    timeline_status(&new_info);
+    *last_known_info = Some(new_info);
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    let controller = MediaManager::start()?;
+    let mut last_known_info: Option<NowPlayingInfo> = None;
+
+    loop {
+        let result = select! {
+            recv(controller.update_rx) -> msg => {
+                match msg {
+                    Ok(update) => Ok(update),
+                    Err(_) => Err(RecvTimeoutError::Disconnected),
+                }
+            },
+            default(Duration::from_secs(1)) => {
+                Err(RecvTimeoutError::Timeout)
+            }
+        };
+
+        match result {
+            Ok(update) => match update {
+                MediaUpdate::SessionsChanged(sessions) => {
+                    if sessions.is_empty() {
+                        log::warn!("当前没有可用的媒体会话。");
+                        last_known_info = None;
+                    } else {
+                        for (i, session) in sessions.iter().enumerate() {
+                            log::info!("  [{}] {}", i + 1, session.display_name);
+                        }
+                    }
+                    println!();
+                }
+                MediaUpdate::TrackChanged(info) => {
+                    handle_track_changed(info, &mut last_known_info, false);
+                }
+                MediaUpdate::TrackChangedForced(info) => {
+                    handle_track_changed(info, &mut last_known_info, true);
+                }
+                MediaUpdate::SelectedSessionVanished(session_id) => {
+                    log::warn!("当前选择的会话 '{}' 已消失。", session_id);
+                    last_known_info = None;
+                }
+                MediaUpdate::Error(e) => {
+                    log::error!("运行时错误: {}", e);
+                }
+                _ => {}
+            },
+            Err(RecvTimeoutError::Timeout) => {
+                if let Some(info) = &last_known_info {
+                    if info.is_playing.unwrap_or(false) {
+                        timeline_status(info);
+                    }
+                }
+            }
+            Err(RecvTimeoutError::Disconnected) => {
+                log::info!("媒体事件通道已关闭，程序退出。");
+                break;
+            }
+        }
+    }
+    Ok(())
+}

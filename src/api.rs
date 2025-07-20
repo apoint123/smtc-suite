@@ -67,6 +67,12 @@ pub struct NowPlayingInfo {
     pub can_skip_next: Option<bool>,
     /// 指示媒体源当前是否允许“上一首”操作。
     pub can_skip_previous: Option<bool>,
+    /// 指示媒体源当前是否允许“跳转”操作。
+    pub can_seek: Option<bool>,
+    /// 指示媒体源当前是否允许切换“随机播放”模式。
+    pub can_change_shuffle: Option<bool>,
+    /// 指示媒体源当前是否允许切换“循环”模式。
+    pub can_change_repeat: Option<bool>,
 
     /// 封面图片的原始字节数据 (`Vec<u8>`)。
     #[serde(skip)]

@@ -82,7 +82,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Err(_) => Err(RecvTimeoutError::Disconnected),
                 }
             },
-            default(Duration::from_secs(1)) => {
+            default(Duration::from_millis(500)) => {
                 Err(RecvTimeoutError::Timeout)
             }
         };
