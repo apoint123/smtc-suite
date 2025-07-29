@@ -2,7 +2,7 @@ use thiserror::Error;
 use tokio::sync::mpsc::error::SendError;
 
 use crate::api::MediaCommand;
-use crate::worker::InternalCommand;
+use crate::audio_capture::AudioCaptureError;
 
 /// 定义库的统一错误枚举。
 #[derive(Debug, Error)]
@@ -37,15 +37,9 @@ pub enum SmtcError {
     #[error("向工作线程发送外部命令失败")]
     CommandSendError(#[from] SendError<MediaCommand>),
 
-    /// 向工作线程的命令通道发送内部命令时失败。
-    ///
-    /// 这通常意味着后台工作线程已经崩溃或关闭。
-    #[error("向工作线程发送内部命令失败")]
-    InternalCommandSendError(#[from] SendError<InternalCommand>),
-
     /// 音频捕获模块报告的特定逻辑错误。
     #[error("音频捕获失败: {0}")]
-    AudioCapture(String),
+    AudioCapture(#[from] AudioCaptureError),
 
     /// 音量控制模块报告的特定逻辑错误。
     #[error("音量控制失败: {0}")]
@@ -59,6 +53,4 @@ pub enum SmtcError {
 }
 
 /// 本库统一的 `Result` 类型别名。
-///
-/// 它默认使用 `SmtcError` 作为错误类型，简化了函数签名。
 pub type Result<T> = std::result::Result<T, SmtcError>;
