@@ -1,22 +1,24 @@
 use std::io::{BufRead, stdin};
-use std::thread;
 
 use log::{error, info};
 use smtc_suite::{MediaManager, MediaUpdate};
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let (command_tx, update_receiver) = match MediaManager::start() {
-        Ok(c) => (c.command_tx, c.update_rx),
+    let (controller, mut update_rx) = match MediaManager::start() {
+        Ok((c, rx)) => (c, rx),
         Err(e) => {
             error!("SMTC 服务启动失败: {}", e);
             return Err(e.into());
         }
     };
 
-    let update_handle = thread::spawn(move || {
-        while let Ok(update) = update_receiver.recv() {
+    let command_tx = controller.command_tx.clone();
+
+    let update_task = tokio::spawn(async move {
+        while let Some(update) = update_rx.recv().await {
             match update {
                 MediaUpdate::SessionsChanged(sessions) => {
                     info!("[会话列表更新] 当前共有 {} 个媒体会话:", sessions.len());
@@ -35,16 +37,22 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     });
 
-    command_tx.send(smtc_suite::MediaCommand::RequestUpdate)?;
+    command_tx
+        .send(smtc_suite::MediaCommand::RequestUpdate)
+        .await?;
 
     info!("按 Enter 键即可退出程序。");
 
-    let mut buffer = String::new();
-    stdin().lock().read_line(&mut buffer)?;
+    let input_task = tokio::task::spawn_blocking(|| {
+        let mut buffer = String::new();
+        stdin().lock().read_line(&mut buffer)
+    });
 
-    command_tx.send(smtc_suite::MediaCommand::Shutdown)?;
+    input_task.await??;
 
-    update_handle.join().expect("更新处理线程 join 失败");
+    controller.shutdown().await?;
+
+    update_task.await?;
 
     Ok(())
 }

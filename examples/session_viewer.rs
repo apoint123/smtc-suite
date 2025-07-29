@@ -1,4 +1,3 @@
-use crossbeam_channel::{RecvTimeoutError, select};
 use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo};
 use std::time::Duration;
 
@@ -67,121 +66,99 @@ fn log_smtc_status(info: &NowPlayingInfo) {
     );
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
-    let controller = MediaManager::start()?;
+    let (controller, mut update_rx) = MediaManager::start()?;
 
     let mut last_known_info: Option<NowPlayingInfo> = None;
+    let mut interval = tokio::time::interval(Duration::from_millis(500));
 
     loop {
-        let result = select! {
-            recv(controller.update_rx) -> msg => {
-                match msg {
-                    Ok(update) => Ok(update),
-                    Err(_) => Err(RecvTimeoutError::Disconnected),
-                }
-            },
-            default(Duration::from_millis(500)) => {
-                Err(RecvTimeoutError::Timeout)
-            }
-        };
+        tokio::select! {
+            biased; // 优先处理来自通道的消息
 
-        match result {
-            Ok(update) => match update {
-                MediaUpdate::SessionsChanged(sessions) => {
-                    if sessions.is_empty() {
-                        log::warn!("当前没有可用的媒体会话。");
-                    } else {
-                        for (i, session) in sessions.iter().enumerate() {
-                            log::info!("  [{}] {}", i + 1, session.display_name);
+            // 分支 1: 等待来自后台的更新
+            maybe_update = update_rx.recv() => {
+                let update = match maybe_update {
+                    Some(u) => u,
+                    None => {
+                        // recv() 返回 None 意味着通道已关闭
+                        log::info!("媒体事件通道已关闭，程序退出。");
+                        break;
+                    }
+                };
+
+                match update {
+                    MediaUpdate::SessionsChanged(sessions) => {
+                        if sessions.is_empty() {
+                            log::warn!("当前没有可用的媒体会话。");
+                        } else {
+                            for (i, session) in sessions.iter().enumerate() {
+                                log::info!("  [{}] {}", i + 1, session.display_name);
+                            }
                         }
                     }
-                }
-                MediaUpdate::TrackChanged(info) => {
-                    let new_info = parse_combined_artist_album_info(info);
+                    MediaUpdate::TrackChanged(info) | MediaUpdate::TrackChangedForced(info) => {
+                        let new_info = parse_combined_artist_album_info(info);
 
-                    let has_text_info_changed = match &last_known_info {
-                        Some(last) => {
-                            last.title != new_info.title
-                                || last.artist != new_info.artist
-                                || last.album_title != new_info.album_title
+                        let has_text_info_changed = match &last_known_info {
+                            Some(last) => {
+                                last.title != new_info.title
+                                    || last.artist != new_info.artist
+                                    || last.album_title != new_info.album_title
+                            }
+                            None => true,
+                        };
+
+                        if has_text_info_changed {
+                            let title = new_info.title.as_deref().unwrap_or("N/A");
+                            let artist = new_info.artist.as_deref().unwrap_or("N/A");
+                            let album = new_info.album_title.as_deref().unwrap_or("N/A");
+                            log::info!("曲目信息变更: {} - {} (专辑: {})", artist, title, album);
                         }
-                        None => true,
-                    };
 
-                    if has_text_info_changed {
-                        let title = new_info.title.as_deref().unwrap_or("N/A");
-                        let artist = new_info.artist.as_deref().unwrap_or("N/A");
-                        let album = new_info.album_title.as_deref().unwrap_or("N/A");
-                        log::info!("曲目信息变更: {} - {} (专辑: {})", artist, title, album);
+                        log_smtc_status(&new_info);
+                        last_known_info = Some(new_info);
                     }
-
-                    log_smtc_status(&new_info);
-                    last_known_info = Some(new_info);
-                }
-                MediaUpdate::VolumeChanged {
-                    session_id,
-                    volume,
-                    is_muted,
-                } => {
-                    let vol_percent = (volume * 100.0).round() as u8;
-                    let mute_str = if is_muted { " (已静音)" } else { "" };
-                    log::info!(
-                        "音量变更 -> 会话 '{}': {}%{}",
+                    MediaUpdate::VolumeChanged {
                         session_id,
-                        vol_percent,
-                        mute_str
-                    );
-                }
-                MediaUpdate::SelectedSessionVanished(session_id) => {
-                    log::warn!("当前选择的会话 '{}' 已消失。", session_id);
-                    last_known_info = None;
-                }
-                MediaUpdate::Error(e) => {
-                    log::error!("运行时错误: {}", e);
-                }
-                MediaUpdate::AudioData(_) => {}
-                MediaUpdate::TrackChangedForced(info) => {
-                    let new_info = parse_combined_artist_album_info(info);
-
-                    let has_text_info_changed = match &last_known_info {
-                        Some(last) => {
-                            last.title != new_info.title
-                                || last.artist != new_info.artist
-                                || last.album_title != new_info.album_title
-                        }
-                        None => true,
-                    };
-
-                    if has_text_info_changed {
-                        let title = new_info.title.as_deref().unwrap_or("N/A");
-                        let artist = new_info.artist.as_deref().unwrap_or("N/A");
-                        let album = new_info.album_title.as_deref().unwrap_or("N/A");
+                        volume,
+                        is_muted,
+                    } => {
+                        let vol_percent = (volume * 100.0).round() as u8;
+                        let mute_str = if is_muted { " (已静音)" } else { "" };
                         log::info!(
-                            "曲目信息变更(强制): {} - {} (专辑: {})",
-                            artist,
-                            title,
-                            album
+                            "音量变更 -> 会话 '{}': {}%{}",
+                            session_id,
+                            vol_percent,
+                            mute_str
                         );
                     }
-
-                    log_smtc_status(&new_info);
-                    last_known_info = Some(new_info);
+                    MediaUpdate::SelectedSessionVanished(session_id) => {
+                        log::warn!("当前选择的会话 '{}' 已消失。", session_id);
+                        last_known_info = None;
+                    }
+                    MediaUpdate::Error(e) => {
+                        log::error!("运行时错误: {}", e);
+                    }
+                    MediaUpdate::AudioData(_) => {}
                 }
             },
-            Err(RecvTimeoutError::Timeout) => {
+
+            // 分支 2: 每 500ms 触发一次，用于定时刷新状态日志
+            _ = interval.tick() => {
                 if let Some(info) = &last_known_info {
                     if info.is_playing.unwrap_or(false) {
                         log_smtc_status(info);
                     }
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                log::info!("媒体事件通道已关闭，程序退出。");
-                break;
-            }
         }
     }
+
+    controller.shutdown().await?;
+
     Ok(())
 }

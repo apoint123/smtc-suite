@@ -1,13 +1,10 @@
-// src/ffi.rs
-
 use crate::{
-    MediaController, MediaManager, TextConversionMode,
+    MediaController,
     api::{
-        CControlCommandType, CRepeatMode, CSmtcControlCommand, CTextConversionMode, MediaCommand,
-        MediaUpdate, NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo,
+        CControlCommandType, CSmtcControlCommand, CTextConversionMode, MediaCommand, MediaUpdate,
+        NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo,
     },
 };
-use crossbeam_channel::{Receiver as CrossbeamReceiver, select};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
@@ -17,6 +14,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+use tokio::runtime::Runtime as TokioRuntime;
+use tokio::sync::mpsc;
 
 // ================================================================================================
 // C-ABI 兼容的公共枚举和数据结构
@@ -34,6 +33,8 @@ pub enum SmtcResult {
     CreationFailed,
     /// 内部发生错误，通常伴有日志输出。
     InternalError,
+    /// 命令因通道已满而发送失败。
+    ChannelFull,
 }
 
 /// 一个包装器，用于安全地在线程间传递裸指针 `*mut c_void`。
@@ -165,10 +166,11 @@ pub type UpdateCallback =
 // 句柄生命周期管理
 // ================================================================================================
 
-/// Rust 端的核心控制器句柄。对于 C 端来说，这是一个不透明指针。
-/// 该结构体封装了所有 Rust 资源，包括后台线程和通信通道。
+/// Rust 端的核心控制器句柄。
 pub struct SmtcHandle {
     controller: Option<MediaController>,
+    update_rx: Option<mpsc::Receiver<MediaUpdate>>,
+    runtime: Option<TokioRuntime>,
     update_listener_handle: Option<std::thread::JoinHandle<()>>,
     shutdown_signal: Arc<AtomicBool>,
     callback_info: Arc<Mutex<Option<(UpdateCallback, SendableVoidPtr)>>>,
@@ -223,10 +225,20 @@ pub unsafe extern "C" fn smtc_suite_create(out_handle: *mut *mut SmtcHandle) -> 
 
     log::info!("[FFI] 正在调用 smtc_suite_create...");
 
-    match MediaManager::start() {
-        Ok(controller) => {
+    match crate::MediaManager::start() {
+        Ok((controller, update_rx)) => {
+            let runtime = match TokioRuntime::new() {
+                Ok(rt) => rt,
+                Err(e) => {
+                    log::error!("[FFI] 创建 Tokio 运行时失败: {e}");
+                    return SmtcResult::CreationFailed;
+                }
+            };
+
             let handle = Box::new(SmtcHandle {
                 controller: Some(controller),
+                update_rx: Some(update_rx),
+                runtime: Some(runtime),
                 update_listener_handle: None,
                 shutdown_signal: Arc::new(AtomicBool::new(false)),
                 callback_info: Arc::new(Mutex::new(None)),
@@ -272,13 +284,17 @@ pub unsafe extern "C" fn smtc_suite_destroy(handle_ptr: *mut SmtcHandle) {
         }
 
         log::info!("[FFI] 正在销毁 SmtcHandle...");
-
         handle.shutdown_signal.store(true, Ordering::Release);
 
-        if let Some(controller) = handle.controller.take()
-            && let Err(e) = controller.shutdown()
+        // 使用存储的 runtime 来同步执行异步的 shutdown
+        if let (Some(controller), Some(runtime)) = (handle.controller.take(), handle.runtime.take())
         {
-            log::error!("[FFI] 发送关闭命令失败: {e}");
+            log::debug!("[FFI] 正在同步执行异步的 shutdown...");
+            runtime.block_on(async {
+                if let Err(e) = controller.shutdown().await {
+                    log::error!("[FFI] 发送关闭命令失败: {e}");
+                }
+            });
         }
 
         if let Some(join_handle) = handle.update_listener_handle.take() {
@@ -347,27 +363,20 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
     let handle = unsafe { &mut *handle_ptr };
 
     let result = catch_unwind(AssertUnwindSafe(|| {
-        // 锁定回调信息，以便安全地在多线程环境中更新它。
         if let Ok(mut cb_info_guard) = handle.callback_info.lock() {
-            // 将函数指针转换为 usize 以便检查是否为 NULL。
             let is_callback_present = (callback as usize) != 0;
             if is_callback_present {
-                // 如果提供了有效的回调，则存储它和用户数据。
                 *cb_info_guard = Some((callback, SendableVoidPtr(userdata)));
             } else {
-                // 如果传入 NULL，则清空回调信息，禁用回调。
                 *cb_info_guard = None;
             }
         } else {
-            // 如果互斥锁被“毒化”（即持有锁的线程 panic 了），这是一个严重的内部错误。
             log::error!("[FFI] 回调信息锁已被毒化，无法更新回调。");
             return SmtcResult::InternalError;
         }
 
         let is_callback_present = (callback as usize) != 0;
         if is_callback_present {
-            // 使用互斥锁确保创建监听线程的操作是原子的。
-            // 这可以防止在多线程环境中（尽管不常见）同时多次调用此函数导致创建多个监听线程。
             let _creation_guard = match handle.listener_creation_mutex.lock() {
                 Ok(guard) => guard,
                 Err(_) => {
@@ -376,107 +385,88 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                 }
             };
 
-            // 只有在第一次注册有效回调且监听线程尚未运行时，才创建它。
             if handle.update_listener_handle.is_none() {
                 log::info!("[FFI] 首次注册回调，正在启动回调监听线程...");
 
-                // 从 MediaController 中“拿走”更新接收器 (`update_rx`)。
-                // 我们使用 `std::mem::replace` 将其替换为一个新的、空的通道接收器，
-                // 以保持 MediaController 结构体的有效性，同时将接收器的所有权转移到新线程。
-                let update_rx: CrossbeamReceiver<MediaUpdate> = match handle.controller.as_mut() {
-                    Some(c) => {
-                        std::mem::replace(&mut c.update_rx, crossbeam_channel::unbounded().1)
-                    }
+                let mut update_rx = match handle.update_rx.take() {
+                    Some(rx) => rx,
                     None => {
-                        log::error!("[FFI] MediaController 无效或已被销毁，无法启动监听线程。");
+                        log::error!("[FFI] update_rx 已被移走，无法重复创建监听线程。");
                         return SmtcResult::InternalError;
                     }
                 };
 
-                // 克隆需要在新线程中使用的共享资源。
                 let shutdown_signal = handle.shutdown_signal.clone();
                 let callback_info = handle.callback_info.clone();
 
-                // 创建并启动回调监听线程。
                 let join_handle = std::thread::spawn(move || {
                     log::debug!(
                         "[FFI 回调线程] 线程已启动 (ID: {:?})。",
                         std::thread::current().id()
                     );
 
-                    // --- 核心事件循环 ---
-                    loop {
-                        // 优先检查关闭信号，确保能够快速响应关闭请求。
-                        if shutdown_signal.load(Ordering::Acquire) {
-                            log::debug!("[FFI 回调线程] 收到关闭信号，准备退出。");
-                            break;
+                    let rt = match TokioRuntime::new() {
+                        Ok(rt) => rt,
+                        Err(e) => {
+                            log::error!("[FFI 回调线程] 创建 Tokio 运行时失败: {e}");
+                            return;
                         }
+                    };
 
-                        // 使用 `crossbeam_channel::select!` 宏来同时等待消息或超时。
-                        select! {
-                            // 分支 1: 尝试从 `update_rx` 接收消息。
-                            recv(update_rx) -> msg => {
-                                match msg {
-                                    Ok(update) => {
-                                        // 成功接收到一条更新消息。
-                                        // 再次锁定回调信息，以获取最新的回调函数指针和用户数据。
-                                        if let Ok(cb_info_guard) = callback_info.lock()
-                                            && let Some((cb_fn, user_ptr_wrapper)) = *cb_info_guard
-                                        {
-                                            // 使用 `catch_unwind` 包装对 C 回调的调用，
-                                            // 以防止 C 端的 panic 破坏我们的 Rust 线程。
-                                            let res = catch_unwind(|| unsafe {
-                                                process_and_invoke_callback(
-                                                    update,
-                                                    cb_fn,
-                                                    user_ptr_wrapper.0,
-                                                );
-                                            });
-                                            if res.is_err() {
-                                                log::error!(
-                                                    "[FFI 回调线程] C 端回调函数发生 Panic！线程将继续运行。"
-                                                );
+                    rt.block_on(async move {
+                        loop {
+                            tokio::select! {
+                                biased;
+
+                                maybe_update = update_rx.recv() => {
+                                    match maybe_update {
+                                        Some(update) => {
+                                            if let Ok(cb_info_guard) = callback_info.lock()
+                                                && let Some((cb_fn, user_ptr_wrapper)) = *cb_info_guard
+                                            {
+                                                let res = catch_unwind(|| unsafe {
+                                                    process_and_invoke_callback(
+                                                        update,
+                                                        cb_fn,
+                                                        user_ptr_wrapper.0,
+                                                    );
+                                                });
+                                                if res.is_err() {
+                                                    log::error!(
+                                                        "[FFI 回调线程] C 端回调函数发生 Panic！"
+                                                    );
+                                                }
                                             }
+                                        },
+                                        None => {
+                                            log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
+                                            break;
                                         }
-                                    },
-                                    Err(_) => {
-                                        // `recv` 返回 `Err` 意味着通道的发送端已经全部被丢弃（disconnected）。
-                                        // 这通常发生在 `MediaWorker` 线程退出时，是正常的关闭流程。
-                                        log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
-                                        break; // 退出循环，结束线程。
                                     }
+                                },
+
+                                _ = tokio::time::sleep(Duration::from_millis(100)), if shutdown_signal.load(Ordering::Acquire) => {
+                                     log::debug!("[FFI 回调线程] 收到关闭信号，准备退出。");
+                                     break;
                                 }
-                            },
-                            // 分支 2: 等待超时。
-                            // `default(duration)` 是一个特殊的 select 分支，
-                            // 如果在指定的 `duration` 内没有任何其他分支准备好，它就会被执行。
-                            default(Duration::from_millis(100)) => {
-                                // 超时发生。我们什么都不做，直接进入下一次循环迭代。
-                                continue;
                             }
                         }
-                    }
+                    });
                     log::debug!(
                         "[FFI 回调线程] 线程已结束 (ID: {:?})。",
                         std::thread::current().id()
                     );
                 });
 
-                // 将新创建的线程句柄存储在 SmtcHandle 中，以便将来可以 `join` 它。
                 handle.update_listener_handle = Some(join_handle);
             }
         } else {
-            // 如果传入的回调是 NULL，仅打印一条日志信息。
-            // 线程的停止逻辑由 `smtc_suite_destroy` 统一处理，不需要主动停止线程。
-            log::info!(
-                "[FFI] 传入 NULL 回调，回调功能已禁用。监听线程（如果存在）将继续运行但不会调用任何回调。"
-            );
+            log::info!("[FFI] 传入 NULL 回调，回调功能已禁用。");
         }
 
         SmtcResult::Success
     }));
 
-    // 如果 `catch_unwind` 捕获到了 panic，返回一个内部错误码。
     result.unwrap_or_else(|_| {
         log::error!("[FFI] `smtc_suite_register_update_callback` 内部发生 Panic！");
         SmtcResult::InternalError
@@ -500,6 +490,23 @@ pub unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
 // 命令函数
 // ================================================================================================
 
+/// (内部辅助函数) 将 try_send 的结果转换为 SmtcResult
+fn handle_try_send_result<T>(result: Result<(), mpsc::error::TrySendError<T>>) -> SmtcResult {
+    match result {
+        Ok(_) => SmtcResult::Success,
+        Err(e) => match e {
+            mpsc::error::TrySendError::Full(_) => {
+                log::warn!("[FFI] 发送命令失败: 通道已满，请重试。");
+                SmtcResult::ChannelFull
+            }
+            mpsc::error::TrySendError::Closed(_) => {
+                log::error!("[FFI] 发送命令失败: 通道已关闭。");
+                SmtcResult::InternalError
+            }
+        },
+    }
+}
+
 /// 请求一次全面的状态刷新。
 /// 此函数会触发 `SessionsChanged` 和 `TrackChangedForced` 事件。
 #[unsafe(no_mangle)]
@@ -507,16 +514,11 @@ pub unsafe extern "C" fn smtc_suite_request_update(handle_ptr: *mut SmtcHandle) 
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller
-        && controller
-            .command_tx
-            .send(MediaCommand::RequestUpdate)
-            .is_err()
-    {
-        log::error!("[FFI] 发送刷新请求失败: 通道已关闭。");
-        return SmtcResult::InternalError;
+    if let Some(controller) = &handle.controller {
+        handle_try_send_result(controller.command_tx.try_send(MediaCommand::RequestUpdate))
+    } else {
+        SmtcResult::InvalidHandle
     }
-    SmtcResult::Success
 }
 
 /// 向 SMTC 套件发送一个媒体控制命令。
@@ -550,30 +552,19 @@ pub unsafe extern "C" fn smtc_suite_control_command(
                 }
                 CControlCommandType::SetRepeatMode => {
                     let c_mode = unsafe { command.data.repeat_mode };
-                    let rust_mode = match c_mode {
-                        CRepeatMode::Off => RepeatMode::Off,
-                        CRepeatMode::One => RepeatMode::One,
-                        CRepeatMode::All => RepeatMode::All,
-                    };
-                    SmtcControlCommand::SetRepeatMode(rust_mode)
+                    SmtcControlCommand::SetRepeatMode(RepeatMode::from(c_mode))
                 }
             };
-            if controller
-                .command_tx
-                .send(MediaCommand::Control(rust_command))
-                .is_err()
-            {
-                log::error!("[FFI] 发送控制命令失败: 通道已关闭。");
-                return SmtcResult::InternalError;
-            }
+            return handle_try_send_result(
+                controller
+                    .command_tx
+                    .try_send(MediaCommand::Control(rust_command)),
+            );
         }
-        SmtcResult::Success
+        SmtcResult::InvalidHandle
     }));
 
-    res.unwrap_or_else(|_| {
-        log::error!("[FFI] smtc_suite_control_command 内部发生 Panic！");
-        SmtcResult::InternalError
-    })
+    res.unwrap_or(SmtcResult::InternalError)
 }
 
 /// 启用或禁用高频进度更新。
@@ -602,23 +593,15 @@ pub unsafe extern "C" fn smtc_suite_set_high_frequency_progress_updates(
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    let res = catch_unwind(AssertUnwindSafe(|| {
-        if let Some(controller) = &handle.controller
-            && controller
+    if let Some(controller) = &handle.controller {
+        handle_try_send_result(
+            controller
                 .command_tx
-                .send(MediaCommand::SetHighFrequencyProgressUpdates(enabled))
-                .is_err()
-        {
-            log::error!("[FFI] 发送设置高频更新命令失败: 通道已关闭。");
-            return SmtcResult::InternalError;
-        }
-        SmtcResult::Success
-    }));
-
-    res.unwrap_or_else(|_| {
-        log::error!("[FFI] smtc_suite_set_high_frequency_progress_updates 内部发生 Panic！");
-        SmtcResult::InternalError
-    })
+                .try_send(MediaCommand::SetHighFrequencyProgressUpdates(enabled)),
+        )
+    } else {
+        SmtcResult::InvalidHandle
+    }
 }
 
 /// 选择一个 SMTC 会话进行监控。
@@ -644,22 +627,17 @@ pub unsafe extern "C" fn smtc_suite_select_session(
             unsafe { CStr::from_ptr(session_id).to_string_lossy().into_owned() }
         };
 
-        if let Some(controller) = &handle.controller
-            && controller
-                .command_tx
-                .send(MediaCommand::SelectSession(session_id_str))
-                .is_err()
-        {
-            log::error!("[FFI] 发送选择会话命令失败: 通道已关闭。");
-            return SmtcResult::InternalError;
+        if let Some(controller) = &handle.controller {
+            return handle_try_send_result(
+                controller
+                    .command_tx
+                    .try_send(MediaCommand::SelectSession(session_id_str)),
+            );
         }
-        SmtcResult::Success
+        SmtcResult::InvalidHandle
     }));
 
-    res.unwrap_or_else(|_| {
-        log::error!("[FFI] smtc_suite_select_session 内部发生 Panic！");
-        SmtcResult::InternalError
-    })
+    res.unwrap_or(SmtcResult::InternalError)
 }
 
 /// 设置 SMTC 元数据的文本转换模式。
@@ -671,20 +649,20 @@ pub unsafe extern "C" fn smtc_suite_select_session(
 /// 调用者必须确保 `controller_ptr` 是一个由 `smtc_start` 返回的有效指针，
 /// 并且在调用此函数时没有被释放。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn smtc_set_text_conversion_mode(
-    controller_ptr: *mut MediaController,
+pub unsafe extern "C" fn smtc_suite_set_text_conversion_mode(
+    handle_ptr: *mut SmtcHandle,
     mode: CTextConversionMode,
-) -> bool {
-    let Some(controller) = (unsafe { controller_ptr.as_ref() }) else {
-        return false;
-    };
+) -> SmtcResult {
+    validate_handle!(handle_ptr);
+    let handle = unsafe { &*handle_ptr };
 
-    // 将 C 枚举转换为 Rust 枚举
-    let rust_mode = TextConversionMode::from(mode);
-
-    // 创建并发送命令
-    let command = MediaCommand::SetTextConversion(rust_mode);
-    controller.command_tx.send(command).is_ok()
+    if let Some(controller) = &handle.controller {
+        let rust_mode = crate::api::TextConversionMode::from(mode);
+        let command = MediaCommand::SetTextConversion(rust_mode);
+        handle_try_send_result(controller.command_tx.try_send(command))
+    } else {
+        SmtcResult::InvalidHandle
+    }
 }
 
 /// 请求开始音频捕获。
@@ -697,16 +675,15 @@ pub unsafe extern "C" fn smtc_suite_start_audio_capture(handle_ptr: *mut SmtcHan
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller
-        && controller
-            .command_tx
-            .send(MediaCommand::StartAudioCapture)
-            .is_err()
-    {
-        log::error!("[FFI] 发送开始音频捕获命令失败: 通道已关闭。");
-        return SmtcResult::InternalError;
+    if let Some(controller) = &handle.controller {
+        handle_try_send_result(
+            controller
+                .command_tx
+                .try_send(MediaCommand::StartAudioCapture),
+        )
+    } else {
+        SmtcResult::InvalidHandle
     }
-    SmtcResult::Success
 }
 
 /// 请求停止音频捕获。
@@ -719,16 +696,15 @@ pub unsafe extern "C" fn smtc_suite_stop_audio_capture(handle_ptr: *mut SmtcHand
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller
-        && controller
-            .command_tx
-            .send(MediaCommand::StopAudioCapture)
-            .is_err()
-    {
-        log::error!("[FFI] 发送停止音频捕获命令失败: 通道已关闭。");
-        return SmtcResult::InternalError;
+    if let Some(controller) = &handle.controller {
+        handle_try_send_result(
+            controller
+                .command_tx
+                .try_send(MediaCommand::StopAudioCapture),
+        )
+    } else {
+        SmtcResult::InvalidHandle
     }
-    SmtcResult::Success
 }
 
 // ================================================================================================

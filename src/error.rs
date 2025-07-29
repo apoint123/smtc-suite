@@ -1,5 +1,9 @@
-use crossbeam_channel::SendError;
 use thiserror::Error;
+use tokio::sync::mpsc::error::SendError;
+
+use crate::api::MediaCommand;
+use crate::worker::InternalCommand;
+
 /// 定义库的统一错误枚举。
 #[derive(Debug, Error)]
 pub enum SmtcError {
@@ -27,11 +31,17 @@ pub enum SmtcError {
     #[error("音频重采样器创建失败: {0}")]
     ResamplerConstruction(#[from] rubato::ResamplerConstructionError),
 
-    /// 向工作线程的命令通道发送命令时失败。
+    /// 向工作线程的命令通道发送外部命令时失败。
     ///
     /// 这通常意味着后台工作线程已经崩溃或关闭。
-    #[error("向工作线程发送命令失败")]
-    CommandSendError(#[from] SendError<crate::MediaCommand>),
+    #[error("向工作线程发送外部命令失败")]
+    CommandSendError(#[from] SendError<MediaCommand>),
+
+    /// 向工作线程的命令通道发送内部命令时失败。
+    ///
+    /// 这通常意味着后台工作线程已经崩溃或关闭。
+    #[error("向工作线程发送内部命令失败")]
+    InternalCommandSendError(#[from] SendError<InternalCommand>),
 
     /// 音频捕获模块报告的特定逻辑错误。
     #[error("音频捕获失败: {0}")]

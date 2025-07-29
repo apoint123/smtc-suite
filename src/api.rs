@@ -1,6 +1,8 @@
-use crossbeam_channel::{self, Receiver, SendError, Sender};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
+use tokio::sync::mpsc;
+
+use crate::error::{Result, SmtcError};
 
 /// 定义重复播放模式的枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -219,6 +221,16 @@ pub enum CTextConversionMode {
     HongKongToSimplified = 6,
 }
 
+impl From<CRepeatMode> for RepeatMode {
+    fn from(c_mode: CRepeatMode) -> Self {
+        match c_mode {
+            CRepeatMode::Off => RepeatMode::Off,
+            CRepeatMode::One => RepeatMode::One,
+            CRepeatMode::All => RepeatMode::All,
+        }
+    }
+}
+
 impl From<CTextConversionMode> for TextConversionMode {
     fn from(c_mode: CTextConversionMode) -> Self {
         match c_mode {
@@ -304,18 +316,19 @@ pub enum MediaUpdate {
 /// 用于与在后台运行的 `MediaWorker` 进行通信。
 pub struct MediaController {
     /// 用于向后台服务发送 `MediaCommand` 的通道发送端。
-    pub command_tx: Sender<MediaCommand>,
-    /// 用于从后台服务接收 `MediaUpdate` 的通道接收端。
-    pub update_rx: Receiver<MediaUpdate>,
+    pub command_tx: mpsc::Sender<MediaCommand>,
 }
 
 impl MediaController {
-    /// 发送一个 `Shutdown` 命令来优雅地终止媒体服务的后台线程。
+    /// 终止媒体服务的后台线程。
     ///
     /// # 返回
     /// - `Ok(())`: 如果命令成功发送。
-    /// - `Err(SendError)`: 如果后台线程已经关闭，无法接收命令。
-    pub fn shutdown(&self) -> Result<(), SendError<MediaCommand>> {
-        self.command_tx.send(MediaCommand::Shutdown)
+    /// - `Err(SmtcError)`: 如果后台线程已经关闭，无法接收命令。
+    pub async fn shutdown(&self) -> Result<()> {
+        self.command_tx
+            .send(MediaCommand::Shutdown)
+            .await
+            .map_err(SmtcError::from)
     }
 }

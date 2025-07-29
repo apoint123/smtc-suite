@@ -5,24 +5,23 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
-    thread,
     time::Duration,
 };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     info!("正在启动媒体服务...");
-    let controller = MediaManager::start()?;
-    let command_tx = controller.command_tx;
-
-    let command_tx_clone = command_tx.clone();
+    let (controller, mut update_rx) = MediaManager::start()?;
+    let command_tx = controller.command_tx.clone();
 
     let session_selected = Arc::new(AtomicBool::new(false));
     let session_selected_clone = session_selected.clone();
+    let command_tx_clone = command_tx.clone();
 
-    let update_thread = thread::spawn(move || {
-        while let Ok(update) = controller.update_rx.recv() {
+    let event_task = tokio::spawn(async move {
+        while let Some(update) = update_rx.recv().await {
             match update {
                 MediaUpdate::TrackChanged(info) => {
                     info!(
@@ -46,6 +45,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 .send(MediaCommand::SelectSession(
                                     first_session.session_id.clone(),
                                 ))
+                                .await
                                 .is_ok()
                             {
                                 session_selected_clone.store(true, Ordering::Relaxed);
@@ -59,46 +59,54 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => { /* 忽略其他更新 */ }
             }
         }
-        info!("更新通道已关闭，事件监听线程退出。");
+        info!("更新通道已关闭，事件监听任务退出。");
     });
 
     for _ in 0..10 {
         if session_selected.load(Ordering::Relaxed) {
             break;
         }
-        thread::sleep(Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
 
     if !session_selected.load(Ordering::Relaxed) {
         warn!("未能自动选择会话。测试将继续，但控制命令可能无效。");
     }
 
-    thread::sleep(Duration::from_secs(3));
+    tokio::time::sleep(Duration::from_secs(3)).await;
     info!("开启随机播放");
-    command_tx.send(MediaCommand::Control(SmtcControlCommand::SetShuffle(true)))?;
+    command_tx
+        .send(MediaCommand::Control(SmtcControlCommand::SetShuffle(true)))
+        .await?;
 
-    thread::sleep(Duration::from_secs(3));
+    tokio::time::sleep(Duration::from_secs(3)).await;
     info!("设置重复模式为“全部循环”");
-    command_tx.send(MediaCommand::Control(SmtcControlCommand::SetRepeatMode(
-        RepeatMode::All,
-    )))?;
+    command_tx
+        .send(MediaCommand::Control(SmtcControlCommand::SetRepeatMode(
+            RepeatMode::All,
+        )))
+        .await?;
 
-    thread::sleep(Duration::from_secs(5));
+    tokio::time::sleep(Duration::from_secs(5)).await;
     info!("关闭随机播放");
-    command_tx.send(MediaCommand::Control(SmtcControlCommand::SetShuffle(false)))?;
+    command_tx
+        .send(MediaCommand::Control(SmtcControlCommand::SetShuffle(false)))
+        .await?;
 
-    thread::sleep(Duration::from_secs(3));
+    tokio::time::sleep(Duration::from_secs(3)).await;
     info!("关闭重复模式");
-    command_tx.send(MediaCommand::Control(SmtcControlCommand::SetRepeatMode(
-        RepeatMode::Off,
-    )))?;
+    command_tx
+        .send(MediaCommand::Control(SmtcControlCommand::SetRepeatMode(
+            RepeatMode::Off,
+        )))
+        .await?;
 
-    thread::sleep(Duration::from_secs(2));
+    tokio::time::sleep(Duration::from_secs(2)).await;
 
     info!("测试完成，正在发送关闭命令...");
-    command_tx.send(MediaCommand::Shutdown)?;
+    controller.shutdown().await?;
 
-    update_thread.join().expect("更新线程 join 失败");
+    event_task.await?;
 
     Ok(())
 }

@@ -1,4 +1,3 @@
-use crossbeam_channel::{RecvTimeoutError, select};
 use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo, RepeatMode};
 use std::time::Duration;
 
@@ -164,64 +163,69 @@ fn handle_track_changed(
     *last_known_info = Some(new_info);
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
-    let controller = MediaManager::start()?;
+
+    let (controller, mut update_rx) = MediaManager::start()?;
     let mut last_known_info: Option<NowPlayingInfo> = None;
+    let mut interval = tokio::time::interval(Duration::from_secs(1));
 
     loop {
-        let result = select! {
-            recv(controller.update_rx) -> msg => {
-                match msg {
-                    Ok(update) => Ok(update),
-                    Err(_) => Err(RecvTimeoutError::Disconnected),
-                }
-            },
-            default(Duration::from_secs(1)) => {
-                Err(RecvTimeoutError::Timeout)
-            }
-        };
+        tokio::select! {
+            biased; // 优先处理来自通道的消息
 
-        match result {
-            Ok(update) => match update {
-                MediaUpdate::SessionsChanged(sessions) => {
-                    if sessions.is_empty() {
-                        log::warn!("当前没有可用的媒体会话。");
-                        last_known_info = None;
-                    } else {
-                        for (i, session) in sessions.iter().enumerate() {
-                            log::info!("  [{}] {}", i + 1, session.display_name);
-                        }
+            // 分支 1: 等待来自后台的更新
+            maybe_update = update_rx.recv() => {
+                let update = match maybe_update {
+                    Some(u) => u,
+                    None => {
+                        log::info!("媒体事件通道已关闭，程序退出。");
+                        break;
                     }
-                    println!();
+                };
+
+                match update {
+                    MediaUpdate::SessionsChanged(sessions) => {
+                        if sessions.is_empty() {
+                            log::warn!("当前没有可用的媒体会话。");
+                            last_known_info = None;
+                        } else {
+                            for (i, session) in sessions.iter().enumerate() {
+                                log::info!("  [{}] {}", i + 1, session.display_name);
+                            }
+                        }
+                        println!();
+                    }
+                    MediaUpdate::TrackChanged(info) => {
+                        handle_track_changed(info, &mut last_known_info, false);
+                    }
+                    MediaUpdate::TrackChangedForced(info) => {
+                        handle_track_changed(info, &mut last_known_info, true);
+                    }
+                    MediaUpdate::SelectedSessionVanished(session_id) => {
+                        log::warn!("当前选择的会话 '{}' 已消失。", session_id);
+                        last_known_info = None;
+                    }
+                    MediaUpdate::Error(e) => {
+                        log::error!("运行时错误: {}", e);
+                    }
+                    _ => {}
                 }
-                MediaUpdate::TrackChanged(info) => {
-                    handle_track_changed(info, &mut last_known_info, false);
-                }
-                MediaUpdate::TrackChangedForced(info) => {
-                    handle_track_changed(info, &mut last_known_info, true);
-                }
-                MediaUpdate::SelectedSessionVanished(session_id) => {
-                    log::warn!("当前选择的会话 '{}' 已消失。", session_id);
-                    last_known_info = None;
-                }
-                MediaUpdate::Error(e) => {
-                    log::error!("运行时错误: {}", e);
-                }
-                _ => {}
             },
-            Err(RecvTimeoutError::Timeout) => {
+
+            // 分支 2: 定时器触发，用于更新时间线
+            _ = interval.tick() => {
                 if let Some(info) = &last_known_info {
                     if info.is_playing.unwrap_or(false) {
                         timeline_status(info);
                     }
                 }
             }
-            Err(RecvTimeoutError::Disconnected) => {
-                log::info!("媒体事件通道已关闭，程序退出。");
-                break;
-            }
         }
     }
+
+    controller.shutdown().await?;
+
     Ok(())
 }

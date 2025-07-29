@@ -2,7 +2,6 @@ use std::{
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
-        mpsc::Sender as StdSender,
     },
     thread::{self, JoinHandle},
     time::Duration,
@@ -11,6 +10,7 @@ use std::{
 use rubato::{
     Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
 };
+use tokio::{runtime::Runtime, sync::mpsc::Sender as TokioSender};
 use windows::{
     Win32::{
         Media::{
@@ -125,9 +125,9 @@ pub struct AudioCapturer {
 /// * `update_tx`: 用于发送 `InternalUpdate::AudioDataPacket` 的通道发送端。
 /// * `channels_in_audio_data`: `audio_f32_interleaved` 中每个音频帧包含的声道数。
 /// * `target_channels_for_output`: 最终输出数据期望的声道数 (例如 `TARGET_CHANNELS`)。
-fn process_and_send_audio_data(
+async fn process_and_send_audio_data(
     audio_f32_interleaved: Vec<f32>,
-    update_tx: &StdSender<InternalUpdate>,
+    update_tx: &TokioSender<InternalUpdate>,
     channels_in_audio_data: usize,
     target_channels_for_output: u16,
 ) -> Result<()> {
@@ -174,9 +174,9 @@ fn process_and_send_audio_data(
             .flat_map(|&sample_f32| sample_f32.to_le_bytes())
             .collect();
 
-        // 通过通道发送数据包
         if update_tx
             .send(InternalUpdate::AudioDataPacket(audio_data_bytes))
+            .await
             .is_err()
         {
             let err_msg = "发送音频数据包失败。通道可能已关闭。".to_string();
@@ -207,7 +207,7 @@ impl AudioCapturer {
     /// # 返回
     /// * `Ok(())` 如果线程成功启动或已在运行。
     /// * `Err(String)` 如果启动线程失败。
-    pub fn start_capture(&mut self, update_tx: StdSender<InternalUpdate>) -> Result<()> {
+    pub fn start_capture(&mut self, update_tx: TokioSender<InternalUpdate>) -> Result<()> {
         if self.capture_thread_handle.is_some() {
             log::debug!("[音频捕获器] 捕获线程已在运行，无需重复启动。");
             return Ok(());
@@ -225,44 +225,47 @@ impl AudioCapturer {
                 thread::current().id()
             );
 
-            // 初始化当前线程的 COM 环境。这是与 Windows 音频 API 交互所必需的。
-            // 使用 RAII Guard 确保 COM 在线程退出时被正确反初始化。
-            let _com_guard = match ComThreadInitializer::initialize_com() {
-                Ok(_) => {
-                    log::trace!("[音频捕获线程] COM (STA) 初始化成功。");
-                    Some(ComThreadInitializer) // 返回 Guard 对象，其生命周期将与线程绑定
-                }
-                Err(e) => {
-                    log::error!("[音频捕获线程] COM (STA) 初始化失败: {e:?}。线程即将退出。");
-                    // 尝试通过发送一个空数据包来通知主工作线程 COM 初始化失败
-                    if update_tx
-                        .send(InternalUpdate::AudioDataPacket(Vec::new()))
-                        .is_err()
-                    {
-                        log::error!("[音频捕获线程] 发送空包以通知COM初始化失败时出错。");
-                    };
-                    return; // COM 初始化失败，线程无法继续
-                }
-            };
+            let rt = Runtime::new().expect("无法为音频捕获线程创建 Tokio 运行时");
 
-            // 尝试提升线程优先级，以获得更稳定的音频捕获性能。
-            // "Pro Audio" 特性通常用于需要低延迟和高优先级的音频处理任务。
-            // SAFETY: 调用 Windows API AvSetMmThreadCharacteristicsW。
-            unsafe {
-                let task_name_hstring = HSTRING::from("Pro Audio");
-                let mut task_index = 0u32;
-                if AvSetMmThreadCharacteristicsW(&task_name_hstring, &mut task_index).is_err() {
-                    log::warn!(
-                        "[音频捕获线程] 无法设置线程特性为 'Pro Audio'。可能需要管理员权限。"
-                    );
-                } else {
-                    log::debug!("[音频捕获线程] 线程特性已成功设置为 'Pro Audio'。");
-                }
-            }
+            rt.block_on(async {
+                // 使用 RAII Guard 确保 COM 在线程退出时被正确反初始化。
+                let _com_guard = match ComThreadInitializer::initialize_com() {
+                    Ok(_) => Some(ComThreadInitializer),
+                    Err(e) => {
+                        let err_msg = format!("[音频捕获线程] COM (STA) 初始化失败: {e:?}");
 
-            if let Err(e) = AudioCapturer::capture_loop_impl(stop_signal_clone, update_tx) {
-                log::error!("[音频捕获线程] 捕获循环遇到致命错误: {e}。线程即将退出。");
-            }
+                        if update_tx
+                            .send(InternalUpdate::AudioCaptureError(err_msg))
+                            .await
+                            .is_err()
+                        {
+                            log::error!("[音频捕获线程] 发送错误通知时失败。");
+                        };
+                        return;
+                    }
+                };
+
+                // 尝试提升线程优先级，以获得更稳定的音频捕获性能。
+                // "Pro Audio" 特性通常用于需要低延迟和高优先级的音频处理任务。
+                // SAFETY: 调用 Windows API AvSetMmThreadCharacteristicsW。
+                unsafe {
+                    let task_name_hstring = HSTRING::from("Pro Audio");
+                    let mut task_index = 0u32;
+                    if AvSetMmThreadCharacteristicsW(&task_name_hstring, &mut task_index).is_err() {
+                        log::warn!(
+                            "[音频捕获线程] 无法设置线程特性为 'Pro Audio'。可能需要管理员权限。"
+                        );
+                    } else {
+                        log::debug!("[音频捕获线程] 线程特性已成功设置为 'Pro Audio'。");
+                    }
+                }
+
+                if let Err(e) = AudioCapturer::capture_loop_impl(stop_signal_clone, update_tx).await
+                {
+                    log::error!("[音频捕获线程] 捕获循环遇到致命错误: {e}。线程即将退出。");
+                }
+            });
+
             log::debug!(
                 "[音频捕获线程] 音频捕获线程已结束 (ID: {:?})。",
                 thread::current().id()
@@ -298,9 +301,9 @@ impl AudioCapturer {
     /// ## 安全性 (Safety)
     /// 此函数包含大量对 Windows COM API 的不安全调用，这些调用需要满足特定的前提条件，
     /// 例如正确的 COM 初始化和线程模型。
-    fn capture_loop_impl(
+    async fn capture_loop_impl(
         stop_signal: Arc<AtomicBool>,
-        update_tx: StdSender<InternalUpdate>,
+        update_tx: TokioSender<InternalUpdate>,
     ) -> Result<()> {
         // SAFETY: 所有 WASAPI 调用都应在 unsafe 块内，因为它们是 FFI 调用。
         unsafe {
@@ -657,10 +660,11 @@ impl AudioCapturer {
                             &update_tx,
                             original_channels_usize, // 传递给辅助函数的声道数
                             TARGET_CHANNELS,         // 目标输出声道数
-                        ) {
-                            // 如果发送失败 (例如通道关闭)，则释放缓冲区并退出线程
+                        )
+                        .await
+                        {
                             capture_client.ReleaseBuffer(num_frames_actually_captured)?;
-                            return Err(e_send); // 向上层报告发送错误
+                            return Err(e_send);
                         }
                         log::trace!("[音频捕获线程] 成功发送一批处理后的音频数据。");
                     }
@@ -725,7 +729,8 @@ impl AudioCapturer {
                                     &update_tx,
                                     original_channels_usize,
                                     TARGET_CHANNELS,
-                                )?;
+                                )
+                                .await?;
                             } else {
                                 log::debug!("[音频捕获线程] 流末尾重采样未产生输出帧。");
                             }
