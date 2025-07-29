@@ -88,6 +88,34 @@ pub struct NowPlayingInfo {
     pub position_report_time: Option<Instant>,
 }
 
+impl NowPlayingInfo {
+    /// 用另一份 NowPlayingInfo 的非 None 字段更新自身
+    pub fn update_with(&mut self, other: &NowPlayingInfo) {
+        if let Some(pos) = other.position_ms {
+            self.position_ms = Some(pos);
+        }
+        if let Some(time) = other.position_report_time {
+            self.position_report_time = Some(time);
+        }
+        if let Some(playing) = other.is_playing {
+            self.is_playing = Some(playing);
+        }
+        if let Some(duration) = other.duration_ms {
+            self.duration_ms = Some(duration);
+        }
+        if let Some(shuffle) = other.is_shuffle_active {
+            self.is_shuffle_active = Some(shuffle);
+        }
+        if let Some(repeat) = other.repeat_mode {
+            self.repeat_mode = Some(repeat);
+        }
+        if let Some(cover) = other.cover_data.clone() {
+            self.cover_data = Some(cover);
+            self.cover_data_hash = other.cover_data_hash;
+        }
+    }
+}
+
 /// 表示一个可用的系统媒体传输控件 (SMTC) 会话。
 ///
 /// 每个支持媒体控制的应用（如 Spotify, Windows Media Player）都会创建一个会话。

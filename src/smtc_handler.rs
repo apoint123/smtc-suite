@@ -21,10 +21,7 @@ use windows::{
         GlobalSystemMediaTransportControlsSessionPlaybackStatus,
     },
     Media::MediaPlaybackAutoRepeatMode,
-    Storage::Streams::{
-        Buffer, DataReader, IRandomAccessStreamReference, IRandomAccessStreamWithContentType,
-        InputStreamOptions,
-    },
+    Storage::Streams::{Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions},
     Win32::{
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
@@ -283,6 +280,8 @@ enum AsyncTaskResult {
     MediaPropertiesReady(WinResult<GlobalSystemMediaTransportControlsSessionMediaProperties>),
     /// 媒体控制命令（如播放、暂停）的异步执行结果。
     MediaControlCompleted(SmtcControlCommand, WinResult<bool>),
+    /// 封面数据获取任务的结果。
+    CoverDataReady(WinResult<Option<Vec<u8>>>),
 }
 
 /// 封装了 `run_smtc_listener` 主事件循环中所有可变的状态。
@@ -394,43 +393,60 @@ async fn send_now_playing_update(
 }
 
 /// 从 SMTC 会话中异步获取封面图片数据。
-async fn fetch_cover_data_async(
+async fn fetch_cover_data_task(
     thumb_ref: IRandomAccessStreamReference,
-    player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
-    now_playing_tx: watch::Sender<NowPlayingInfo>,
-) {
-    log::debug!("[Cover Fetcher] 开始异步获取封面数据...");
+) -> WinResult<Option<Vec<u8>>> {
+    let start_time = Instant::now();
+    log::debug!("[Cover Fetcher] 正在获取封面数据...");
+    let result = async {
+        let open_op = thumb_ref.OpenReadAsync()?;
+        let stream = tokio::select! {
+            biased;
+            res = open_op.clone().into_future() => {
+                res?
+            },
+            _ = tokio::time::sleep(SMTC_ASYNC_OPERATION_TIMEOUT) => {
+                log::warn!("[Cover Fetcher] 打开封面流超时 (>{SMTC_ASYNC_OPERATION_TIMEOUT:?})。");
+                if let Err(e) = open_op.Cancel() {
+                    log::warn!("[Cover Fetcher] 取消 OpenReadAsync 操作失败: {e:?}");
+                } else {
+                    log::debug!("[Cover Fetcher] 取消 OpenReadAsync 操作成功。");
+                }
+                return Err(WinError::from(E_ABORT_HRESULT));
+            }
+        };
+        log::debug!("[Cover Fetcher] 成功获取到封面流 (IRandomAccessStreamWithContentType)。");
 
-    // 异步块，用于安全地处理所有可能失败的 WinRT 调用。
-    let cover_result: WinResult<Option<Vec<u8>>> = async {
-        // 1. 异步打开数据流
-        let stream_op: IAsyncOperation<IRandomAccessStreamWithContentType> =
-            thumb_ref.OpenReadAsync()?;
-        let stream = tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, stream_op.into_future())
-            .await
-            .map_err(|_| {
-                log::warn!("[Cover Fetcher] 打开封面流超时。");
-                WinError::from(E_ABORT_HRESULT)
-            })??;
+        let stream_size = stream.Size()?;
 
-        // 2. 检查流是否为空
-        if stream.Size()? == 0 {
-            log::debug!("[Cover Fetcher] 媒体会话提供了空的封面流。");
+        if stream_size == 0 {
+            log::warn!("[Cover Fetcher] 未能获取到封面（流大小为0）。");
+            return Ok(None);
+        }
+        if stream_size > MAX_COVER_SIZE_BYTES as u64 {
+            log::warn!(
+                "[Cover Fetcher] 封面数据 ({stream_size} 字节) 超出最大限制 ({MAX_COVER_SIZE_BYTES} 字节)，已丢弃。"
+            );
             return Ok(None);
         }
 
-        // 3. 创建缓冲区并异步读取所有数据
-        let buffer = Buffer::Create(stream.Size()? as u32)?;
+        let buffer = Buffer::Create(stream_size as u32)?;
         let read_op = stream.ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?;
-
-        let bytes_buffer = tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, read_op.into_future())
-            .await
-            .map_err(|_| {
-                log::warn!("[Cover Fetcher] 读取封面数据超时。");
-                WinError::from(E_ABORT_HRESULT)
-            })??;
-
-        // 4. 将缓冲区中的数据转换为 Vec<u8>
+        let bytes_buffer = tokio::select! {
+            biased;
+            res = read_op.clone().into_future() => {
+                res?
+            },
+            _ = tokio::time::sleep(SMTC_ASYNC_OPERATION_TIMEOUT) => {
+                log::warn!("[Cover Fetcher] 读取封面数据超时 (>{SMTC_ASYNC_OPERATION_TIMEOUT:?})。");
+                if let Err(e) = read_op.Cancel() {
+                    log::warn!("[Cover Fetcher] 取消 ReadAsync 操作失败: {e:?}");
+                } else {
+                    log::debug!("[Cover Fetcher] 取消 ReadAsync 操作成功。");
+                }
+                return Err(WinError::from(E_ABORT_HRESULT));
+            }
+        };
         let reader = DataReader::FromBuffer(&bytes_buffer)?;
         let mut bytes = vec![0u8; bytes_buffer.Length()? as usize];
         reader.ReadBytes(&mut bytes)?;
@@ -438,52 +454,29 @@ async fn fetch_cover_data_async(
     }
     .await;
 
-    let mut state_guard = player_state_arc.lock().await;
-
-    match cover_result {
+    match &result {
         Ok(Some(bytes)) => {
-            // 检查数据大小是否超出限制
-            if bytes.len() > MAX_COVER_SIZE_BYTES {
-                log::warn!(
-                    "[Cover Fetcher] 获取到的封面数据 ({} 字节) 超出最大限制 ({} 字节)，已丢弃。",
-                    bytes.len(),
-                    MAX_COVER_SIZE_BYTES
-                );
-                // 即使丢弃，也清空状态以防万一
-                state_guard.cover_data = None;
-                state_guard.cover_data_hash = None;
-            } else {
-                // 计算新封面的哈希值，只有当封面真正变化时才更新状态
-                let new_hash = calculate_cover_hash(&bytes);
-                if state_guard.cover_data_hash != Some(new_hash) {
-                    log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
-                    state_guard.cover_data_hash = Some(new_hash);
-                    state_guard.cover_data = Some(bytes);
-                } else {
-                    log::trace!("[State Update] 封面哈希值未变，无需更新。");
-                }
-            }
+            log::debug!(
+                "[Cover Fetcher] 获取到 {} 字节的封面数据。总耗时: {:?}",
+                bytes.len(),
+                start_time.elapsed()
+            );
         }
         Ok(None) => {
-            // 如果获取到的是空流，则清空封面状态
-            log::debug!("[State Update] 清空封面，因为获取到的流为空。");
-            state_guard.cover_data = None;
-            state_guard.cover_data_hash = None;
+            log::debug!(
+                "[Cover Fetcher] 任务成功完成，但无有效封面数据。总耗时: {:?}",
+                start_time.elapsed()
+            );
         }
         Err(e) => {
-            // 如果在获取过程中发生任何错误，也清空封面状态
-            log::warn!("[State Update] 因获取封面失败而清空封面: {e:?}");
-            state_guard.cover_data = None;
-            state_guard.cover_data_hash = None;
+            log::warn!(
+                "[Cover Fetcher] 任务失败: {e:?}, 总耗时: {:?}",
+                start_time.elapsed()
+            );
         }
     }
 
-    let latest_info = NowPlayingInfo::from(&*state_guard);
-    drop(state_guard);
-
-    if now_playing_tx.send(latest_info).is_err() {
-        log::warn!("[Cover Fetcher] 状态广播失败，所有接收者可能已关闭");
-    }
+    result
 }
 
 /// 一个独立的任务，用于平滑地调整指定进程的音量
@@ -837,6 +830,9 @@ pub fn run_smtc_listener(
             AsyncTaskResult::ManagerReady,
         );
 
+        let mut session_check_interval =
+            tokio::time::interval(std::time::Duration::from_millis(250));
+
         log::debug!("[SMTC 主循环] 进入 select! 事件循环...");
 
         // 8. 核心事件循环
@@ -979,6 +975,29 @@ pub fn run_smtc_listener(
                         }
                     }
                 },
+
+                // 这里是自动检测会话变更的逻辑
+                 _ = session_check_interval.tick() => {
+                    if let Some(guard) = &state.manager_guard
+                        && state.target_session_id.is_none()
+                            && let Ok(current_session) = guard.manager.GetCurrentSession() {
+                                let new_session_id = current_session.SourceAppUserModelId().ok().map(|h| h.to_string_lossy());
+
+                                let monitored_session_id = state.session_guard.as_ref()
+                                    .and_then(|g| g.session.SourceAppUserModelId().ok())
+                                    .map(|h| h.to_string_lossy());
+
+                                if new_session_id != monitored_session_id {
+                                    log::debug!("[会话轮询] 系统默认会话已更改 (从 {:?} 到 {:?})，正在刷新。", 
+                                        monitored_session_id.as_deref().unwrap_or("无"),
+                                        new_session_id.as_deref().unwrap_or("无")
+                                    );
+
+                                    let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
+                                }
+                            }
+                },
+
                 // 分支 3: 处理内部的 WinRT 事件信号
                 Some(signal) = smtc_event_rx.recv() => {
                     log::trace!("[SMTC 主循环] 收到内部事件信号: {signal:?}");
@@ -1175,14 +1194,17 @@ pub fn run_smtc_listener(
                                         }
 
                                         // 启动新的封面获取任务
-                                        let player_state_arc_clone = player_state_arc.clone();
-                                        let now_playing_tx_clone = now_playing_tx.clone();
-
-                                        let cover_task = tokio::task::spawn_local(fetch_cover_data_async(
-                                            thumb_ref,
-                                            player_state_arc_clone,
-                                            now_playing_tx_clone,
-                                        ));
+                                        let async_result_tx_clone = async_result_tx.clone();
+                                        let cover_task = tokio::task::spawn_local(async move {
+                                            let result = fetch_cover_data_task(thumb_ref).await;
+                                            if async_result_tx_clone
+                                                .send(AsyncTaskResult::CoverDataReady(result))
+                                                .await
+                                                .is_err()
+                                            {
+                                                log::warn!("[Cover Fetcher] 无法将封面结果发送回主循环，通道已关闭。");
+                                            }
+                                        });
 
                                         state.active_cover_fetch_task = Some(cover_task);
                                         log::debug!("[SMTC 主循环] 已启动新的封面获取任务");
@@ -1199,6 +1221,51 @@ pub fn run_smtc_listener(
                                 Ok(true) => log::info!("[SMTC 主循环] 媒体控制指令 {cmd:?} 成功执行。"),
                                 Ok(false) => log::warn!("[SMTC 主循环] 媒体控制指令 {cmd:?} 执行失败 (返回 false)。"),
                                 Err(e) => log::warn!("[SMTC 主循环] 媒体控制指令 {cmd:?} 异步调用失败: {e:?}"),
+                            }
+                        }
+                        AsyncTaskResult::CoverDataReady(result) => {
+                            match result {
+                                Ok(Some(bytes)) => {
+                                    let new_hash = calculate_cover_hash(&bytes);
+                                    let mut player_state = player_state_arc.lock().await;
+                                    if player_state.cover_data_hash != Some(new_hash) {
+                                        log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
+                                        player_state.cover_data = Some(bytes);
+                                        player_state.cover_data_hash = Some(new_hash);
+                                        drop(player_state);
+                                        send_now_playing_update(&player_state_arc, &now_playing_tx).await;
+                                    }
+                                }
+                                Ok(None) => {
+                                    // 获取到空封面或封面太大
+                                    let mut player_state = player_state_arc.lock().await;
+                                    if player_state.cover_data.is_some() {
+                                        log::debug!("[State Update] 清空封面数据。");
+                                        player_state.cover_data = None;
+                                        player_state.cover_data_hash = None;
+                                        drop(player_state);
+                                        send_now_playing_update(&player_state_arc, &now_playing_tx).await;
+                                    }
+                                }
+                                Err(e) => {
+                                    log::warn!("[SMTC 主循环] 获取封面失败: {e:?}，正在重置会话。");
+
+                                    {
+                                        let mut player_state = player_state_arc.lock().await;
+                                        player_state.cover_data = None;
+                                        player_state.cover_data_hash = None;
+                                    }
+                                    send_now_playing_update(&player_state_arc, &now_playing_tx).await;
+
+                                    state.session_guard = None;
+                                    log::debug!("[SMTC 主循环] 已丢弃当前会话监听器。");
+
+                                    if let Err(e) = smtc_event_tx.try_send(SmtcEventSignal::Sessions) {
+                                        log::error!("[SMTC 主循环] 发送会话重置信号失败: {e:?}");
+                                    } else {
+                                        log::debug!("[SMTC 主循环] 已发送会话重置信号，等待重新连接...");
+                                    }
+                                }
                             }
                         }
                     }
