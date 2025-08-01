@@ -70,18 +70,16 @@ pub(crate) struct MediaWorker {
     smtc_handler_thread_handle: Option<thread::JoinHandle<()>>,
     audio_capturer: Option<AudioCapturer>,
     audio_update_rx: Option<TokioReceiver<InternalUpdate>>,
-    tokio_runtime: Arc<Runtime>,
     _shared_player_state: Arc<tokio::sync::Mutex<SharedPlayerState>>,
 }
 
 impl MediaWorker {
-    pub(crate) async fn run(
+    async fn run(
         command_rx: TokioReceiver<MediaCommand>,
         update_tx: TokioSender<MediaUpdate>,
     ) -> Result<()> {
         log::info!("[MediaWorker] Worker 正在启动...");
 
-        let tokio_runtime = Arc::new(Runtime::new()?);
         let (smtc_update_tx, smtc_update_rx) = channel::<InternalUpdate>(32);
         let (smtc_control_tx, smtc_control_rx) = channel::<InternalCommand>(32);
         let (now_playing_tx, now_playing_rx) = watch::channel(NowPlayingInfo::default());
@@ -98,7 +96,6 @@ impl MediaWorker {
             smtc_handler_thread_handle: None,
             audio_capturer: None,
             audio_update_rx: None,
-            tokio_runtime: tokio_runtime.clone(),
             _shared_player_state: Arc::new(tokio::sync::Mutex::new(SharedPlayerState::default())),
         };
 
@@ -336,18 +333,14 @@ impl MediaWorker {
 impl Drop for MediaWorker {
     fn drop(&mut self) {
         if self.smtc_control_tx.is_some() {
-            log::warn!(
-                "[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)，正在尝试关闭所有子系统..."
-            );
-            let rt = Arc::clone(&self.tokio_runtime);
-            rt.block_on(self.shutdown_all_subsystems());
+            log::warn!("[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)。");
         } else {
             log::trace!("[MediaWorker] MediaWorker 实例被正常丢弃。");
         }
     }
 }
 
-pub(crate) fn start_media_worker_thread(
+pub fn start_media_worker_thread(
     command_rx: TokioReceiver<MediaCommand>,
     update_tx: TokioSender<MediaUpdate>,
 ) -> Result<thread::JoinHandle<()>> {
@@ -356,6 +349,7 @@ pub(crate) fn start_media_worker_thread(
         .spawn(move || {
             let local_set = LocalSet::new();
             let rt = Runtime::new().expect("无法为 MediaWorker 创建 Tokio 运行时");
+
             local_set.block_on(&rt, async {
                 if let Err(e) = MediaWorker::run(command_rx, update_tx).await {
                     log::error!("[MediaWorker Thread] Worker 运行失败: {e}");

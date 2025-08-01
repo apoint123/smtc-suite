@@ -432,8 +432,8 @@ impl AudioCapturer {
                     )
                     .map_err(|e| SmtcError::AudioCapture(e.into()))?;
                 for frame_idx in 0..frames_written {
-                    for channel_idx in 0..original_channels {
-                        data_to_send_interleaved.push(resampler_output[channel_idx][frame_idx]);
+                    for channel_data in resampler_output.iter().take(original_channels) {
+                        data_to_send_interleaved.push(channel_data[frame_idx]);
                     }
                 }
                 for channel_buffer in accumulated_audio_planar.iter_mut() {

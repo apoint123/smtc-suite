@@ -23,7 +23,9 @@ use windows::{
         },
         MediaPlaybackAutoRepeatMode,
     },
-    Storage::Streams::{Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions},
+    Storage::Streams::{
+        Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions,
+    },
     Win32::{
         System::{
             Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
@@ -34,7 +36,7 @@ use windows::{
     core::{Error as WinError, HSTRING, Result as WinResult},
 };
 use windows_core::Interface;
-use windows_future::IAsyncOperation;
+use windows_future::{IAsyncInfo, IAsyncOperation};
 
 use crate::{
     api::{
@@ -257,18 +259,13 @@ fn hstring_to_string(hstr: &HSTRING) -> String {
 
 /// 使用超时来执行一个 WinRT 异步操作。
 /// 如果超时，会尝试取消该操作。
-async fn run_winrt_op_with_timeout<T>(operation: IAsyncOperation<T>) -> WinResult<T>
+async fn run_winrt_op_with_timeout<F, T>(operation: F) -> WinResult<T>
 where
     T: windows::core::RuntimeType + 'static,
     T::Default: 'static,
-    IAsyncOperation<T>: IntoFuture<Output = WinResult<T>>,
+    F: IntoFuture<Output = WinResult<T>> + Interface + Clone,
 {
-    match tokio_timeout(
-        SMTC_ASYNC_OPERATION_TIMEOUT,
-        operation.clone().into_future(),
-    )
-    .await
-    {
+    match tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, operation.clone().into_future()).await {
         // 异步操作在超时前成功完成
         Ok(Ok(result)) => Ok(result),
         // 异步操作在超时前完成，但自身返回了错误
@@ -276,9 +273,15 @@ where
         // tokio_timeout 返回超时错误
         Err(_) => {
             log::warn!("WinRT 异步操作超时 (>{:?}).", SMTC_ASYNC_OPERATION_TIMEOUT);
-            if let Err(e) = operation.Cancel() {
-                log::warn!("取消 WinRT 异步操作失败: {:?}", e);
+            
+            if let Ok(async_info) = operation.cast::<IAsyncInfo>() {
+                if let Err(e) = async_info.Cancel() {
+                    log::warn!("取消 WinRT 异步操作失败: {:?}", e);
+                }
+            } else {
+                log::warn!("无法将异步操作转换为 IAsyncInfo 来执行取消操作。");
             }
+            
             Err(WinError::from(E_ABORT_HRESULT))
         }
     }
@@ -446,13 +449,10 @@ async fn fetch_cover_data_task(
         }
 
         let buffer = Buffer::Create(stream_size as u32)?;
-
-        let read_operation = stream
-            .ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?
-            .cast::<IAsyncOperation<Buffer>>()?;
-
+        
+        let read_operation = stream.ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?;
         let bytes_buffer = run_winrt_op_with_timeout(read_operation).await?;
-
+        
         let reader = DataReader::FromBuffer(&bytes_buffer)?;
         let mut bytes = vec![0u8; bytes_buffer.Length()? as usize];
         reader.ReadBytes(&mut bytes)?;
@@ -664,13 +664,21 @@ impl SmtcRunner {
             tokio::select! {
                 biased;
 
-                _ = self.shutdown_rx.recv() => {
-                    log::info!("[SmtcRunner] 收到关闭信号，准备退出...");
+                maybe_shutdown = self.shutdown_rx.recv() => {
+                    if maybe_shutdown.is_some() {
+                        log::info!("[SmtcRunner] 收到关闭信号，准备退出...");
+                    } else {
+                        // recv() 返回 None，意味着发送端已被丢弃
+                        log::warn!("[SmtcRunner] 关闭通道已断开，准备退出...");
+                    }
                     break Ok(());
                 },
 
                 Some(command) = self.control_rx.recv() => {
-                    self.handle_internal_command(command, &smtc_event_tx, &async_result_tx, &progress_signal_tx).await?;
+                    if let Err(e) = self.handle_internal_command(command, &smtc_event_tx, &async_result_tx, &progress_signal_tx).await {
+                        log::error!("[SmtcRunner] 处理内部命令时发生致命错误: {e:?}，循环将终止。");
+                        return Err(crate::error::SmtcError::Windows(e));
+                    }
                 },
 
                 _ = session_check_interval.tick() => {
