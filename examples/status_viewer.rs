@@ -16,19 +16,18 @@ fn parse_combined_artist_album_info(mut info: NowPlayingInfo) -> NowPlayingInfo 
 }
 
 fn get_estimated_pos(info: &NowPlayingInfo) -> Option<u64> {
-    if info.is_playing.unwrap_or(false) {
-        if let (Some(last_pos_ms), Some(report_time)) =
+    if info.is_playing.unwrap_or(false)
+        && let (Some(last_pos_ms), Some(report_time)) =
             (info.position_ms, info.position_report_time)
+    {
+        let elapsed_ms = report_time.elapsed().as_millis() as u64;
+        let estimated_pos = last_pos_ms + elapsed_ms;
+        if let Some(duration_ms) = info.duration_ms
+            && duration_ms > 0
         {
-            let elapsed_ms = report_time.elapsed().as_millis() as u64;
-            let estimated_pos = last_pos_ms + elapsed_ms;
-            if let Some(duration_ms) = info.duration_ms {
-                if duration_ms > 0 {
-                    return Some(estimated_pos.min(duration_ms));
-                }
-            }
-            return Some(estimated_pos);
+            return Some(estimated_pos.min(duration_ms));
         }
+        return Some(estimated_pos);
     }
     info.position_ms
 }
@@ -216,11 +215,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 分支 2: 定时器触发，用于更新时间线
             _ = interval.tick() => {
-                if let Some(info) = &last_known_info {
-                    if info.is_playing.unwrap_or(false) {
+                if let Some(info) = &last_known_info
+                    && info.is_playing.unwrap_or(false) {
                         timeline_status(info);
                     }
-                }
             }
         }
     }

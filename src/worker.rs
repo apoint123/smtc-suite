@@ -11,8 +11,8 @@ use tokio::{
 
 use crate::{
     api::{
-        MediaCommand, MediaUpdate, NowPlayingInfo, SmtcControlCommand, SmtcSessionInfo,
-        TextConversionMode,
+        DiagnosticInfo, MediaCommand, MediaUpdate, NowPlayingInfo, SmtcControlCommand,
+        SmtcSessionInfo, TextConversionMode,
     },
     audio_capture::AudioCapturer,
     error::{Result, SmtcError},
@@ -64,6 +64,7 @@ pub(crate) struct MediaWorker {
     update_tx: TokioSender<MediaUpdate>,
     smtc_control_tx: Option<TokioSender<InternalCommand>>,
     smtc_update_rx: TokioReceiver<InternalUpdate>,
+    diagnostics_rx: Option<TokioReceiver<DiagnosticInfo>>,
     now_playing_rx: watch::Receiver<NowPlayingInfo>,
     smtc_shutdown_tx: Option<TokioSender<()>>,
     smtc_handler_thread_handle: Option<thread::JoinHandle<()>>,
@@ -84,12 +85,14 @@ impl MediaWorker {
         let (smtc_update_tx, smtc_update_rx) = channel::<InternalUpdate>(32);
         let (smtc_control_tx, smtc_control_rx) = channel::<InternalCommand>(32);
         let (now_playing_tx, now_playing_rx) = watch::channel(NowPlayingInfo::default());
+        let (diagnostics_tx, diagnostics_rx) = channel::<DiagnosticInfo>(32);
 
         let mut worker_instance = Self {
             command_rx,
             update_tx,
             smtc_control_tx: Some(smtc_control_tx),
             smtc_update_rx,
+            diagnostics_rx: Some(diagnostics_rx),
             now_playing_rx,
             smtc_shutdown_tx: None,
             smtc_handler_thread_handle: None,
@@ -99,7 +102,12 @@ impl MediaWorker {
             _shared_player_state: Arc::new(tokio::sync::Mutex::new(SharedPlayerState::default())),
         };
 
-        worker_instance.start_smtc_handler_thread(smtc_control_rx, smtc_update_tx, now_playing_tx);
+        worker_instance.start_smtc_handler_thread(
+            smtc_control_rx,
+            smtc_update_tx,
+            now_playing_tx,
+            diagnostics_tx,
+        );
 
         log::debug!("[MediaWorker] 初始化完成，即将进入核心异步事件循环。");
 
@@ -136,6 +144,19 @@ impl MediaWorker {
 
                 Some(update) = self.smtc_update_rx.recv() => {
                     self.handle_internal_update(update, "SMTC").await;
+                },
+
+                maybe_diag_update = async {
+                    if let Some(rx) = self.diagnostics_rx.as_mut() {
+                        rx.recv().await
+                    } else {
+                        std::future::pending().await
+                    }
+                }, if self.diagnostics_rx.is_some() => {
+                     if let Some(diag_info) = maybe_diag_update
+                        && self.update_tx.send(MediaUpdate::Diagnostic(diag_info)).await.is_err() {
+                            log::error!("[MediaWorker] 发送 Diagnostic 更新到外部失败。");
+                        }
                 },
 
                 maybe_audio_update = async {
@@ -214,6 +235,7 @@ impl MediaWorker {
         control_rx_for_smtc: TokioReceiver<InternalCommand>,
         update_tx_for_smtc: TokioSender<InternalUpdate>,
         now_playing_tx: watch::Sender<NowPlayingInfo>,
+        diagnostics_tx: TokioSender<DiagnosticInfo>,
     ) {
         if self.smtc_handler_thread_handle.is_some() {
             log::warn!("[MediaWorker] 尝试启动 SMTC 处理器，但它似乎已在运行。");
@@ -236,6 +258,7 @@ impl MediaWorker {
                     player_state_clone,
                     shutdown_rx_for_smtc,
                     now_playing_tx,
+                    diagnostics_tx,
                 ) {
                     log::error!("[SMTC Handler Thread] SMTC Handler 运行出错: {e}");
                 }

@@ -1,3 +1,4 @@
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -297,6 +298,8 @@ pub enum MediaUpdate {
     AudioData(Vec<u8>),
     /// 报告一个非致命的运行时错误。
     Error(String),
+    /// 报告一个非致命的运行时诊断信息。
+    Diagnostic(DiagnosticInfo),
     /// 指定会话的音量或静音状态已发生变化。
     VolumeChanged {
         /// 发生变化的会话 ID。
@@ -331,4 +334,19 @@ impl MediaController {
             .await
             .map_err(SmtcError::from)
     }
+}
+
+/// 诊断信息的严重级别
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DiagnosticLevel {
+    Warning,
+    Error,
+}
+
+/// 封装一条诊断信息
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiagnosticInfo {
+    pub level: DiagnosticLevel,
+    pub message: String,
+    pub timestamp: DateTime<Utc>,
 }

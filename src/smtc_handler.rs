@@ -1,10 +1,11 @@
 use std::{future::IntoFuture, sync::Arc, time::Instant};
 
+use chrono::Utc;
 use easer::functions::Easing;
-use ferrous_opencc::OpenCC;
+use ferrous_opencc::{OpenCC, config::BuiltinConfig};
 use tokio::{
     sync::{
-        Mutex as TokioMutex,
+        Mutex as TokioMutex, MutexGuard,
         mpsc::{Receiver as TokioReceiver, Sender as TokioSender, channel as tokio_channel},
         watch,
     },
@@ -32,10 +33,14 @@ use windows::{
     },
     core::{Error as WinError, HSTRING, Result as WinResult},
 };
+use windows_core::Interface;
 use windows_future::IAsyncOperation;
 
 use crate::{
-    api::{NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo, TextConversionMode},
+    api::{
+        DiagnosticInfo, DiagnosticLevel, NowPlayingInfo, RepeatMode, SmtcControlCommand,
+        SmtcSessionInfo, TextConversionMode,
+    },
     error::Result,
     volume_control,
     worker::{InternalCommand, InternalUpdate},
@@ -250,6 +255,35 @@ fn hstring_to_string(hstr: &HSTRING) -> String {
     }
 }
 
+/// 使用超时来执行一个 WinRT 异步操作。
+/// 如果超时，会尝试取消该操作。
+async fn run_winrt_op_with_timeout<T>(operation: IAsyncOperation<T>) -> WinResult<T>
+where
+    T: windows::core::RuntimeType + 'static,
+    T::Default: 'static,
+    IAsyncOperation<T>: IntoFuture<Output = WinResult<T>>,
+{
+    match tokio_timeout(
+        SMTC_ASYNC_OPERATION_TIMEOUT,
+        operation.clone().into_future(),
+    )
+    .await
+    {
+        // 异步操作在超时前成功完成
+        Ok(Ok(result)) => Ok(result),
+        // 异步操作在超时前完成，但自身返回了错误
+        Ok(Err(e)) => Err(e),
+        // tokio_timeout 返回超时错误
+        Err(_) => {
+            log::warn!("WinRT 异步操作超时 (>{:?}).", SMTC_ASYNC_OPERATION_TIMEOUT);
+            if let Err(e) = operation.Cancel() {
+                log::warn!("取消 WinRT 异步操作失败: {:?}", e);
+            }
+            Err(WinError::from(E_ABORT_HRESULT))
+        }
+    }
+}
+
 /// 计算封面图片数据的哈希值 (u64)，用于高效地检测封面图片是否发生变化。
 pub fn calculate_cover_hash(data: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
@@ -376,43 +410,26 @@ fn spawn_async_op<T, F>(
     }
 }
 
-async fn send_now_playing_update(
-    player_state_arc: &Arc<TokioMutex<SharedPlayerState>>,
+fn send_now_playing_update(
+    state_guard: &MutexGuard<SharedPlayerState>,
     now_playing_tx: &watch::Sender<NowPlayingInfo>,
 ) {
-    let latest_info = {
-        let state_guard = player_state_arc.lock().await;
-        NowPlayingInfo::from(&*state_guard)
-    };
+    let latest_info = NowPlayingInfo::from(&**state_guard);
 
     if now_playing_tx.send(latest_info).is_err() {
         log::warn!("[SMTC] 状态广播失败，所有接收者可能已关闭");
     }
 }
 
-/// 从 SMTC 会话中异步获取封面图片数据。
+/// 从 SMTC 会话中获取封面图片数据。
 async fn fetch_cover_data_task(
     thumb_ref: IRandomAccessStreamReference,
 ) -> WinResult<Option<Vec<u8>>> {
     let start_time = Instant::now();
     log::debug!("[Cover Fetcher] 正在获取封面数据...");
+
     let result = async {
-        let open_op = thumb_ref.OpenReadAsync()?;
-        let stream = tokio::select! {
-            biased;
-            res = open_op.clone().into_future() => {
-                res?
-            },
-            _ = tokio::time::sleep(SMTC_ASYNC_OPERATION_TIMEOUT) => {
-                log::warn!("[Cover Fetcher] 打开封面流超时 (>{SMTC_ASYNC_OPERATION_TIMEOUT:?})。");
-                if let Err(e) = open_op.Cancel() {
-                    log::warn!("[Cover Fetcher] 取消 OpenReadAsync 操作失败: {e:?}");
-                } else {
-                    log::debug!("[Cover Fetcher] 取消 OpenReadAsync 操作成功。");
-                }
-                return Err(WinError::from(E_ABORT_HRESULT));
-            }
-        };
+        let stream = run_winrt_op_with_timeout(thumb_ref.OpenReadAsync()?).await?;
         log::debug!("[Cover Fetcher] 成功获取到封面流 (IRandomAccessStreamWithContentType)。");
 
         let stream_size = stream.Size()?;
@@ -429,22 +446,13 @@ async fn fetch_cover_data_task(
         }
 
         let buffer = Buffer::Create(stream_size as u32)?;
-        let read_op = stream.ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?;
-        let bytes_buffer = tokio::select! {
-            biased;
-            res = read_op.clone().into_future() => {
-                res?
-            },
-            _ = tokio::time::sleep(SMTC_ASYNC_OPERATION_TIMEOUT) => {
-                log::warn!("[Cover Fetcher] 读取封面数据超时 (>{SMTC_ASYNC_OPERATION_TIMEOUT:?})。");
-                if let Err(e) = read_op.Cancel() {
-                    log::warn!("[Cover Fetcher] 取消 ReadAsync 操作失败: {e:?}");
-                } else {
-                    log::debug!("[Cover Fetcher] 取消 ReadAsync 操作成功。");
-                }
-                return Err(WinError::from(E_ABORT_HRESULT));
-            }
-        };
+
+        let read_operation = stream
+            .ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?
+            .cast::<IAsyncOperation<Buffer>>()?;
+
+        let bytes_buffer = run_winrt_op_with_timeout(read_operation).await?;
+
         let reader = DataReader::FromBuffer(&bytes_buffer)?;
         let mut bytes = vec![0u8; bytes_buffer.Length()? as usize];
         reader.ReadBytes(&mut bytes)?;
@@ -571,6 +579,69 @@ struct SmtcRunner {
     now_playing_tx: watch::Sender<NowPlayingInfo>,
     control_rx: TokioReceiver<InternalCommand>,
     shutdown_rx: TokioReceiver<()>,
+    diagnostics_tx: TokioSender<DiagnosticInfo>,
+}
+
+impl SmtcControlCommand {
+    fn execute(self, context: SmtcExecutionContext) -> Option<WinResult<IAsyncOperation<bool>>> {
+        log::debug!("[SmtcRunner] 正在执行命令: {:?}", self);
+
+        match self {
+            Self::Play => Some(context.session.TryPlayAsync()),
+            Self::Pause => Some(context.session.TryPauseAsync()),
+            Self::SkipNext => Some(context.session.TrySkipNextAsync()),
+            Self::SkipPrevious => Some(context.session.TrySkipPreviousAsync()),
+            Self::SeekTo(pos) => Some(
+                context
+                    .session
+                    .TryChangePlaybackPositionAsync(pos as i64 * 10000),
+            ),
+            Self::SetShuffle(is_active) => {
+                Some(context.session.TryChangeShuffleActiveAsync(is_active))
+            }
+            Self::SetRepeatMode(repeat_mode) => {
+                let win_repeat_mode = match repeat_mode {
+                    RepeatMode::Off => MediaPlaybackAutoRepeatMode::None,
+                    RepeatMode::One => MediaPlaybackAutoRepeatMode::Track,
+                    RepeatMode::All => MediaPlaybackAutoRepeatMode::List,
+                };
+                Some(
+                    context
+                        .session
+                        .TryChangeAutoRepeatModeAsync(win_repeat_mode),
+                )
+            }
+            // 直接执行并返回 None
+            Self::SetVolume(level) => {
+                if let Ok(id_hstr) = context.session.SourceAppUserModelId() {
+                    let session_id_str = hstring_to_string(&id_hstr);
+                    if !session_id_str.is_empty() {
+                        if let Some(old_task) = context.active_volume_easing_task.take() {
+                            old_task.abort();
+                        }
+                        let task_id = context
+                            .next_easing_task_id
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        *context.active_volume_easing_task =
+                            Some(tokio::task::spawn_local(volume_easing_task(
+                                task_id,
+                                level,
+                                session_id_str,
+                                context.connector_update_tx.clone(),
+                            )));
+                    }
+                }
+                None // 没有需要处理的异步操作
+            }
+        }
+    }
+}
+
+struct SmtcExecutionContext<'a> {
+    session: &'a MediaSession,
+    active_volume_easing_task: &'a mut Option<JoinHandle<()>>,
+    next_easing_task_id: &'a Arc<std::sync::atomic::AtomicU64>,
+    connector_update_tx: &'a TokioSender<InternalUpdate>,
 }
 
 impl SmtcRunner {
@@ -638,24 +709,31 @@ impl SmtcRunner {
                     log::info!("[SmtcRunner] 切换文本转换模式 -> {mode:?}");
                     self.state.text_conversion_mode = mode;
 
-                    let config_name = match mode {
+                    let config = match mode {
                         TextConversionMode::Off => None,
-                        TextConversionMode::TraditionalToSimplified => Some("t2s.json"),
-                        TextConversionMode::SimplifiedToTraditional => Some("s2t.json"),
-                        TextConversionMode::SimplifiedToTaiwan => Some("s2tw.json"),
-                        TextConversionMode::TaiwanToSimplified => Some("tw2s.json"),
-                        TextConversionMode::SimplifiedToHongKong => Some("s2hk.json"),
-                        TextConversionMode::HongKongToSimplified => Some("hk2s.json"),
+                        TextConversionMode::TraditionalToSimplified => Some(BuiltinConfig::T2s),
+                        TextConversionMode::SimplifiedToTraditional => Some(BuiltinConfig::S2t),
+                        TextConversionMode::SimplifiedToTaiwan => Some(BuiltinConfig::S2tw),
+                        TextConversionMode::TaiwanToSimplified => Some(BuiltinConfig::Tw2s),
+                        TextConversionMode::SimplifiedToHongKong => Some(BuiltinConfig::S2hk),
+                        TextConversionMode::HongKongToSimplified => Some(BuiltinConfig::Hk2s),
                     };
 
-                    self.state.text_converter =
-                        config_name.and_then(|name| match OpenCC::from_config_name(name) {
+                    self.state.text_converter = if let Some(config) = config {
+                        match ferrous_opencc::OpenCC::from_config(config) {
                             Ok(converter) => Some(converter),
                             Err(e) => {
-                                log::error!("[SmtcRunner] 加载 OpenCC 配置 '{name}' 失败: {e}");
+                                self.send_diagnostic(
+                                    DiagnosticLevel::Error,
+                                    format!("加载 OpenCC 配置 '{config:?}' 失败: {e}"),
+                                )
+                                .await;
                                 None
                             }
-                        });
+                        }
+                    } else {
+                        None // TextConversionMode::Off
+                    };
 
                     let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
                 }
@@ -668,65 +746,24 @@ impl SmtcRunner {
             }
             InternalCommand::MediaControl(media_cmd) => {
                 let Some(guard) = &self.state.session_guard else {
+                    log::warn!(
+                        "[SmtcRunner] 收到媒体控制命令 {:?}，但没有活动的会话，已忽略。",
+                        media_cmd
+                    );
                     return Ok(());
                 };
-                let session = &guard.session;
-                log::debug!("[SmtcRunner] 正在执行命令: {media_cmd:?}");
-                match media_cmd {
-                    SmtcControlCommand::SetVolume(level) => {
-                        if let Ok(id_hstr) = session.SourceAppUserModelId() {
-                            let session_id_str = hstring_to_string(&id_hstr);
-                            if !session_id_str.is_empty() {
-                                if let Some(old_task) = self.state.active_volume_easing_task.take()
-                                {
-                                    old_task.abort();
-                                }
-                                let task_id = self
-                                    .state
-                                    .next_easing_task_id
-                                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                self.state.active_volume_easing_task =
-                                    Some(tokio::task::spawn_local(volume_easing_task(
-                                        task_id,
-                                        level,
-                                        session_id_str,
-                                        self.connector_update_tx.clone(),
-                                    )));
-                            }
-                        }
-                    }
-                    SmtcControlCommand::SetShuffle(is_active) => {
-                        let async_op = session.TryChangeShuffleActiveAsync(is_active);
-                        spawn_async_op(async_op, async_result_tx, move |res| {
-                            AsyncTaskResult::MediaControlCompleted(media_cmd, res)
-                        });
-                    }
-                    SmtcControlCommand::SetRepeatMode(repeat_mode) => {
-                        let win_repeat_mode = match repeat_mode {
-                            RepeatMode::Off => MediaPlaybackAutoRepeatMode::None,
-                            RepeatMode::One => MediaPlaybackAutoRepeatMode::Track,
-                            RepeatMode::All => MediaPlaybackAutoRepeatMode::List,
-                        };
-                        let async_op = session.TryChangeAutoRepeatModeAsync(win_repeat_mode);
-                        spawn_async_op(async_op, async_result_tx, move |res| {
-                            AsyncTaskResult::MediaControlCompleted(media_cmd, res)
-                        });
-                    }
-                    other_cmd => {
-                        let async_op = match other_cmd {
-                            SmtcControlCommand::Play => session.TryPlayAsync(),
-                            SmtcControlCommand::Pause => session.TryPauseAsync(),
-                            SmtcControlCommand::SkipNext => session.TrySkipNextAsync(),
-                            SmtcControlCommand::SkipPrevious => session.TrySkipPreviousAsync(),
-                            SmtcControlCommand::SeekTo(pos) => {
-                                session.TryChangePlaybackPositionAsync(pos as i64 * 10000)
-                            }
-                            _ => unreachable!(),
-                        };
-                        spawn_async_op(async_op, async_result_tx, move |res| {
-                            AsyncTaskResult::MediaControlCompleted(other_cmd, res)
-                        });
-                    }
+
+                let context = SmtcExecutionContext {
+                    session: &guard.session,
+                    active_volume_easing_task: &mut self.state.active_volume_easing_task,
+                    next_easing_task_id: &self.state.next_easing_task_id,
+                    connector_update_tx: &self.connector_update_tx,
+                };
+
+                if let Some(async_op_result) = media_cmd.execute(context) {
+                    spawn_async_op(async_op_result, async_result_tx, move |res| {
+                        AsyncTaskResult::MediaControlCompleted(media_cmd, res)
+                    });
                 }
             }
             InternalCommand::RequestStateUpdate => {
@@ -841,7 +878,8 @@ impl SmtcRunner {
                             state_guard.can_change_repeat = c.IsRepeatEnabled().unwrap_or(false);
                         }
                     }
-                    send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
+                    let player_state = self.player_state_arc.lock().await;
+                    send_now_playing_update(&player_state, &self.now_playing_tx);
                 }
             }
             SmtcEventSignal::TimelineProperties => {
@@ -875,13 +913,7 @@ impl SmtcRunner {
                                         "[SmtcRunner] 收到第一次 SMTC 更新，已清除等待标志。"
                                     );
                                 }
-
-                                drop(state_guard);
-                                send_now_playing_update(
-                                    &self.player_state_arc,
-                                    &self.now_playing_tx,
-                                )
-                                .await;
+                                send_now_playing_update(&state_guard, &self.now_playing_tx);
                             }
                         }
                         Err(e) => log::warn!("[SmtcRunner] 获取 TimelineProperties 失败: {e:?}"),
@@ -899,17 +931,46 @@ impl SmtcRunner {
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
     ) -> WinResult<()> {
         match result {
-            AsyncTaskResult::ManagerReady(Ok(mgr)) => {
+            AsyncTaskResult::ManagerReady(res) => self.on_manager_ready(res, smtc_event_tx).await,
+            AsyncTaskResult::MediaPropertiesReady(res) => {
+                self.on_media_properties_ready(res, async_result_tx).await
+            }
+            AsyncTaskResult::MediaControlCompleted(cmd, res) => {
+                self.on_media_control_completed(cmd, res).await
+            }
+            AsyncTaskResult::CoverDataReady(res) => {
+                self.on_cover_data_ready(res, smtc_event_tx).await
+            }
+        }
+    }
+
+    async fn on_manager_ready(
+        &mut self,
+        result: WinResult<MediaSessionManager>,
+        smtc_event_tx: &TokioSender<SmtcEventSignal>,
+    ) -> WinResult<()> {
+        match result {
+            Ok(mgr) => {
                 log::trace!("[SmtcRunner] SMTC 管理器已就绪。");
                 let guard = ManagerEventGuard::new(mgr, smtc_event_tx)?;
                 self.state.manager_guard = Some(guard);
                 let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
+                Ok(())
             }
-            AsyncTaskResult::ManagerReady(Err(e)) => {
+            Err(e) => {
                 log::error!("[SmtcRunner] 初始化 SMTC 管理器失败: {e:?}。");
-                return Err(e);
+                Err(e)
             }
-            AsyncTaskResult::MediaPropertiesReady(Ok(props)) => {
+        }
+    }
+
+    async fn on_media_properties_ready(
+        &mut self,
+        result: WinResult<GlobalSystemMediaTransportControlsSessionMediaProperties>,
+        async_result_tx: &TokioSender<AsyncTaskResult>,
+    ) -> WinResult<()> {
+        match result {
+            Ok(props) => {
                 let get_prop_string = |prop_res: WinResult<HSTRING>, name: &str| {
                     prop_res.map_or_else(
                         |e| {
@@ -930,108 +991,117 @@ impl SmtcRunner {
                 let album = get_prop_string(props.AlbumTitle(), "AlbumTitle");
 
                 const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
-                let is_placeholder_title = IGNORED_TITLES.iter().any(|&ignored| title == ignored);
+                if IGNORED_TITLES.iter().any(|&ignored| title == ignored) {
+                    return Ok(());
+                }
 
-                if !is_placeholder_title {
-                    let should_fetch_cover;
-                    {
-                        let mut player_state = self.player_state_arc.lock().await;
+                let is_new_track;
+                {
+                    let mut player_state = self.player_state_arc.lock().await;
+                    is_new_track = player_state.title != title || player_state.artist != artist;
+
+                    if is_new_track {
                         log::info!(
                             "[SmtcRunner] 接收到新曲目信息: '{}' - '{}'",
                             &artist,
                             &title
                         );
-
-                        let is_new_track =
-                            player_state.title != title || player_state.artist != artist;
-                        if is_new_track {
-                            player_state.cover_data = None;
-                            player_state.cover_data_hash = None;
-                            player_state.is_waiting_for_initial_update = true;
-                            should_fetch_cover = true;
-                        } else {
-                            should_fetch_cover = false;
-                        }
-
-                        player_state.title = title;
-                        player_state.artist = artist;
-                        player_state.album = album;
+                        player_state.cover_data = None;
+                        player_state.cover_data_hash = None;
+                        player_state.is_waiting_for_initial_update = true;
                     }
-
-                    if should_fetch_cover && let Ok(thumb_ref) = props.Thumbnail() {
-                        if let Some(old_task) = self.state.active_cover_fetch_task.take() {
-                            old_task.abort();
-                            log::trace!("[SmtcRunner] 已取消旧的封面获取任务");
-                        }
-
-                        let async_result_tx_clone = async_result_tx.clone();
-                        let cover_task = tokio::task::spawn_local(async move {
-                            let result = fetch_cover_data_task(thumb_ref).await;
-                            if async_result_tx_clone
-                                .send(AsyncTaskResult::CoverDataReady(result))
-                                .await
-                                .is_err()
-                            {
-                                log::warn!(
-                                    "[Cover Fetcher] 无法将封面结果发送回主循环，通道已关闭。"
-                                );
-                            }
-                        });
-
-                        self.state.active_cover_fetch_task = Some(cover_task);
-                    }
-
-                    send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
+                    player_state.title = title;
+                    player_state.artist = artist;
+                    player_state.album = album;
                 }
+
+                if is_new_track && let Ok(thumb_ref) = props.Thumbnail() {
+                    if let Some(old_task) = self.state.active_cover_fetch_task.take() {
+                        old_task.abort();
+                        log::debug!("[SmtcRunner] 已取消旧的封面获取任务");
+                    }
+                    let async_result_tx_clone = async_result_tx.clone();
+                    let cover_task = tokio::task::spawn_local(async move {
+                        let result = fetch_cover_data_task(thumb_ref).await;
+                        if async_result_tx_clone
+                            .send(AsyncTaskResult::CoverDataReady(result))
+                            .await
+                            .is_err()
+                        {
+                            log::warn!("[Cover Fetcher] 无法将封面结果发送回主循环，通道已关闭。");
+                        }
+                    });
+                    self.state.active_cover_fetch_task = Some(cover_task);
+                }
+
+                let player_state = self.player_state_arc.lock().await;
+                send_now_playing_update(&player_state, &self.now_playing_tx);
             }
-            AsyncTaskResult::MediaPropertiesReady(Err(e)) => {
+            Err(e) => {
                 log::warn!("[SmtcRunner] 获取媒体属性失败: {e:?}");
             }
-            AsyncTaskResult::MediaControlCompleted(cmd, res) => match res {
-                Ok(true) => log::debug!("[SmtcRunner] 媒体控制指令 {cmd:?} 成功执行。"),
-                Ok(false) => {
-                    log::warn!("[SmtcRunner] 媒体控制指令 {cmd:?} 执行失败 (返回 false)。")
-                }
-                Err(e) => log::warn!("[SmtcRunner] 媒体控制指令 {cmd:?} 调用失败: {e:?}"),
-            },
-            AsyncTaskResult::CoverDataReady(result) => match result {
-                Ok(Some(bytes)) => {
-                    let new_hash = calculate_cover_hash(&bytes);
-                    let mut player_state = self.player_state_arc.lock().await;
-                    if player_state.cover_data_hash != Some(new_hash) {
-                        log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
-                        player_state.cover_data = Some(bytes);
-                        player_state.cover_data_hash = Some(new_hash);
-                        drop(player_state);
-                        send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
-                    }
-                }
-                Ok(None) => {
-                    let mut player_state = self.player_state_arc.lock().await;
-                    if player_state.cover_data.is_some() {
-                        log::debug!("[State Update] 清空封面数据。");
-                        player_state.cover_data = None;
-                        player_state.cover_data_hash = None;
-                        drop(player_state);
-                        send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
-                    }
-                }
-                Err(e) => {
-                    log::warn!("[SmtcRunner] 获取封面失败: {e:?}，正在重置会话。");
-                    {
-                        let mut player_state = self.player_state_arc.lock().await;
-                        player_state.cover_data = None;
-                        player_state.cover_data_hash = None;
-                    }
-                    send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
+        }
+        Ok(())
+    }
 
-                    self.state.session_guard = None;
+    async fn on_media_control_completed(
+        &mut self,
+        cmd: SmtcControlCommand,
+        res: WinResult<bool>,
+    ) -> WinResult<()> {
+        match res {
+            Ok(true) => log::debug!("[SmtcRunner] 媒体控制指令 {cmd:?} 成功执行。"),
+            Ok(false) => log::warn!("[SmtcRunner] 媒体控制指令 {cmd:?} 执行失败 (返回 false)。"),
+            Err(e) => log::warn!("[SmtcRunner] 媒体控制指令 {cmd:?} 调用失败: {e:?}"),
+        }
+        Ok(())
+    }
 
-                    if let Err(e) = smtc_event_tx.try_send(SmtcEventSignal::Sessions) {
-                        log::error!("[SmtcRunner] 发送会话重置信号失败: {e:?}");
-                    }
+    async fn on_cover_data_ready(
+        &mut self,
+        result: WinResult<Option<Vec<u8>>>,
+        smtc_event_tx: &TokioSender<SmtcEventSignal>,
+    ) -> WinResult<()> {
+        match result {
+            Ok(Some(bytes)) => {
+                let new_hash = calculate_cover_hash(&bytes);
+                let mut player_state = self.player_state_arc.lock().await;
+                if player_state.cover_data_hash != Some(new_hash) {
+                    log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
+                    player_state.cover_data = Some(bytes);
+                    player_state.cover_data_hash = Some(new_hash);
+                    drop(player_state);
+                    let player_state = self.player_state_arc.lock().await;
+                    send_now_playing_update(&player_state, &self.now_playing_tx);
                 }
-            },
+            }
+            Ok(None) => {
+                let mut player_state = self.player_state_arc.lock().await;
+                if player_state.cover_data.is_some() {
+                    log::debug!("[State Update] 清空封面数据。");
+                    player_state.cover_data = None;
+                    player_state.cover_data_hash = None;
+                    drop(player_state);
+                    let player_state = self.player_state_arc.lock().await;
+                    send_now_playing_update(&player_state, &self.now_playing_tx);
+                }
+            }
+            Err(e) => {
+                log::warn!("[SmtcRunner] 获取封面失败: {e:?}，正在重置会话。");
+                {
+                    let mut player_state = self.player_state_arc.lock().await;
+                    player_state.cover_data = None;
+                    player_state.cover_data_hash = None;
+                }
+                let player_state = self.player_state_arc.lock().await;
+                send_now_playing_update(&player_state, &self.now_playing_tx);
+
+                self.state.session_guard = None;
+
+                if let Err(e) = smtc_event_tx.try_send(SmtcEventSignal::Sessions) {
+                    log::error!("[SmtcRunner] 发送会话重置信号失败: {e:?}");
+                }
+            }
         }
         Ok(())
     }
@@ -1046,7 +1116,8 @@ impl SmtcRunner {
             let mut player_state = self.player_state_arc.lock().await;
             player_state.is_playing = is_playing_now;
         }
-        send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
+        let player_state = self.player_state_arc.lock().await;
+        send_now_playing_update(&player_state, &self.now_playing_tx);
     }
 
     async fn handle_session_check_tick(
@@ -1088,6 +1159,17 @@ impl SmtcRunner {
     ) -> WinResult<()> {
         log::debug!("[会话处理器] 开始处理会话变更...");
 
+        let session_candidates = self.get_sessions().await?;
+
+        let new_session_to_monitor = self.select_session_to_monitor(session_candidates).await?;
+
+        self.update_monitoring_session(new_session_to_monitor, smtc_event_tx)
+            .await?;
+
+        Ok(())
+    }
+
+    async fn get_sessions(&self) -> WinResult<Vec<(String, MediaSession)>> {
         let guard = self
             .state
             .manager_guard
@@ -1122,13 +1204,23 @@ impl SmtcRunner {
             log::warn!("[会话处理器] 无法发送会话列表更新");
         }
 
-        let new_session_to_monitor = if let Some(target_id) = self.state.target_session_id.as_ref()
-        {
-            if let Some((_, session)) = session_candidates
-                .into_iter()
-                .find(|(id, _)| id == target_id)
-            {
-                Some(session)
+        Ok(session_candidates)
+    }
+
+    async fn select_session_to_monitor(
+        &mut self,
+        candidates: Vec<(String, MediaSession)>,
+    ) -> WinResult<Option<MediaSession>> {
+        let guard = self
+            .state
+            .manager_guard
+            .as_ref()
+            .ok_or_else(|| WinError::from(E_ABORT_HRESULT))?;
+        let manager = &guard.manager;
+
+        if let Some(target_id) = self.state.target_session_id.as_ref() {
+            if let Some((_, session)) = candidates.into_iter().find(|(id, _)| id == target_id) {
+                Ok(Some(session))
             } else {
                 log::warn!("[会话处理器] 目标会话 '{target_id}' 已消失。");
                 let _ = self
@@ -1138,12 +1230,18 @@ impl SmtcRunner {
                     ))
                     .await;
                 self.state.target_session_id = None;
-                manager.GetCurrentSession().ok()
+                manager.GetCurrentSession().map(Some)
             }
         } else {
-            manager.GetCurrentSession().ok()
-        };
+            manager.GetCurrentSession().map(Some)
+        }
+    }
 
+    async fn update_monitoring_session(
+        &mut self,
+        new_session_to_monitor: Option<MediaSession>,
+        smtc_event_tx: &TokioSender<SmtcEventSignal>,
+    ) -> WinResult<()> {
         let new_session_id = new_session_to_monitor
             .as_ref()
             .and_then(|s| s.SourceAppUserModelId().ok())
@@ -1156,38 +1254,57 @@ impl SmtcRunner {
             .and_then(|g| g.session.SourceAppUserModelId().ok())
             .map(|h| h.to_string_lossy());
 
-        if new_session_id != current_session_id {
-            log::info!(
-                "[会话处理器] 检测到会话切换: 从 {:?} -> 到 {:?}",
-                current_session_id.as_deref().unwrap_or("无"),
-                new_session_id.as_deref().unwrap_or("无")
-            );
-
-            self.state.session_guard = None;
-
-            if let Some(new_s) = new_session_to_monitor {
-                let new_guard = MonitoredSessionGuard::new(new_s, smtc_event_tx)?;
-                {
-                    let mut player_state = self.player_state_arc.lock().await;
-                    player_state.reset_to_empty();
-                }
-                send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
-                self.state.session_guard = Some(new_guard);
-
-                log::info!("[会话处理器] 会话切换完成，正在获取所有初始状态。");
-                let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
-                let _ = smtc_event_tx.try_send(SmtcEventSignal::PlaybackInfo);
-                let _ = smtc_event_tx.try_send(SmtcEventSignal::TimelineProperties);
-            } else {
-                log::info!("[会话处理器] 没有可用的媒体会话，重置状态。");
-                {
-                    let mut player_state = self.player_state_arc.lock().await;
-                    player_state.reset_to_empty();
-                }
-                send_now_playing_update(&self.player_state_arc, &self.now_playing_tx).await;
-            }
+        if new_session_id == current_session_id {
+            return Ok(());
         }
+
+        log::info!(
+            "[会话处理器] 检测到会话切换: 从 {:?} -> 到 {:?}",
+            current_session_id.as_deref().unwrap_or("无"),
+            new_session_id.as_deref().unwrap_or("无")
+        );
+
+        self.state.session_guard = None;
+
+        {
+            let mut player_state = self.player_state_arc.lock().await;
+            player_state.reset_to_empty();
+        }
+        let player_state = self.player_state_arc.lock().await;
+        send_now_playing_update(&player_state, &self.now_playing_tx);
+
+        if let Some(new_s) = new_session_to_monitor {
+            let new_guard = MonitoredSessionGuard::new(new_s, smtc_event_tx)?;
+            self.state.session_guard = Some(new_guard);
+
+            log::info!("[会话处理器] 会话切换完成，正在获取初始状态。");
+            let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
+            let _ = smtc_event_tx.try_send(SmtcEventSignal::PlaybackInfo);
+            let _ = smtc_event_tx.try_send(SmtcEventSignal::TimelineProperties);
+        } else {
+            log::info!("[会话处理器] 没有可用的媒体会话，已重置状态。");
+        }
+
         Ok(())
+    }
+
+    /// 发送一条诊断信息，并同时在控制台打印日志。
+    async fn send_diagnostic(&self, level: DiagnosticLevel, message: impl Into<String>) {
+        let message = message.into();
+        match level {
+            DiagnosticLevel::Warning => log::warn!("[诊断信息] {}", &message),
+            DiagnosticLevel::Error => log::error!("[诊断信息] {}", &message),
+        }
+
+        let info = DiagnosticInfo {
+            level,
+            message,
+            timestamp: Utc::now(),
+        };
+
+        if self.diagnostics_tx.send(info).await.is_err() {
+            log::warn!("[诊断信息] 诊断通道已关闭，无法发送信息。");
+        }
     }
 }
 
@@ -1197,6 +1314,7 @@ pub fn run_smtc_listener(
     player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
     shutdown_rx: TokioReceiver<()>,
     now_playing_tx: watch::Sender<NowPlayingInfo>,
+    diagnostics_tx: TokioSender<DiagnosticInfo>,
 ) -> Result<()> {
     log::info!("[SMTC Handler] 正在启动 SMTC 监听器");
 
@@ -1256,6 +1374,7 @@ pub fn run_smtc_listener(
             now_playing_tx,
             control_rx,
             shutdown_rx,
+            diagnostics_tx,
         };
 
         if let Err(e) = runner.run().await {

@@ -35,21 +35,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 MediaUpdate::SessionsChanged(sessions) => {
                     debug!("可用会话列表已更新，共 {} 个。", sessions.len());
-                    if let Some(first_session) = sessions.first() {
-                        if !session_selected_clone.load(Ordering::Relaxed) {
-                            info!(
-                                "发现媒体会话 '{}'，将自动选择。",
-                                first_session.display_name
-                            );
-                            if command_tx_clone
-                                .send(MediaCommand::SelectSession(
-                                    first_session.session_id.clone(),
-                                ))
-                                .await
-                                .is_ok()
-                            {
-                                session_selected_clone.store(true, Ordering::Relaxed);
-                            }
+                    if let Some(first_session) = sessions.first()
+                        && !session_selected_clone.load(Ordering::Relaxed)
+                    {
+                        info!(
+                            "发现媒体会话 '{}'，将自动选择。",
+                            first_session.display_name
+                        );
+                        if command_tx_clone
+                            .send(MediaCommand::SelectSession(
+                                first_session.session_id.clone(),
+                            ))
+                            .await
+                            .is_ok()
+                        {
+                            session_selected_clone.store(true, Ordering::Relaxed);
                         }
                     }
                 }

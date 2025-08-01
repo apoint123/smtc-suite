@@ -16,6 +16,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 base64 = "0.22.1"
+chrono = { version = "0.4", features = ["serde"] }
 crossbeam-channel = "0.5.15"
 easer = "0.3"
 env_logger = "0.11.8"
@@ -39,4 +40,5 @@ windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
 ] }
+windows-core = "0.61.2"
 windows-future = { version = "0.2" }

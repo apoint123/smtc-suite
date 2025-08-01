@@ -402,7 +402,7 @@ impl AudioCapturer {
     fn handle_audio_resampling(
         captured_f32_interleaved: &[f32],
         resampler: &mut Option<SincFixedIn<f32>>,
-        accumulated_audio_planar: &mut Vec<Vec<f32>>,
+        accumulated_audio_planar: &mut [Vec<f32>],
         original_channels: usize,
     ) -> Result<Vec<f32>> {
         let mut data_to_send_interleaved = Vec::new();
@@ -568,7 +568,7 @@ impl AudioCapturer {
             if accumulated_audio_planar.iter().any(|b| !b.is_empty()) {
                 for channel_buffer in &mut accumulated_audio_planar {
                     let padding_needed = needed_frames.saturating_sub(channel_buffer.len());
-                    channel_buffer.extend(std::iter::repeat(0.0f32).take(padding_needed));
+                    channel_buffer.extend(std::iter::repeat_n(0.0f32, padding_needed));
                 }
                 let mut output_buffer = vec![vec![0.0; rs.output_frames_max()]; original_channels];
                 let input_slices: Vec<&[f32]> = accumulated_audio_planar

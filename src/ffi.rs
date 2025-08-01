@@ -5,11 +5,12 @@ use crate::{
         NowPlayingInfo, RepeatMode, SmtcControlCommand, SmtcSessionInfo,
     },
 };
+use log::{Level, LevelFilter, Metadata, Record};
 use std::{
     ffi::{CStr, CString, c_char, c_void},
     panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -105,6 +106,31 @@ pub struct CSessionList {
     pub count: usize,
 }
 
+/// C-ABI 兼容的诊断级别枚举。
+#[repr(C)]
+#[derive(Debug)]
+pub enum CDiagnosticLevel {
+    Warning,
+    Error,
+}
+
+/// C-ABI 兼容的诊断信息结构体。
+///
+/// # 数据生命周期
+/// **此结构体及其指向的所有字符串数据仅在回调函数作用域内有效。**
+/// 如果需要保留，必须在回调函数内部进行深拷贝。
+/// **调用者不应也无需手动释放任何指针。**
+#[repr(C)]
+#[derive(Debug)]
+pub struct CDiagnosticInfo {
+    /// 诊断事件的级别。
+    pub level: CDiagnosticLevel,
+    /// 诊断信息的具体内容。仅在回调内有效。
+    pub message: *const c_char,
+    /// 事件发生的时间戳，仅在回调内有效。
+    pub timestamp_str: *const c_char,
+}
+
 /// C-ABI 兼容的音频数据包结构体。
 ///
 /// # 数据生命周期
@@ -151,6 +177,8 @@ pub enum CUpdateType {
     VolumeChanged,
     /// data 指针类型: `*const c_char` (已消失会话的 ID)
     SelectedSessionVanished,
+    /// data 指针类型: `*const CDiagnosticInfo`
+    Diagnostic,
 }
 
 /// 定义从 C 端接收更新的回调函数指针类型。
@@ -161,6 +189,96 @@ pub enum CUpdateType {
 /// - `userdata`: 调用者在注册时传入的自定义上下文指针。
 pub type UpdateCallback =
     extern "C" fn(update_type: CUpdateType, data: *const c_void, userdata: *mut c_void);
+
+/// C-ABI 兼容的日志级别枚举。
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+pub enum CLogLevel {
+    Error = 1,
+    Warn = 2,
+    Info = 3,
+    Debug = 4,
+    Trace = 5,
+}
+
+impl From<CLogLevel> for LevelFilter {
+    fn from(level: CLogLevel) -> Self {
+        match level {
+            CLogLevel::Error => LevelFilter::Error,
+            CLogLevel::Warn => LevelFilter::Warn,
+            CLogLevel::Info => LevelFilter::Info,
+            CLogLevel::Debug => LevelFilter::Debug,
+            CLogLevel::Trace => LevelFilter::Trace,
+        }
+    }
+}
+
+impl From<Level> for CLogLevel {
+    fn from(level: Level) -> Self {
+        match level {
+            Level::Error => CLogLevel::Error,
+            Level::Warn => CLogLevel::Warn,
+            Level::Info => CLogLevel::Info,
+            Level::Debug => CLogLevel::Debug,
+            Level::Trace => CLogLevel::Trace,
+        }
+    }
+}
+
+/// 定义 C 端日志回调函数的指针类型。
+///
+/// # 参数
+/// - `level`: 日志消息的级别。
+/// - `target`: 日志来源的模块路径 (例如 "my_lib::my_module")。
+/// - `message`: UTF-8 编码、Null 结尾的日志消息。
+/// - `userdata`: 调用者在注册时传入的自定义上下文指针。
+pub type LogCallback = extern "C" fn(
+    level: CLogLevel,
+    target: *const c_char,
+    message: *const c_char,
+    userdata: *mut c_void,
+);
+
+/// FFI 日志记录器的状态，用于存储 C 回调和用户数据。
+struct FfiLoggerState {
+    callback: LogCallback,
+    userdata: SendableVoidPtr,
+}
+
+static FFI_LOGGER: OnceLock<FfiLogger> = OnceLock::new();
+
+struct FfiLogger {
+    state: Mutex<FfiLoggerState>,
+}
+
+impl log::Log for FfiLogger {
+    fn enabled(&self, metadata: &Metadata) -> bool {
+        metadata.level() <= log::max_level()
+    }
+
+    fn log(&self, record: &Record) {
+        if !self.enabled(record.metadata()) {
+            return;
+        }
+
+        let state_guard = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(_) => return, // 锁被毒化，无法记录
+        };
+
+        let target = CString::new(record.target()).unwrap_or_default();
+        let message = CString::new(record.args().to_string()).unwrap_or_default();
+
+        (state_guard.callback)(
+            record.level().into(),
+            target.as_ptr(),
+            message.as_ptr(),
+            state_guard.userdata.0,
+        );
+    }
+
+    fn flush(&self) {}
+}
 
 // ================================================================================================
 // 句柄生命周期管理
@@ -707,6 +825,52 @@ pub unsafe extern "C" fn smtc_suite_stop_audio_capture(handle_ptr: *mut SmtcHand
     }
 }
 
+/// 初始化日志系统，并将所有日志消息重定向到指定的 C 回调函数。
+///
+/// 这个函数在整个程序的生命周期中只应被调用一次。
+///
+/// # 参数
+/// - `callback`: 用于接收日志消息的函数指针。不能为 NULL。
+/// - `userdata`: 将被原样传递给回调函数的用户自定义指针。
+/// - `max_level`: 要捕获的最高日志级别。
+///
+/// # 返回
+/// - `SmtcResult::Success`: 如果成功初始化。
+/// - `SmtcResult::InternalError`: 如果日志系统已经被初始化过，或者发生其他内部错误。
+///
+/// # 安全性
+/// 必须保证 `callback` 是一个有效的指针。
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn smtc_suite_init_logging(
+    callback: LogCallback,
+    userdata: *mut c_void,
+    max_level: CLogLevel,
+) -> SmtcResult {
+    let logger = FfiLogger {
+        state: Mutex::new(FfiLoggerState {
+            callback,
+            userdata: SendableVoidPtr(userdata),
+        }),
+    };
+
+    if FFI_LOGGER.set(logger).is_err() {
+        log::error!("[FFI] 日志系统已初始化，无法重复设置。");
+        return SmtcResult::InternalError;
+    }
+
+    if let Ok(logger_ref) = FFI_LOGGER.get().ok_or(SmtcResult::InternalError) {
+        if log::set_logger(logger_ref).is_err() {
+            log::error!("[FFI] 设置全局 Logger 失败，可能已被其他库占用。");
+            return SmtcResult::InternalError;
+        }
+        log::set_max_level(max_level.into());
+        log::info!("[FFI] 成功初始化日志系统。");
+        SmtcResult::Success
+    } else {
+        SmtcResult::InternalError
+    }
+}
+
 // ================================================================================================
 // 内存管理 (仅限内部使用)
 // ================================================================================================
@@ -716,8 +880,7 @@ pub unsafe extern "C" fn smtc_suite_stop_audio_capture(handle_ptr: *mut SmtcHand
 /// # 安全性
 /// `s` 必须是一个由本库的 FFI 函数返回、且尚未被释放的有效指针。
 /// 传入 `NULL` 是安全的。
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn smtc_suite_free_string(s: *mut c_char) {
+unsafe fn smtc_suite_free_string(s: *mut c_char) {
     if s.is_null() {
         return;
     }
@@ -770,6 +933,17 @@ impl Drop for VolumeChangedEventGuard {
     fn drop(&mut self) {
         unsafe {
             smtc_suite_free_string(self.0.session_id as *mut c_char);
+        }
+    }
+}
+
+// RAII 守卫，确保 CDiagnosticInfo 的所有字符串成员都被释放。
+struct DiagnosticInfoGuard(CDiagnosticInfo);
+impl Drop for DiagnosticInfoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            smtc_suite_free_string(self.0.message as *mut c_char);
+            smtc_suite_free_string(self.0.timestamp_str as *mut c_char);
         }
     }
 }
@@ -859,6 +1033,15 @@ unsafe fn process_and_invoke_callback(
                 userdata,
             );
         }
+        MediaUpdate::Diagnostic(info) => {
+            let c_info = convert_to_c_diagnostic_info(&info);
+            let _guard = DiagnosticInfoGuard(c_info);
+            callback(
+                CUpdateType::Diagnostic,
+                &_guard.0 as *const _ as *const c_void,
+                userdata,
+            );
+        }
     }
 }
 
@@ -886,5 +1069,18 @@ fn convert_to_c_session_info(info: &SmtcSessionInfo) -> CSessionInfo {
         session_id: to_c_char(&info.session_id),
         source_app_user_model_id: to_c_char(&info.source_app_user_model_id),
         display_name: to_c_char(&info.display_name),
+    }
+}
+
+/// (内部) 将 Rust 的 `DiagnosticInfo` 转换为 C 的 `CDiagnosticInfo`。
+fn convert_to_c_diagnostic_info(info: &crate::api::DiagnosticInfo) -> CDiagnosticInfo {
+    let c_level = match info.level {
+        crate::api::DiagnosticLevel::Warning => CDiagnosticLevel::Warning,
+        crate::api::DiagnosticLevel::Error => CDiagnosticLevel::Error,
+    };
+    CDiagnosticInfo {
+        level: c_level,
+        message: to_c_char(&info.message),
+        timestamp_str: to_c_char(info.timestamp.to_rfc3339()),
     }
 }
