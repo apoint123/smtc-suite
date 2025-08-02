@@ -23,15 +23,10 @@ use windows::{
         },
         MediaPlaybackAutoRepeatMode,
     },
-    Storage::Streams::{
-        Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions,
-    },
+    Storage::Streams::{Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions},
     Win32::{
-        System::{
-            Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
-            Threading::GetCurrentThreadId,
-        },
-        UI::WindowsAndMessaging::{DispatchMessageW, GetMessageW, MSG, TranslateMessage, WM_QUIT},
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+        UI::WindowsAndMessaging::{DispatchMessageW, MSG, TranslateMessage},
     },
     core::{Error as WinError, HSTRING, Result as WinResult},
 };
@@ -265,7 +260,12 @@ where
     T::Default: 'static,
     F: IntoFuture<Output = WinResult<T>> + Interface + Clone,
 {
-    match tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, operation.clone().into_future()).await {
+    match tokio_timeout(
+        SMTC_ASYNC_OPERATION_TIMEOUT,
+        operation.clone().into_future(),
+    )
+    .await
+    {
         // 异步操作在超时前成功完成
         Ok(Ok(result)) => Ok(result),
         // 异步操作在超时前完成，但自身返回了错误
@@ -273,7 +273,7 @@ where
         // tokio_timeout 返回超时错误
         Err(_) => {
             log::warn!("WinRT 异步操作超时 (>{:?}).", SMTC_ASYNC_OPERATION_TIMEOUT);
-            
+
             if let Ok(async_info) = operation.cast::<IAsyncInfo>() {
                 if let Err(e) = async_info.Cancel() {
                     log::warn!("取消 WinRT 异步操作失败: {:?}", e);
@@ -281,7 +281,7 @@ where
             } else {
                 log::warn!("无法将异步操作转换为 IAsyncInfo 来执行取消操作。");
             }
-            
+
             Err(WinError::from(E_ABORT_HRESULT))
         }
     }
@@ -449,10 +449,10 @@ async fn fetch_cover_data_task(
         }
 
         let buffer = Buffer::Create(stream_size as u32)?;
-        
+
         let read_operation = stream.ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?;
         let bytes_buffer = run_winrt_op_with_timeout(read_operation).await?;
-        
+
         let reader = DataReader::FromBuffer(&bytes_buffer)?;
         let mut bytes = vec![0u8; bytes_buffer.Length()? as usize];
         reader.ReadBytes(&mut bytes)?;
@@ -661,8 +661,14 @@ impl SmtcRunner {
             tokio::time::interval(std::time::Duration::from_millis(250));
 
         loop {
+            pump_pending_messages();
+
             tokio::select! {
                 biased;
+
+                _ = tokio::time::sleep(std::time::Duration::from_millis(16)) => {
+                    // 这个分支的目的就是为了唤醒 select!
+                },
 
                 maybe_shutdown = self.shutdown_rx.recv() => {
                     if maybe_shutdown.is_some() {
@@ -1316,6 +1322,24 @@ impl SmtcRunner {
     }
 }
 
+fn pump_pending_messages() {
+    unsafe {
+        let mut msg = MSG::default();
+        while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(
+            &mut msg,
+            None,
+            0,
+            0,
+            windows::Win32::UI::WindowsAndMessaging::PM_REMOVE,
+        )
+        .as_bool()
+        {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+    }
+}
+
 pub fn run_smtc_listener(
     connector_update_tx: TokioSender<InternalUpdate>,
     control_rx: TokioReceiver<InternalCommand>,
@@ -1350,31 +1374,6 @@ pub fn run_smtc_listener(
             return;
         }
 
-        let (thread_id_tx, thread_id_rx) = std::sync::mpsc::channel::<u32>();
-        let message_pump_handle = tokio::task::spawn_blocking(move || {
-            let thread_id = unsafe { GetCurrentThreadId() };
-            if thread_id_tx.send(thread_id).is_err() {
-                log::error!("[消息泵] 无法发送线程ID，启动失败！");
-                return;
-            }
-            unsafe {
-                let mut msg = MSG::default();
-                while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-                    let _ = TranslateMessage(&msg);
-                    DispatchMessageW(&msg);
-                }
-            }
-        });
-
-        let pump_thread_id = match thread_id_rx.recv_timeout(std::time::Duration::from_secs(5)) {
-            Ok(id) => id,
-            Err(_) => {
-                log::error!("[SMTC 主循环] 等待消息泵线程ID超时，启动失败！");
-                return;
-            }
-        };
-        log::debug!("[SMTC 主循环] 已成功获取消息泵线程ID: {pump_thread_id}");
-
         let mut runner = SmtcRunner {
             state: SmtcState::new(),
             connector_update_tx,
@@ -1398,23 +1397,6 @@ pub fn run_smtc_listener(
         }
         if let Some(task) = state.active_progress_timer_task {
             task.abort();
-        }
-
-        // 发送 WM_QUIT 消息来停止消息泵线程
-        // SAFETY: PostThreadMessageW 是向特定线程发送消息的标准 Win32 API。
-        // 我们在启动时获取了正确的线程ID `main_thread_id`，所以这是安全的。
-        unsafe {
-            use windows::Win32::Foundation::{LPARAM, WPARAM};
-            use windows::Win32::UI::WindowsAndMessaging::PostThreadMessageW;
-
-            if PostThreadMessageW(pump_thread_id, WM_QUIT, WPARAM(0), LPARAM(0)).is_err() {
-                log::error!(
-                    "[SMTC 清理] 发送 WM_QUIT 消息到消息泵线程 (ID:{pump_thread_id}) 失败。"
-                );
-            }
-        }
-        if let Err(e) = message_pump_handle.await {
-            log::warn!("[SMTC 清理] 等待消息泵线程退出时出错: {e:?}");
         }
     });
 
