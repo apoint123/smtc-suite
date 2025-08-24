@@ -92,7 +92,7 @@ pub struct NowPlayingInfo {
 }
 
 impl NowPlayingInfo {
-    /// 用另一份 NowPlayingInfo 的非 None 字段更新自身
+    /// 用另一份 `NowPlayingInfo` 的非 None 字段更新自身
     pub fn update_with(&mut self, other: &NowPlayingInfo) {
         if let Some(pos) = other.position_ms {
             self.position_ms = Some(pos);
@@ -273,7 +273,7 @@ pub enum MediaCommand {
     RequestUpdate,
     /// 启用或禁用高频进度更新。
     ///
-    /// 当启用时，smtc-suite 会以 100ms 的频率主动发送 TrackChanged 事件来模拟平滑进度。
+    /// 当启用时，smtc-suite 会以 100ms 的频率主动发送 `TrackChanged` 事件来模拟平滑进度。
     SetHighFrequencyProgressUpdates(bool),
     /// 请求关闭整个媒体服务后台线程。
     Shutdown,

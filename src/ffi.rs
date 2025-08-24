@@ -229,7 +229,7 @@ impl From<Level> for CLogLevel {
 ///
 /// # 参数
 /// - `level`: 日志消息的级别。
-/// - `target`: 日志来源的模块路径 (例如 "my_lib::my_module")。
+/// - `target`: 日志来源的模块路径 (例如 "`my_lib::my_module`")。
 /// - `message`: UTF-8 编码、Null 结尾的日志消息。
 /// - `userdata`: 调用者在注册时传入的自定义上下文指针。
 pub type LogCallback = extern "C" fn(
@@ -261,9 +261,8 @@ impl log::Log for FfiLogger {
             return;
         }
 
-        let state_guard = match self.state.lock() {
-            Ok(guard) => guard,
-            Err(_) => return, // 锁被毒化，无法记录
+        let Ok(state_guard) = self.state.lock() else {
+            return;
         };
 
         let target = CString::new(record.target()).unwrap_or_default();
@@ -495,23 +494,17 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
 
         let is_callback_present = (callback as usize) != 0;
         if is_callback_present {
-            let _creation_guard = match handle.listener_creation_mutex.lock() {
-                Ok(guard) => guard,
-                Err(_) => {
-                    log::error!("[FFI] 监听器创建锁已被毒化，操作中止。");
-                    return SmtcResult::InternalError;
-                }
+            let Ok(_creation_guard) = handle.listener_creation_mutex.lock() else {
+                log::error!("[FFI] 监听器创建锁已被毒化，操作中止。");
+                return SmtcResult::InternalError;
             };
 
             if handle.update_listener_handle.is_none() {
                 log::info!("[FFI] 首次注册回调，正在启动回调监听线程...");
 
-                let mut update_rx = match handle.update_rx.take() {
-                    Some(rx) => rx,
-                    None => {
-                        log::error!("[FFI] update_rx 已被移走，无法重复创建监听线程。");
-                        return SmtcResult::InternalError;
-                    }
+                let Some(mut update_rx) = handle.update_rx.take() else {
+                    log::error!("[FFI] update_rx 已被移走，无法重复创建监听线程。");
+                    return SmtcResult::InternalError;
                 };
 
                 let shutdown_signal = handle.shutdown_signal.clone();
@@ -537,33 +530,30 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                                 biased;
 
                                 maybe_update = update_rx.recv() => {
-                                    match maybe_update {
-                                        Some(update) => {
-                                            if let Ok(cb_info_guard) = callback_info.lock()
-                                                && let Some((cb_fn, user_ptr_wrapper)) = *cb_info_guard
-                                            {
-                                                let res = catch_unwind(|| unsafe {
-                                                    process_and_invoke_callback(
-                                                        update,
-                                                        cb_fn,
-                                                        user_ptr_wrapper.0,
-                                                    );
-                                                });
-                                                if res.is_err() {
-                                                    log::error!(
-                                                        "[FFI 回调线程] C 端回调函数发生 Panic！"
-                                                    );
-                                                }
+                                    if let Some(update) = maybe_update {
+                                        if let Ok(cb_info_guard) = callback_info.lock()
+                                            && let Some((cb_fn, user_ptr_wrapper)) = *cb_info_guard
+                                        {
+                                            let res = catch_unwind(|| unsafe {
+                                                process_and_invoke_callback(
+                                                    update,
+                                                    cb_fn,
+                                                    user_ptr_wrapper.0,
+                                                );
+                                            });
+                                            if res.is_err() {
+                                                log::error!(
+                                                    "[FFI 回调线程] C 端回调函数发生 Panic！"
+                                                );
                                             }
-                                        },
-                                        None => {
-                                            log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
-                                            break;
                                         }
+                                    } else {
+                                        log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
+                                        break;
                                     }
                                 },
 
-                                _ = tokio::time::sleep(Duration::from_millis(100)), if shutdown_signal.load(Ordering::Acquire) => {
+                                () = tokio::time::sleep(Duration::from_millis(100)), if shutdown_signal.load(Ordering::Acquire) => {
                                      log::debug!("[FFI 回调线程] 收到关闭信号，准备退出。");
                                      break;
                                 }
@@ -601,17 +591,19 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
 /// 导出此函数是安全的，因为它不接受任何输入并返回一个静态的、常量的数据。
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
-    concat!(env!("CARGO_PKG_VERSION"), "\0").as_ptr() as *const c_char
+    concat!(env!("CARGO_PKG_VERSION"), "\0")
+        .as_ptr()
+        .cast::<c_char>()
 }
 
 // ================================================================================================
 // 命令函数
 // ================================================================================================
 
-/// (内部辅助函数) 将 try_send 的结果转换为 SmtcResult
+/// (内部辅助函数) 将 `try_send` 的结果转换为 `SmtcResult`
 fn handle_try_send_result<T>(result: Result<(), mpsc::error::TrySendError<T>>) -> SmtcResult {
     match result {
-        Ok(_) => SmtcResult::Success,
+        Ok(()) => SmtcResult::Success,
         Err(e) => match e {
             mpsc::error::TrySendError::Full(_) => {
                 log::warn!("[FFI] 发送命令失败: 通道已满，请重试。");
@@ -906,9 +898,9 @@ struct NowPlayingInfoGuard(CNowPlayingInfo);
 impl Drop for NowPlayingInfoGuard {
     fn drop(&mut self) {
         unsafe {
-            smtc_suite_free_string(self.0.title as *mut c_char);
-            smtc_suite_free_string(self.0.artist as *mut c_char);
-            smtc_suite_free_string(self.0.album_title as *mut c_char);
+            smtc_suite_free_string(self.0.title.cast_mut());
+            smtc_suite_free_string(self.0.artist.cast_mut());
+            smtc_suite_free_string(self.0.album_title.cast_mut());
         }
     }
 }
@@ -919,9 +911,9 @@ impl Drop for SessionListGuard {
     fn drop(&mut self) {
         for session in self.0.drain(..) {
             unsafe {
-                smtc_suite_free_string(session.session_id as *mut c_char);
-                smtc_suite_free_string(session.source_app_user_model_id as *mut c_char);
-                smtc_suite_free_string(session.display_name as *mut c_char);
+                smtc_suite_free_string(session.session_id.cast_mut());
+                smtc_suite_free_string(session.source_app_user_model_id.cast_mut());
+                smtc_suite_free_string(session.display_name.cast_mut());
             }
         }
     }
@@ -932,7 +924,7 @@ struct VolumeChangedEventGuard(CVolumeChangedEvent);
 impl Drop for VolumeChangedEventGuard {
     fn drop(&mut self) {
         unsafe {
-            smtc_suite_free_string(self.0.session_id as *mut c_char);
+            smtc_suite_free_string(self.0.session_id.cast_mut());
         }
     }
 }
@@ -942,8 +934,8 @@ struct DiagnosticInfoGuard(CDiagnosticInfo);
 impl Drop for DiagnosticInfoGuard {
     fn drop(&mut self) {
         unsafe {
-            smtc_suite_free_string(self.0.message as *mut c_char);
-            smtc_suite_free_string(self.0.timestamp_str as *mut c_char);
+            smtc_suite_free_string(self.0.message.cast_mut());
+            smtc_suite_free_string(self.0.timestamp_str.cast_mut());
         }
     }
 }
@@ -961,33 +953,33 @@ unsafe fn process_and_invoke_callback(
     match update {
         MediaUpdate::TrackChanged(info) => {
             let c_info = convert_to_c_now_playing_info(&info);
-            let _guard = NowPlayingInfoGuard(c_info);
+            let guard = NowPlayingInfoGuard(c_info);
             callback(
                 CUpdateType::TrackChanged,
-                &_guard.0 as *const _ as *const c_void,
+                (&raw const guard.0).cast::<c_void>(),
                 userdata,
             );
         }
         MediaUpdate::TrackChangedForced(info) => {
             let c_info = convert_to_c_now_playing_info(&info);
-            let _guard = NowPlayingInfoGuard(c_info);
+            let guard = NowPlayingInfoGuard(c_info);
             callback(
                 CUpdateType::TrackChangedForced,
-                &_guard.0 as *const _ as *const c_void,
+                (&raw const guard.0).cast::<c_void>(),
                 userdata,
             );
         }
         MediaUpdate::SessionsChanged(sessions) => {
             let c_sessions: Vec<CSessionInfo> =
                 sessions.iter().map(convert_to_c_session_info).collect();
-            let _guard = SessionListGuard(c_sessions);
+            let guard = SessionListGuard(c_sessions);
             let list = CSessionList {
-                sessions: _guard.0.as_ptr(),
-                count: _guard.0.len(),
+                sessions: guard.0.as_ptr(),
+                count: guard.0.len(),
             };
             callback(
                 CUpdateType::SessionsChanged,
-                &list as *const _ as *const c_void,
+                (&raw const list).cast::<c_void>(),
                 userdata,
             );
         }
@@ -998,7 +990,7 @@ unsafe fn process_and_invoke_callback(
             };
             callback(
                 CUpdateType::AudioData,
-                &packet as *const _ as *const c_void,
+                (&raw const packet).cast::<c_void>(),
                 userdata,
             );
         }
@@ -1017,10 +1009,10 @@ unsafe fn process_and_invoke_callback(
                 volume,
                 is_muted,
             };
-            let _guard = VolumeChangedEventGuard(event);
+            let guard = VolumeChangedEventGuard(event);
             callback(
                 CUpdateType::VolumeChanged,
-                &_guard.0 as *const _ as *const c_void,
+                (&raw const guard.0).cast::<c_void>(),
                 userdata,
             );
         }
@@ -1035,10 +1027,10 @@ unsafe fn process_and_invoke_callback(
         }
         MediaUpdate::Diagnostic(info) => {
             let c_info = convert_to_c_diagnostic_info(&info);
-            let _guard = DiagnosticInfoGuard(c_info);
+            let guard = DiagnosticInfoGuard(c_info);
             callback(
                 CUpdateType::Diagnostic,
-                &_guard.0 as *const _ as *const c_void,
+                (&raw const guard.0).cast::<c_void>(),
                 userdata,
             );
         }

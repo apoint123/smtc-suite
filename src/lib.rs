@@ -13,37 +13,36 @@
 //! * **系统音频捕获**: 以环回模式捕获系统正在播放的音频流，并提供重采样到统一格式的功能。
 //! * **独立音量控制**: 查找特定应用的音频会话，并独立获取或设置其音量。
 //! * **异步事件驱动**: 所有后台操作都在一个独立的、高效的异步工作线程中进行，
-//!   通过通道与主应用通信，不会阻塞您的应用主线程。
+//!   通过通道与主应用通信，不会阻塞你的应用主线程。
 //!
 //! ## 使用方法
 //!
 //! 与本库交互的唯一入口是 [`MediaManager::start()`] 函数。
 //!
-//! 1.  调用 `MediaManager::start()` 会启动所有必需的后台服务，并返回一个 [`Result<MediaController>`]。
-//! 2.  [`MediaController`] 结构体是您与后台服务交互的句柄。它包含两个字段：
-//!     * `command_tx`: 一个 `Sender<MediaCommand>`，用于向后台发送指令。
-//!     * `update_rx`: 一个 `Receiver<MediaUpdate>`，用于接收来自后台的状态更新和事件。
-//! 3.  您可以在一个独立的线程中循环监听 `update_rx` 以接收实时更新。
-//! 4.  通过 `command_tx` 发送 [`MediaCommand`] 枚举中的指令来控制后台服务。
-//! 5.  当您的应用退出时，务必调用 [`MediaController::shutdown()`] 或发送一个 `MediaCommand::Shutdown`
+//! 1.  调用 `MediaManager::start()` 会启动所有必需的后台服务，并返回一个元组：
+//!     `(MediaController, mpsc::Receiver<MediaUpdate>)`。
+//! 2.  [`MediaController`] 结构体是你向后台服务发送指令的句柄。它包含一个 `command_tx`
+//!     字段，用于发送 [`MediaCommand`]。
+//! 3.  `mpsc::Receiver<MediaUpdate>` 是你接收所有来自后台的状态更新和事件的通道。
+//! 4.  你可以在一个独立的任务中循环监听这个 `Receiver` 以接收实时更新。
+//! 5.  当你的应用退出时，务必调用 [`MediaController::shutdown()`] 或发送一个 `MediaCommand::Shutdown`
 //!     来优雅地关闭后台线程。
 //!
 //! ## 示例
 //!
 //! ```no_run
 //! use smtc_suite::{MediaManager, MediaCommand, MediaUpdate};
-//! use std::thread;
 //! use std::time::Duration;
 //!
-//! fn main() -> Result<(), Box<dyn std::error::Error>> {
-//!     // 1. 启动媒体服务并获取控制器
-//!     let controller = MediaManager::start()?;
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error>> {
+//!     // 1. 启动媒体服务并获取控制器和更新接收器
+//!     let (controller, mut update_rx) = MediaManager::start()?;
 //!
-//!     // 推荐在一个单独的线程中处理来自后台的更新事件
-//!     let update_receiver = controller.update_rx;
-//!     let update_thread = thread::spawn(move || {
+//!     // 推荐在一个单独的 Tokio 任务中处理来自后台的更新事件
+//!     let update_task = tokio::spawn(async move {
 //!         // 循环接收更新，直到通道关闭
-//!         while let Ok(update) = update_receiver.recv() {
+//!         while let Some(update) = update_rx.recv().await {
 //!             match update {
 //!                 MediaUpdate::TrackChanged(info) => {
 //!                     println!(
@@ -61,25 +60,25 @@
 //!                 _ => { /* 处理其他更新 */ }
 //!             }
 //!         }
-//!         println!("更新通道已关闭，事件监听线程退出。");
+//!         println!("更新通道已关闭，事件监听任务退出。");
 //!     });
 //!
-//!     // 在主线程中，我们可以发送命令
+//!     // 在主任务中，我们可以发送命令
 //!     // 例如，等待5秒后启动音频捕获
 //!     println!("将在5秒后启动音频捕获...");
-//!     thread::sleep(Duration::from_secs(5));
-//!     controller.command_tx.send(MediaCommand::StartAudioCapture)?;
+//!     tokio::time::sleep(Duration::from_secs(5)).await;
+//!     controller.command_tx.send(MediaCommand::StartAudioCapture).await?;
 //!
 //!     // 再等待10秒
 //!     println!("音频捕获已启动，将在10秒后关闭服务...");
-//!     thread::sleep(Duration::from_secs(10));
+//!     tokio::time::sleep(Duration::from_secs(10)).await;
 //!
 //!     // 3. 在程序退出前，发送关闭命令
 //!     println!("正在发送关闭命令...");
-//!     controller.shutdown()?;
+//!     controller.shutdown().await?;
 //!
-//!     // 等待更新线程结束
-//!     update_thread.join().expect("更新线程 join 失败");
+//!     // 等待更新任务结束
+//!     update_task.await?;
 //!
 //!     println!("程序已优雅退出。");
 //!
@@ -108,14 +107,16 @@ use tokio::sync::mpsc;
 pub struct MediaManager;
 
 impl MediaManager {
-    /// 启动所有后台监控服务，并返回一个控制器。
+    /// 启动所有后台监控服务，并返回一个控制器和事件接收器。
     ///
     /// 这是与本库交互的唯一正确方式。它会初始化并运行一个专用的后台工作线程，
     /// 该线程负责处理所有与系统 API 的交互。
     ///
     /// # 返回
-    /// - `Ok(MediaController)`: 成功启动后，返回一个控制器用于后续的交互。
-    /// - `Err(SmtcError)`: 如果在启动过程中发生严重错误（例如，无法创建后台线程或 Tokio 运行时）。
+    /// - `Ok((controller, update_rx))`: 成功启动后，返回一个元组：
+    ///   - `controller`: 一个 [`MediaController`]，用于向后台服务发送命令。
+    ///   - `update_rx`: 一个 `mpsc::Receiver<MediaUpdate>`，用于接收所有事件和状态更新。
+    /// - `Err(SmtcError)`: 如果在启动过程中发生严重错误（例如，无法创建后台线程）。
     pub fn start() -> Result<(MediaController, mpsc::Receiver<MediaUpdate>)> {
         let (command_tx, command_rx) = mpsc::channel::<MediaCommand>(32);
         let (update_tx, update_rx) = mpsc::channel::<MediaUpdate>(32);

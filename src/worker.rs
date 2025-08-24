@@ -1,12 +1,16 @@
 use std::{sync::Arc, thread};
 
+use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::{
-    runtime::Runtime,
     sync::{
         mpsc::{Receiver as TokioReceiver, Sender as TokioSender, channel},
         watch,
     },
     task::LocalSet,
+};
+use windows::{
+    Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+    core::Result as WinResult,
 };
 
 use crate::{
@@ -33,7 +37,7 @@ pub(crate) enum InternalCommand {
     RequestStateUpdate,
     /// 设置 SMTC 元数据的文本转换模式。
     SetTextConversion(TextConversionMode),
-    /// 指示 smtc_handler 启动或停止其内部的进度模拟计时器。
+    /// 指示 `smtc_handler` 启动或停止其内部的进度模拟计时器。
     SetProgressTimer(bool),
 }
 
@@ -66,8 +70,7 @@ pub(crate) struct MediaWorker {
     smtc_update_rx: TokioReceiver<InternalUpdate>,
     diagnostics_rx: Option<TokioReceiver<DiagnosticInfo>>,
     now_playing_rx: watch::Receiver<NowPlayingInfo>,
-    smtc_shutdown_tx: Option<TokioSender<()>>,
-    smtc_handler_thread_handle: Option<thread::JoinHandle<()>>,
+    smtc_listener_task_handle: Option<TokioJoinHandle<Result<()>>>,
     audio_capturer: Option<AudioCapturer>,
     audio_update_rx: Option<TokioReceiver<InternalUpdate>>,
     _shared_player_state: Arc<tokio::sync::Mutex<SharedPlayerState>>,
@@ -84,6 +87,17 @@ impl MediaWorker {
         let (smtc_control_tx, smtc_control_rx) = channel::<InternalCommand>(32);
         let (now_playing_tx, now_playing_rx) = watch::channel(NowPlayingInfo::default());
         let (diagnostics_tx, diagnostics_rx) = channel::<DiagnosticInfo>(32);
+        let player_state = Arc::new(tokio::sync::Mutex::new(SharedPlayerState::default()));
+
+        let (_shutdown_tx, shutdown_rx) = channel::<()>(1);
+        let smtc_listener_handle = tokio::task::spawn_local(smtc_handler::run_smtc_listener(
+            smtc_update_tx.clone(),
+            smtc_control_rx,
+            player_state.clone(),
+            shutdown_rx,
+            now_playing_tx,
+            diagnostics_tx,
+        ));
 
         let mut worker_instance = Self {
             command_rx,
@@ -92,19 +106,11 @@ impl MediaWorker {
             smtc_update_rx,
             diagnostics_rx: Some(diagnostics_rx),
             now_playing_rx,
-            smtc_shutdown_tx: None,
-            smtc_handler_thread_handle: None,
+            smtc_listener_task_handle: Some(smtc_listener_handle),
             audio_capturer: None,
             audio_update_rx: None,
-            _shared_player_state: Arc::new(tokio::sync::Mutex::new(SharedPlayerState::default())),
+            _shared_player_state: player_state,
         };
-
-        worker_instance.start_smtc_handler_thread(
-            smtc_control_rx,
-            smtc_update_tx,
-            now_playing_tx,
-            diagnostics_tx,
-        );
 
         log::debug!("[MediaWorker] 初始化完成，即将进入核心异步事件循环。");
 
@@ -131,7 +137,7 @@ impl MediaWorker {
                     self.handle_command_from_app(command).await;
                 },
 
-                Ok(_) = self.now_playing_rx.changed() => {
+                Ok(()) = self.now_playing_rx.changed() => {
                     let info = self.now_playing_rx.borrow().clone();
                     if info.title.is_some()
                         && self.update_tx.send(MediaUpdate::TrackChanged(info)).await.is_err() {
@@ -227,68 +233,6 @@ impl MediaWorker {
         }
     }
 
-    fn start_smtc_handler_thread(
-        &mut self,
-        control_rx_for_smtc: TokioReceiver<InternalCommand>,
-        update_tx_for_smtc: TokioSender<InternalUpdate>,
-        now_playing_tx: watch::Sender<NowPlayingInfo>,
-        diagnostics_tx: TokioSender<DiagnosticInfo>,
-    ) {
-        if self.smtc_handler_thread_handle.is_some() {
-            log::warn!("[MediaWorker] 尝试启动 SMTC 处理器，但它似乎已在运行。");
-            return;
-        }
-
-        log::debug!("[MediaWorker] 正在启动 SMTC Handler 线程...");
-        let player_state_clone = Arc::clone(&self._shared_player_state);
-
-        let (shutdown_tx, shutdown_rx_for_smtc) = channel::<()>(1);
-        self.smtc_shutdown_tx = Some(shutdown_tx);
-
-        let handle = thread::Builder::new()
-            .name("smtc_handler_thread".to_string())
-            .spawn(move || {
-                log::debug!("[SMTC Handler Thread] 线程已启动。");
-                if let Err(e) = smtc_handler::run_smtc_listener(
-                    update_tx_for_smtc,
-                    control_rx_for_smtc,
-                    player_state_clone,
-                    shutdown_rx_for_smtc,
-                    now_playing_tx,
-                    diagnostics_tx,
-                ) {
-                    log::error!("[SMTC Handler Thread] SMTC Handler 运行出错: {e}");
-                }
-                log::debug!("[SMTC Handler Thread] 线程已结束。");
-            })
-            .expect("无法启动 SMTC Handler 线程");
-        self.smtc_handler_thread_handle = Some(handle);
-    }
-
-    async fn stop_smtc_handler_thread(&mut self) {
-        if self.smtc_control_tx.take().is_some() {
-            log::debug!("[MediaWorker] SMTC 控制通道已清理。");
-        }
-
-        if let Some(tx) = self.smtc_shutdown_tx.take() {
-            log::debug!("[MediaWorker] 正在向 SMTC 处理器发送关闭信号...");
-            if tx.send(()).await.is_err() {
-                log::warn!("[MediaWorker] 发送关闭信号至 SMTC 处理器失败 (可能已自行关闭)。");
-            }
-        }
-
-        if let Some(handle) = self.smtc_handler_thread_handle.take() {
-            log::debug!("[MediaWorker] 正在等待 SMTC Handler 线程退出...");
-            // 在异步函数中 join 阻塞操作需要使用 spawn_blocking
-            let res = tokio::task::spawn_blocking(move || handle.join()).await;
-            match res {
-                Ok(Ok(_)) => log::debug!("[MediaWorker] SMTC Handler 线程已成功退出。"),
-                Ok(Err(e)) => log::warn!("[MediaWorker] 等待 SMTC Handler 线程退出失败: {e:?}"),
-                Err(e) => log::warn!("[MediaWorker] spawn_blocking 任务失败: {e:?}"),
-            }
-        }
-    }
-
     fn start_audio_capture_internal(&mut self) {
         if self.audio_capturer.is_some() {
             log::warn!("[MediaWorker] 音频捕获已在运行，无需重复启动。");
@@ -300,7 +244,7 @@ impl MediaWorker {
 
         let mut capturer = AudioCapturer::new();
         match capturer.start_capture(audio_update_tx) {
-            Ok(_) => {
+            Ok(()) => {
                 self.audio_capturer = Some(capturer);
                 self.audio_update_rx = Some(audio_update_rx);
                 log::info!("[MediaWorker] 音频捕获已成功启动。");
@@ -325,7 +269,10 @@ impl MediaWorker {
 
     async fn shutdown_all_subsystems(&mut self) {
         log::info!("[MediaWorker] 正在关闭所有子系统...");
-        self.stop_smtc_handler_thread().await;
+        if let Some(handle) = self.smtc_listener_task_handle.take() {
+            log::debug!("[MediaWorker] 正在中止 SMTC 监听器任务...");
+            handle.abort();
+        }
         self.stop_audio_capture_internal();
     }
 }
@@ -347,8 +294,32 @@ pub fn start_media_worker_thread(
     thread::Builder::new()
         .name("media_worker_thread".to_string())
         .spawn(move || {
+            struct ComGuard;
+            impl ComGuard {
+                fn new() -> WinResult<Self> {
+                    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+                    Ok(ComGuard)
+                }
+            }
+            impl Drop for ComGuard {
+                fn drop(&mut self) {
+                    unsafe { CoUninitialize() };
+                }
+            }
+
+            let _com_guard = match ComGuard::new() {
+                Ok(guard) => guard,
+                Err(e) => {
+                    log::error!("[MediaWorker Thread] COM 初始化失败: {e}，线程无法启动。");
+                    return;
+                }
+            };
+
             let local_set = LocalSet::new();
-            let rt = Runtime::new().expect("无法为 MediaWorker 创建 Tokio 运行时");
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("无法为 MediaWorker 创建 Tokio 运行时");
 
             local_set.block_on(&rt, async {
                 if let Err(e) = MediaWorker::run(command_rx, update_tx).await {

@@ -10,7 +10,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (controller, mut update_rx) = match MediaManager::start() {
         Ok((c, rx)) => (c, rx),
         Err(e) => {
-            error!("SMTC 服务启动失败: {}", e);
+            error!("SMTC 服务启动失败: {e}");
             return Err(e.into());
         }
     };
@@ -30,7 +30,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 MediaUpdate::Error(e) => {
-                    error!("[后台错误] {}", e);
+                    error!("[后台错误] {e}");
                 }
                 _ => {}
             }

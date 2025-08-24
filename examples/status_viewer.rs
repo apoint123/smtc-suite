@@ -37,7 +37,7 @@ fn ms_to_hms(ms: u64) -> String {
     let millis = ms % 1000;
     let mins = secs / 60;
     let secs = secs % 60;
-    format!("{:02}:{:02}.{:03}", mins, secs, millis)
+    format!("{mins:02}:{secs:02}.{millis:03}")
 }
 
 fn controls_status(info: &NowPlayingInfo) {
@@ -90,12 +90,7 @@ fn log_playback_status(info: &NowPlayingInfo) {
         None => "未知",
     };
 
-    log::info!(
-        "播放状态: {} | 随机: {} | 循环: {}",
-        play_state,
-        shuffle_state,
-        repeat_state
-    );
+    log::info!("播放状态: {play_state} | 随机: {shuffle_state} | 循环: {repeat_state}");
 }
 
 fn handle_track_changed(
@@ -141,13 +136,7 @@ fn handle_track_changed(
         let artist = new_info.artist.as_deref().unwrap_or("N/A");
         let album = new_info.album_title.as_deref().unwrap_or("N/A");
         let force_str = if is_forced { "(强制)" } else { "" };
-        log::info!(
-            "曲目信息变更{}: {} - {} (专辑: {})",
-            force_str,
-            artist,
-            title,
-            album
-        );
+        log::info!("曲目信息变更{force_str}: {artist} - {title} (专辑: {album})");
     }
 
     if has_controls_changed {
@@ -176,13 +165,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 分支 1: 等待来自后台的更新
             maybe_update = update_rx.recv() => {
-                let update = match maybe_update {
-                    Some(u) => u,
-                    None => {
-                        log::info!("媒体事件通道已关闭，程序退出。");
-                        break;
-                    }
-                };
+                let Some(update) = maybe_update else {
+                     log::info!("媒体事件通道已关闭，程序退出。");
+                     break;
+                 };
 
                 match update {
                     MediaUpdate::SessionsChanged(sessions) => {
@@ -203,11 +189,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         handle_track_changed(info, &mut last_known_info, true);
                     }
                     MediaUpdate::SelectedSessionVanished(session_id) => {
-                        log::warn!("当前选择的会话 '{}' 已消失。", session_id);
+                        log::warn!("当前选择的会话 '{session_id}' 已消失。");
                         last_known_info = None;
                     }
                     MediaUpdate::Error(e) => {
-                        log::error!("运行时错误: {}", e);
+                        log::error!("运行时错误: {e}");
                     }
                     _ => {}
                 }

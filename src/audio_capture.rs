@@ -23,10 +23,7 @@ use windows::{
             Multimedia::{KSDATAFORMAT_SUBTYPE_IEEE_FLOAT, WAVE_FORMAT_IEEE_FLOAT},
         },
         System::{
-            Com::{
-                CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-                CoUninitialize,
-            },
+            Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
             Threading::{
                 AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent, WaitForMultipleObjects,
             },
@@ -49,7 +46,7 @@ const WASAPI_BUFFER_DURATION_MS: u64 = 20;
 /// 大约每隔多少毫秒尝试发送一次处理好的音频数据包。
 const AUDIO_PACKET_SEND_INTERVAL_MS: u64 = 100;
 /// `WaitForMultipleObjects` 的无限等待超时参数。
-const WAIT_INFINITE: u32 = 0xFFFFFFFF;
+const WAIT_INFINITE: u32 = 0xFFFF_FFFF;
 
 /// 模块内部使用的错误类型。
 #[derive(Error, Debug)]
@@ -73,7 +70,7 @@ pub enum AudioCaptureError {
     BytesToSampleConversion,
 }
 
-/// RAII Guard: 确保 IAudioClient 在离开作用域时被正确停止。
+/// RAII Guard: 确保 `IAudioClient` 在离开作用域时被正确停止。
 struct AudioClientGuard<'a> {
     client: &'a IAudioClient,
 }
@@ -83,7 +80,7 @@ impl<'a> AudioClientGuard<'a> {
         Ok(Self { client })
     }
 }
-impl<'a> Drop for AudioClientGuard<'a> {
+impl Drop for AudioClientGuard<'_> {
     fn drop(&mut self) {
         if let Err(e) = unsafe { self.client.Stop() } {
             log::warn!("[AudioClientGuard] 停止音频客户端失败: {e:?}");
@@ -91,27 +88,13 @@ impl<'a> Drop for AudioClientGuard<'a> {
     }
 }
 
-/// RAII Guard: 确保从 GetMixFormat 获取的内存被正确释放。
+/// RAII Guard: 确保从 `GetMixFormat` 获取的内存被正确释放。
 struct WaveFormatGuard(*mut WAVEFORMATEX);
 impl Drop for WaveFormatGuard {
     fn drop(&mut self) {
         if !self.0.is_null() {
             unsafe { windows::Win32::System::Com::CoTaskMemFree(Some(self.0 as *const _)) };
         }
-    }
-}
-
-/// RAII Guard: 确保 COM 在线程退出时被正确反初始化。
-struct ComThreadInitializer;
-impl ComThreadInitializer {
-    fn initialize_com() -> Result<()> {
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED) }.ok()?;
-        Ok(())
-    }
-}
-impl Drop for ComThreadInitializer {
-    fn drop(&mut self) {
-        unsafe { CoUninitialize() };
     }
 }
 
@@ -258,29 +241,26 @@ impl AudioCapturer {
         stop_event: Arc<EventHandleGuard>,
         update_tx: TokioSender<InternalUpdate>,
     ) -> Result<()> {
-        // 1. 初始化 COM 环境
-        let _com_guard = ComThreadInitializer::initialize_com().map(|_| ComThreadInitializer)?;
-
-        // 2. 尝试提升线程优先级
+        // 尝试提升线程优先级
         unsafe {
             let task_name_hstring = HSTRING::from("Pro Audio");
             let mut task_index = 0u32;
-            if AvSetMmThreadCharacteristicsW(&task_name_hstring, &mut task_index).is_err() {
+            if AvSetMmThreadCharacteristicsW(&task_name_hstring, &raw mut task_index).is_err() {
                 log::warn!("[音频捕获线程] 无法设置线程特性为 'Pro Audio'。");
             }
         }
 
-        // 3. 初始化 WASAPI 组件
+        // 初始化 WASAPI 组件
         let (audio_client, capture_client, wave_format, _format_guard) = Self::init_wasapi()?;
 
-        // 4. 为 WASAPI 创建一个自动重置的事件，用于接收数据就绪通知
+        // 为 WASAPI 创建一个自动重置的事件，用于接收数据就绪通知
         let wasapi_event = EventHandleGuard::new(false, false)?;
         unsafe { audio_client.SetEventHandle(wasapi_event.0)? };
 
         let original_channels_usize = wave_format.nChannels as usize;
         let mut resampler = Self::setup_resampler(&wave_format)?;
 
-        // 5. 启动音频流并进入事件驱动的主循环
+        // 启动音频流并进入事件驱动的主循环
         let final_accumulated_buffer = {
             let _client_guard = AudioClientGuard::new(&audio_client)?;
             log::debug!("[音频捕获线程] 音频捕获流已启动，进入事件等待循环。");
@@ -295,9 +275,9 @@ impl AudioCapturer {
                 &update_tx,
             )
             .await?
-        }; // _client_guard 在此 drop，停止音频流
+        };
 
-        // 6. 处理流末尾可能剩余的数据
+        // 处理流末尾可能剩余的数据
         Self::finalize_stream(
             &mut resampler,
             final_accumulated_buffer,
@@ -333,8 +313,8 @@ impl AudioCapturer {
         }
         let format_guard = WaveFormatGuard(wave_format_ptr);
         let wave_format: WAVEFORMATEX = unsafe { std::ptr::read_unaligned(wave_format_ptr) };
-        let is_source_float = (wave_format.wFormatTag as u32 == WAVE_FORMAT_IEEE_FLOAT)
-            || (wave_format.wFormatTag as u32 == WAVE_FORMAT_EXTENSIBLE
+        let is_source_float = (u32::from(wave_format.wFormatTag) == WAVE_FORMAT_IEEE_FLOAT)
+            || (u32::from(wave_format.wFormatTag) == WAVE_FORMAT_EXTENSIBLE
                 && wave_format.cbSize >= 22
                 && unsafe {
                     let wf_ext_ptr = wave_format_ptr as *const WAVEFORMATEXTENSIBLE;
@@ -383,12 +363,12 @@ impl AudioCapturer {
             oversampling_factor: 128,
             window: WindowFunction::Hann,
         };
-        let initial_chunk_size = (wave_format.nSamplesPerSec as f64
+        let initial_chunk_size = (f64::from(wave_format.nSamplesPerSec)
             * (AUDIO_PACKET_SEND_INTERVAL_MS as f64 / 1000.0))
             as usize;
         let chunk_size_for_resampler = initial_chunk_size.max(params.sinc_len * 2);
         let resampler = SincFixedIn::<f32>::new(
-            TARGET_SAMPLE_RATE as f64 / wave_format.nSamplesPerSec as f64,
+            f64::from(TARGET_SAMPLE_RATE) / f64::from(wave_format.nSamplesPerSec),
             2.0,
             params,
             chunk_size_for_resampler,
@@ -426,7 +406,7 @@ impl AudioCapturer {
                         &resampler_input,
                         &mut resampler_output
                             .iter_mut()
-                            .map(|v| v.as_mut_slice())
+                            .map(Vec::as_mut_slice)
                             .collect::<Vec<_>>(),
                         None,
                     )
@@ -490,12 +470,12 @@ impl AudioCapturer {
                             (std::ptr::null_mut(), 0, 0);
                         unsafe {
                             capture_client.GetBuffer(
-                                &mut p_data,
-                                &mut num_frames_captured,
-                                &mut dw_flags,
+                                &raw mut p_data,
+                                &raw mut num_frames_captured,
+                                &raw mut dw_flags,
                                 None,
                                 None,
-                            )?
+                            )?;
                         };
 
                         if dw_flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
@@ -548,7 +528,7 @@ impl AudioCapturer {
                 // 等待失败或其他未知情况
                 _ => {
                     let err = windows::core::Error::from_win32();
-                    log::error!("[音频捕获线程] WaitForMultipleObjects 失败: {:?}", err);
+                    log::error!("[音频捕获线程] WaitForMultipleObjects 失败: {err:?}");
                     return Err(SmtcError::AudioCapture(err.into()));
                 }
             }
@@ -573,14 +553,14 @@ impl AudioCapturer {
                 let mut output_buffer = vec![vec![0.0; rs.output_frames_max()]; original_channels];
                 let input_slices: Vec<&[f32]> = accumulated_audio_planar
                     .iter()
-                    .map(|v| v.as_slice())
+                    .map(std::vec::Vec::as_slice)
                     .collect();
                 let (_, frames_written) = rs
                     .process_into_buffer(
                         &input_slices,
                         &mut output_buffer
                             .iter_mut()
-                            .map(|v| v.as_mut_slice())
+                            .map(std::vec::Vec::as_mut_slice)
                             .collect::<Vec<_>>(),
                         None,
                     )

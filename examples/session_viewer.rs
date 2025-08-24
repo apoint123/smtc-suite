@@ -40,7 +40,7 @@ fn ms_to_hms(ms: u64) -> String {
     let millis = ms % 1000;
     let mins = secs / 60;
     let secs = secs % 60;
-    format!("{:02}:{:02}.{:03}", mins, secs, millis)
+    format!("{mins:02}:{secs:02}.{millis:03}")
 }
 
 /// 一个专门负责打印SMTC状态日志的函数
@@ -50,8 +50,7 @@ fn log_smtc_status(info: &NowPlayingInfo) {
 
     let elapsed_since_report = info
         .position_report_time
-        .map(|t| t.elapsed().as_millis())
-        .unwrap_or(0);
+        .map_or(0, |t| t.elapsed().as_millis());
 
     log::info!(
         "SMTC 状态更新: {}/{} [估算位置={}ms (原始: {}ms + 经过: {}ms), 播放中={}, 总时长={}ms]",
@@ -80,14 +79,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // 分支 1: 等待来自后台的更新
             maybe_update = update_rx.recv() => {
-                let update = match maybe_update {
-                    Some(u) => u,
-                    None => {
-                        // recv() 返回 None 意味着通道已关闭
-                        log::info!("媒体事件通道已关闭，程序退出。");
-                        break;
-                    }
-                };
+                let Some(update) = maybe_update else {
+                     // recv() 返回 None 意味着通道已关闭
+                     log::info!("媒体事件通道已关闭，程序退出。");
+                     break;
+                 };
 
                 match update {
                     MediaUpdate::SessionsChanged(sessions) => {
@@ -115,7 +111,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let title = new_info.title.as_deref().unwrap_or("N/A");
                             let artist = new_info.artist.as_deref().unwrap_or("N/A");
                             let album = new_info.album_title.as_deref().unwrap_or("N/A");
-                            log::info!("曲目信息变更: {} - {} (专辑: {})", artist, title, album);
+                            log::info!("曲目信息变更: {artist} - {title} (专辑: {album})");
                         }
 
                         log_smtc_status(&new_info);
@@ -129,22 +125,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let vol_percent = (volume * 100.0).round() as u8;
                         let mute_str = if is_muted { " (已静音)" } else { "" };
                         log::info!(
-                            "音量变更 -> 会话 '{}': {}%{}",
-                            session_id,
-                            vol_percent,
-                            mute_str
+                            "音量变更 -> 会话 '{session_id}': {vol_percent}%{mute_str}"
                         );
                     }
                     MediaUpdate::SelectedSessionVanished(session_id) => {
-                        log::warn!("当前选择的会话 '{}' 已消失。", session_id);
+                        log::warn!("当前选择的会话 '{session_id}' 已消失。");
                         last_known_info = None;
                     }
                     MediaUpdate::Error(e) => {
-                        log::error!("运行时错误: {}", e);
+                        log::error!("运行时错误: {e}");
                     }
-                    MediaUpdate::AudioData(_) => {}
-                    MediaUpdate::Diagnostic(_) => {}
-                }
+                    MediaUpdate::AudioData(_) | MediaUpdate::Diagnostic(_) => {}
+                    }
             },
 
             // 分支 2: 每 500ms 触发一次，用于定时刷新状态日志

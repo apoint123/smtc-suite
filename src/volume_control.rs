@@ -9,57 +9,23 @@ use windows::{
             eConsole, eRender,
         },
         System::{
-            Com::{
-                CLSCTX_ALL, COINIT_APARTMENTTHREADED, CoCreateInstance, CoInitializeEx,
-                CoUninitialize,
-            },
+            Com::{CLSCTX_ALL, CoCreateInstance},
             Diagnostics::ToolHelp::{
                 CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
                 TH32CS_SNAPPROCESS,
             },
         },
     },
-    core::{Interface, Result as WinResult},
+    core::Interface,
 };
 
 use crate::error::{Result, SmtcError};
-
-// --- COM 初始化器 ---
-
-/// RAII Guard，用于在当前线程安全地初始化和反初始化 COM。
-///
-/// 当此结构体的实例被创建时，它会调用 `CoInitializeEx` 来初始化 COM 环境。
-/// 当实例离开作用域时（例如函数返回），其 `Drop` 实现会自动调用 `CoUninitialize`，
-/// 确保 COM 资源被正确释放，避免泄漏。
-struct ComInitializer;
-
-impl ComInitializer {
-    /// 在当前线程上初始化 COM (STA - 单线程套间)。
-    ///
-    /// 对于需要与 Windows Shell 或 UI 相关 API（包括 WASAPI）交互的线程，
-    /// 初始化为 STA 是推荐的做法。
-    fn initialize() -> WinResult<()> {
-        // SAFETY: CoInitializeEx 在每个需要使用 COM 的线程开始时调用一次是安全的。
-        unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok() }
-    }
-}
-
-impl Drop for ComInitializer {
-    fn drop(&mut self) {
-        // SAFETY: 与 CoInitializeEx 成对出现，确保 COM 资源被正确释放。
-        unsafe {
-            CoUninitialize();
-        }
-    }
-}
-
-// --- 公共 API ---
 
 /// 通过应用程序的标识符（AUMID 或可执行文件名）获取其音量和静音状态。
 ///
 /// # 参数
 /// * `identifier`: 目标应用的标识符字符串。
-///   - 对于 UWP 应用，应为 AUMID (e.g., "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic")。
+///   - 对于 UWP 应用，应为 AUMID (e.g., "`Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic`")。
 ///   - 对于 Win32 应用，应为可执行文件名 (e.g., "Spotify.exe")。
 ///
 /// # 返回
@@ -111,8 +77,6 @@ pub fn set_volume_for_identifier(
 
 /// 根据给定的应用标识符，在系统中查找匹配的、活动的音频会话控制器。
 fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSessionControl2> {
-    ComInitializer::initialize()?;
-
     // 预先获取 PID，作为后备匹配策略使用。
     let target_pid = get_pid_from_identifier(identifier);
 
@@ -126,8 +90,6 @@ fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSession
         None
     };
 
-    // SAFETY: 所有的 COM 调用都在 unsafe 块中。
-    // 我们已在函数开始时通过 ComInitializer 初始化了 COM。
     unsafe {
         let device_enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
@@ -298,7 +260,7 @@ fn get_pid_from_identifier(identifier: &str) -> Option<u32> {
 
 /// 从 AUMID 中启发式地推断出可能的可执行文件名。
 ///
-/// 这种方法比依赖音频会话的 IconPath 更可靠，特别是对于安装在系统目录的应用。
+/// 这种方法比依赖音频会话的 `IconPath` 更可靠，特别是对于安装在系统目录的应用。
 ///
 /// # 示例
 /// - `AppleInc.AppleMusicWin_nzyj5cx40ttqa!App` -> `AppleMusic.exe`
@@ -325,18 +287,15 @@ fn derive_executable_name_from_aumid(aumid: &str) -> Option<String> {
 /// 使用 Windows Tool Help Library (`CreateToolhelp32Snapshot`) 遍历系统中的所有进程，
 /// 不区分大小写地匹配其可执行文件名。
 fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
-    // SAFETY: CreateToolhelp32Snapshot 是一个标准的 Win32 API 调用。
     let snapshot_handle = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
         Ok(handle) if !handle.is_invalid() => handle,
-        _ => return None, // 获取快照失败或句柄无效
+        _ => return None,
     };
 
-    // 使用 RAII Guard 确保 CloseHandle 在函数退出时总能被调用。
     struct HandleGuard(HANDLE);
     impl Drop for HandleGuard {
         fn drop(&mut self) {
             if !self.0.is_invalid() {
-                // SAFETY: self.0 是一个有效的句柄。
                 unsafe { CloseHandle(self.0).ok() };
             }
         }
@@ -348,8 +307,7 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
         ..Default::default()
     };
 
-    // SAFETY: Process32FirstW 用于开始遍历进程快照。
-    if unsafe { Process32FirstW(snapshot_handle, &mut process_entry) }.is_err() {
+    if unsafe { Process32FirstW(snapshot_handle, &raw mut process_entry) }.is_err() {
         return None;
     }
 
@@ -369,7 +327,7 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
         }
 
         // SAFETY: Process32NextW 用于移动到下一个进程。
-        if unsafe { Process32NextW(snapshot_handle, &mut process_entry) }.is_err() {
+        if unsafe { Process32NextW(snapshot_handle, &raw mut process_entry) }.is_err() {
             // 如果错误是 ERROR_NO_MORE_FILES，说明已遍历完所有进程，这是正常情况。
             if windows::core::Error::from_win32().code() == ERROR_NO_MORE_FILES.to_hresult() {
                 break;
@@ -379,13 +337,11 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
     None
 }
 
-/// 尝试通过分析活动音频会话的元数据，为给定的 PackageFamilyName (源自 AUMID) 找到 PID。
+/// 尝试通过分析活动音频会话的元数据，为给定的 `PackageFamilyName` (源自 AUMID) 找到 PID。
 ///
 /// 这是针对 UWP 应用等使用 AUMID 的场景。它会遍历所有音频会话，
 /// 检查其 `IconPath`，并尝试从中启发式地提取 PFN (Package Family Name) 进行匹配。
 fn find_pid_for_aumid_via_audio_sessions(target_pfn_from_aumid: &str) -> Result<Option<u32>> {
-    ComInitializer::initialize()?;
-
     // SAFETY: COM 调用
     unsafe {
         let device_enumerator: IMMDeviceEnumerator =

@@ -54,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
                 MediaUpdate::Error(e) => {
-                    warn!("收到一个非致命错误: {}", e);
+                    warn!("收到一个非致命错误: {e}");
                 }
                 _ => { /* 忽略其他更新 */ }
             }

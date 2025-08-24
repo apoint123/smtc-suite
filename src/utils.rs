@@ -1,6 +1,6 @@
 use ferrous_opencc::OpenCC;
 
-/// 使用指定的 OpenCC 实例转换文本。
+/// 使用指定的 `OpenCC` 实例转换文本。
 ///
 /// # 参数
 /// * `text`: 需要转换的字符串切片。

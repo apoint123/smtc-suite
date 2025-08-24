@@ -15,17 +15,15 @@ categories = ["api-bindings", "multimedia::audio"]
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
-base64 = "0.22.1"
 chrono = { version = "0.4", features = ["serde"] }
-crossbeam-channel = "0.5.15"
 easer = "0.3"
-env_logger = "0.11.8"
 ferrous-opencc = "0"
 log = "0"
 rubato = "0.16"
 serde = "1.0.219"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
 
 windows = { version = "0.61", features = [
     "Media_Control",
@@ -42,3 +40,13 @@ windows = { version = "0.61", features = [
 ] }
 windows-core = "0.61.2"
 windows-future = { version = "0.2" }
+
+[dev-dependencies]
+env_logger = "0.11.8"
+
+[profile.release]
+opt-level = 3
+debug = false
+lto = true
+codegen-units = 1
+panic = "abort"
