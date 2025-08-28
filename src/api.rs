@@ -170,7 +170,6 @@ pub enum CControlCommandType {
 
 // C-ABI 兼容的重复模式枚举。
 #[repr(u8)]
-#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CRepeatMode {
     Off = 0,
@@ -290,8 +289,6 @@ pub enum MediaUpdate {
     /// 负载是一个 `NowPlayingInfo` 结构体，包含了所有最新的媒体信息，
     /// 包括元数据、播放状态、进度和封面数据。
     TrackChanged(NowPlayingInfo),
-    /// 响应 `RequestUpdate` 命令时发送，同样包含一个完整的状态快照。
-    TrackChangedForced(NowPlayingInfo),
     /// 可用的媒体会话列表已更新。
     SessionsChanged(Vec<SmtcSessionInfo>),
     /// 接收到一个音频数据包（如果音频捕获已启动）。

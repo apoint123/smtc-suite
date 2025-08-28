@@ -165,8 +165,6 @@ pub struct CVolumeChangedEvent {
 pub enum CUpdateType {
     /// data 指针类型: `*const CNowPlayingInfo` (常规更新)
     TrackChanged,
-    /// data 指针类型: `*const CNowPlayingInfo` (强制刷新)
-    TrackChangedForced,
     /// data 指针类型: `*const CSessionList`
     SessionsChanged,
     /// data 指针类型: `*const CAudioDataPacket`
@@ -956,15 +954,6 @@ unsafe fn process_and_invoke_callback(
             let guard = NowPlayingInfoGuard(c_info);
             callback(
                 CUpdateType::TrackChanged,
-                (&raw const guard.0).cast::<c_void>(),
-                userdata,
-            );
-        }
-        MediaUpdate::TrackChangedForced(info) => {
-            let c_info = convert_to_c_now_playing_info(&info);
-            let guard = NowPlayingInfoGuard(c_info);
-            callback(
-                CUpdateType::TrackChangedForced,
                 (&raw const guard.0).cast::<c_void>(),
                 userdata,
             );

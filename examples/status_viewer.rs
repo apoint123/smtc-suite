@@ -185,9 +185,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     MediaUpdate::TrackChanged(info) => {
                         handle_track_changed(info, &mut last_known_info, false);
                     }
-                    MediaUpdate::TrackChangedForced(info) => {
-                        handle_track_changed(info, &mut last_known_info, true);
-                    }
                     MediaUpdate::SelectedSessionVanished(session_id) => {
                         log::warn!("当前选择的会话 '{session_id}' 已消失。");
                         last_known_info = None;

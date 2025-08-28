@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
                     }
-                    MediaUpdate::TrackChanged(info) | MediaUpdate::TrackChangedForced(info) => {
+                    MediaUpdate::TrackChanged(info) => {
                         let new_info = parse_combined_artist_album_info(info);
 
                         let has_text_info_changed = match &last_known_info {

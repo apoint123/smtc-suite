@@ -25,7 +25,8 @@ use windows::{
         System::{
             Com::{CLSCTX_INPROC_SERVER, CoCreateInstance},
             Threading::{
-                AvSetMmThreadCharacteristicsW, CreateEventW, SetEvent, WaitForMultipleObjects,
+                AvSetMmThreadCharacteristicsW, CreateEventW, INFINITE, SetEvent,
+                WaitForMultipleObjects,
             },
         },
     },
@@ -45,8 +46,6 @@ const TARGET_CHANNELS: u16 = 2;
 const WASAPI_BUFFER_DURATION_MS: u64 = 20;
 /// 大约每隔多少毫秒尝试发送一次处理好的音频数据包。
 const AUDIO_PACKET_SEND_INTERVAL_MS: u64 = 100;
-/// `WaitForMultipleObjects` 的无限等待超时参数。
-const WAIT_INFINITE: u32 = 0xFFFF_FFFF;
 
 /// 模块内部使用的错误类型。
 #[derive(Error, Debug)]
@@ -446,7 +445,7 @@ impl AudioCapturer {
         loop {
             // 阻塞式地等待任一事件被触发。
             let wait_result: WAIT_EVENT =
-                unsafe { WaitForMultipleObjects(&handles, false, WAIT_INFINITE) };
+                unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
 
             // 检查是哪个事件被触发了
             match wait_result {

@@ -50,6 +50,22 @@ pub enum SmtcError {
     /// 这是一个严重的初始化错误，会导致后台线程无法启动。
     #[error("Tokio 运行时创建失败: {0}")]
     TokioRuntime(#[from] std::io::Error),
+
+    /// 尝试启动一个已经启动的媒体服务。
+    ///
+    /// `MediaManager::start()` 在一个进程中只应被调用一次。
+    #[error("媒体服务已在运行，无法重复启动。")]
+    AlreadyRunning,
+
+    /// 锁已被毒化。
+    #[error("锁已被毒化: {0}")]
+    MutexPoisoned(String),
+}
+
+impl<T> From<std::sync::PoisonError<T>> for SmtcError {
+    fn from(err: std::sync::PoisonError<T>) -> Self {
+        SmtcError::MutexPoisoned(err.to_string())
+    }
 }
 
 /// 本库统一的 `Result` 类型别名。

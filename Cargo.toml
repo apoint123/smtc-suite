@@ -1,6 +1,6 @@
 [package]
 name = "smtc-suite"
-version = "2.4.1"
+version = "2.5.0"
 edition = "2024"
 authors = ["apoint123 <vpnzaph@outlook.com>"]
 description = "一个用于与 Windows 系统媒体控件 (SMTC) 和系统音频进行交互的 Rust 库。"
@@ -17,7 +17,7 @@ crate-type = ["cdylib", "staticlib", "rlib"]
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
 easer = "0.3"
-ferrous-opencc = "0"
+ferrous-opencc = "0.2"
 log = "0"
 rubato = "0.16"
 serde = "1.0.219"

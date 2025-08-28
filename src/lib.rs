@@ -101,7 +101,11 @@ pub use api::{
 };
 pub use error::{Result, SmtcError};
 
+use std::sync::{LazyLock, Mutex};
+use std::thread::JoinHandle;
 use tokio::sync::mpsc;
+
+static WORKER_HANDLE: LazyLock<Mutex<Option<JoinHandle<()>>>> = LazyLock::new(|| Mutex::new(None));
 
 /// `MediaManager` 是本库的静态入口点。
 pub struct MediaManager;
@@ -116,14 +120,24 @@ impl MediaManager {
     /// - `Ok((controller, update_rx))`: 成功启动后，返回一个元组：
     ///   - `controller`: 一个 [`MediaController`]，用于向后台服务发送命令。
     ///   - `update_rx`: 一个 `mpsc::Receiver<MediaUpdate>`，用于接收所有事件和状态更新。
-    /// - `Err(SmtcError)`: 如果在启动过程中发生严重错误（例如，无法创建后台线程）。
+    /// - `Err(SmtcError)`: 如果在启动过程中发生严重错误，或服务已在运行。
     pub fn start() -> Result<(MediaController, mpsc::Receiver<MediaUpdate>)> {
+        let mut handle_guard = WORKER_HANDLE.lock()?;
+
+        if let Some(handle) = handle_guard.as_ref()
+            && !handle.is_finished()
+        {
+            return Err(SmtcError::AlreadyRunning);
+        }
+
         let (command_tx, command_rx) = mpsc::channel::<MediaCommand>(32);
         let (update_tx, update_rx) = mpsc::channel::<MediaUpdate>(32);
 
-        worker::start_media_worker_thread(command_rx, update_tx)?;
+        let new_handle = worker::start_media_worker_thread(command_rx, update_tx)?;
 
         let controller = MediaController { command_tx };
+
+        *handle_guard = Some(new_handle);
 
         Ok((controller, update_rx))
     }
