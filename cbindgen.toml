@@ -1,25 +1,3 @@
 language = "C"
 include_guard = "SMTC_SUITE_H"
 pragma_once = true
-
-[export]
-include = [
-    # 枚举
-    "CControlCommandType",
-    "CUpdateType",
-    "CTextConversionMode",
-    "CRepeatMode",
-
-    # 结构体和联合体
-    "ControlCommandData",
-    "CSmtcControlCommand",
-    "CNowPlayingInfo",
-    "CSessionInfo",
-    "CSessionList",
-    "CAudioDataPacket",
-    "CVolumeChangedEvent",
-]
-
-[parse]
-parse_deps = true
-include = ["smtc-suite"]

@@ -20,7 +20,7 @@ easer = "0.3"
 ferrous-opencc = "0.2"
 log = "0"
 rubato = "0.16"
-serde = "1.0.219"
+serde = "1.0"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tokio-util = "0.7"
@@ -42,7 +42,10 @@ windows-core = "0.61.2"
 windows-future = { version = "0.2" }
 
 [dev-dependencies]
-env_logger = "0.11.8"
+env_logger = "0.11"
+
+[build-dependencies]
+cbindgen = "0.29"
 
 [profile.release]
 opt-level = 3

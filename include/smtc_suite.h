@@ -22,6 +22,17 @@ typedef enum CControlCommandType {
   SetRepeatMode,
 } CControlCommandType;
 
+/**
+ * C-ABI 兼容的日志级别枚举。
+ */
+typedef enum CLogLevel {
+  Error = 1,
+  Warn = 2,
+  Info = 3,
+  Debug = 4,
+  Trace = 5,
+} CLogLevel;
+
 enum CRepeatMode {
   Off = 0,
   One = 1,
@@ -71,7 +82,7 @@ typedef uint8_t CTextConversionMode;
  */
 typedef enum CUpdateType {
   /**
-   * data 指针类型: `*const CNowPlayingInfo`
+   * data 指针类型: `*const CNowPlayingInfo` (常规更新)
    */
   TrackChanged,
   /**
@@ -94,6 +105,10 @@ typedef enum CUpdateType {
    * data 指针类型: `*const c_char` (已消失会话的 ID)
    */
   SelectedSessionVanished,
+  /**
+   * data 指针类型: `*const CDiagnosticInfo`
+   */
+  Diagnostic,
 } CUpdateType;
 
 /**
@@ -116,19 +131,14 @@ typedef enum SmtcResult {
    * 内部发生错误，通常伴有日志输出。
    */
   InternalError,
+  /**
+   * 命令因通道已满而发送失败。
+   */
+  ChannelFull,
 } SmtcResult;
 
 /**
- * 与媒体库后台服务交互的控制器。
- *
- * 这是库的公共入口点。它包含一个命令发送端和一个更新接收端，
- * 用于与在后台运行的 `MediaWorker` 进行通信。
- */
-typedef struct MediaController MediaController;
-
-/**
- * Rust 端的核心控制器句柄。对于 C 端来说，这是一个不透明指针。
- * 该结构体封装了所有 Rust 资源，包括后台线程和通信通道。
+ * Rust 端的核心控制器句柄。
  */
 typedef struct SmtcHandle SmtcHandle;
 
@@ -169,130 +179,18 @@ typedef struct CSmtcControlCommand {
 } CSmtcControlCommand;
 
 /**
- * C-ABI 兼容的“正在播放”信息结构体。
+ * 定义 C 端日志回调函数的指针类型。
  *
- * # 数据生命周期
- * **此结构体及其指向的所有数据（包括字符串和封面数据）仅在回调函数作用域内有效。**
- * 如果需要在回调函数返回后继续使用这些数据，必须在回调函数内部进行深拷贝。
- * **调用者不应也无需手动释放任何指针。**
+ * # 参数
+ * - `level`: 日志消息的级别。
+ * - `target`: 日志来源的模块路径 (例如 "`my_lib::my_module`")。
+ * - `message`: UTF-8 编码、Null 结尾的日志消息。
+ * - `userdata`: 调用者在注册时传入的自定义上下文指针。
  */
-typedef struct CNowPlayingInfo {
-  /**
-   * 曲目标题 (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *title;
-  /**
-   * 艺术家 (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *artist;
-  /**
-   * 专辑标题 (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *album_title;
-  /**
-   * 歌曲总时长（毫秒）。
-   */
-  uint64_t duration_ms;
-  /**
-   * 当前播放位置（毫秒）。
-   */
-  uint64_t position_ms;
-  /**
-   * 当前是否正在播放。
-   */
-  bool is_playing;
-  /**
-   * 指向封面图片原始数据的指针。仅在回调内有效。
-   */
-  const uint8_t *cover_data;
-  /**
-   * 封面图片数据的长度（字节）。
-   */
-  uintptr_t cover_data_len;
-  /**
-   * 封面图片数据的哈希值，可用于快速比较封面是否变化。
-   */
-  uint64_t cover_data_hash;
-} CNowPlayingInfo;
-
-/**
- * C-ABI 兼容的 SMTC 会话信息结构体。
- *
- * # 数据生命周期
- * **此结构体及其指向的所有字符串数据仅在回调函数作用域内有效。**
- * 如果需要保留，必须在回调函数内部进行深拷贝。
- * **调用者不应也无需手动释放任何指针。**
- */
-typedef struct CSessionInfo {
-  /**
-   * 会话的唯一 ID (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *session_id;
-  /**
-   * 来源应用的 AUMID (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *source_app_user_model_id;
-  /**
-   * 用于 UI 显示的名称 (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *display_name;
-} CSessionInfo;
-
-/**
- * C-ABI 兼容的会话列表结构体，用于在回调中传递会话数组。
- *
- * # 数据生命周期
- * **此结构体及其指向的 `sessions` 数组和数组内所有数据仅在回调函数作用域内有效。**
- */
-typedef struct CSessionList {
-  /**
-   * 指向 `CSessionInfo` 数组头部的指针。
-   */
-  const struct CSessionInfo *sessions;
-  /**
-   * 数组中的元素数量。
-   */
-  uintptr_t count;
-} CSessionList;
-
-/**
- * C-ABI 兼容的音频数据包结构体。
- *
- * # 数据生命周期
- * **此结构体及其指向的 `data` 数组仅在回调函数作用域内有效。**
- */
-typedef struct CAudioDataPacket {
-  /**
-   * 指向音频 PCM 数据的指针。
-   */
-  const uint8_t *data;
-  /**
-   * 数据长度（字节）。
-   */
-  uintptr_t len;
-} CAudioDataPacket;
-
-/**
- * C-ABI 兼容的音量变化事件结构体。
- *
- * # 数据生命周期
- * **此结构体及其指向的 `session_id` 字符串仅在回调函数作用域内有效。**
- * **调用者不应也无需手动释放任何指针。**
- */
-typedef struct CVolumeChangedEvent {
-  /**
-   * 发生音量变化的会话 ID (UTF-8 编码, Null 结尾)。仅在回调内有效。
-   */
-  const char *session_id;
-  /**
-   * 新的音量级别 (0.0 到 1.0)。
-   */
-  float volume;
-  /**
-   * 新的静音状态。
-   */
-  bool is_muted;
-} CVolumeChangedEvent;
+typedef void (*LogCallback)(enum CLogLevel level,
+                            const char *target,
+                            const char *message,
+                            void *userdata);
 
 /**
  * 创建一个新的 SMTC 控制器实例。
@@ -365,6 +263,12 @@ enum SmtcResult smtc_suite_register_update_callback(struct SmtcHandle *handle_pt
 const char *smtc_suite_get_version(void);
 
 /**
+ * 请求一次全面的状态刷新。
+ * 此函数会触发 `SessionsChanged` 和 `TrackChangedForced` 事件。
+ */
+enum SmtcResult smtc_suite_request_update(struct SmtcHandle *handle_ptr);
+
+/**
  * 向 SMTC 套件发送一个媒体控制命令。
  *
  * # 安全性
@@ -373,6 +277,29 @@ const char *smtc_suite_get_version(void);
  */
 enum SmtcResult smtc_suite_control_command(struct SmtcHandle *handle_ptr,
                                            struct CSmtcControlCommand command);
+
+/**
+ * 启用或禁用高频进度更新。
+ *
+ * 当启用时，库会以 100ms 的固定间隔主动发送 `TrackChanged` 更新事件，
+ * 以便实现平滑的进度条。禁用后，`TrackChanged` 事件仅在 SMTC
+ * 报告真实变化时才发送。
+ *
+ * # 参数
+ * - `handle_ptr`: 一个由 `smtc_suite_create` 返回的有效句柄。
+ * - `enabled`: `true` 表示启用高频更新，`false` 表示禁用。
+ *
+ * # 返回
+ * - `SmtcResult::Success` 表示命令已成功发送。
+ * - `SmtcResult::InvalidHandle` 如果句柄无效。
+ * - `SmtcResult::InternalError` 如果命令发送失败（例如后台线程已关闭）。
+ *
+ * # 安全性
+ * `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
+ * 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ */
+enum SmtcResult smtc_suite_set_high_frequency_progress_updates(struct SmtcHandle *handle_ptr,
+                                                               bool enabled);
 
 /**
  * 选择一个 SMTC 会话进行监控。
@@ -397,8 +324,8 @@ enum SmtcResult smtc_suite_select_session(struct SmtcHandle *handle_ptr,
  * 调用者必须确保 `controller_ptr` 是一个由 `smtc_start` 返回的有效指针，
  * 并且在调用此函数时没有被释放。
  */
-bool smtc_set_text_conversion_mode(struct MediaController *controller_ptr,
-                                   CTextConversionMode mode);
+enum SmtcResult smtc_suite_set_text_conversion_mode(struct SmtcHandle *handle_ptr,
+                                                    CTextConversionMode mode);
 
 /**
  * 请求开始音频捕获。
@@ -419,12 +346,24 @@ enum SmtcResult smtc_suite_start_audio_capture(struct SmtcHandle *handle_ptr);
 enum SmtcResult smtc_suite_stop_audio_capture(struct SmtcHandle *handle_ptr);
 
 /**
- * 释放由本库 FFI 函数返回的字符串 (`*mut c_char`)。
+ * 初始化日志系统，并将所有日志消息重定向到指定的 C 回调函数。
+ *
+ * 这个函数在整个程序的生命周期中只应被调用一次。
+ *
+ * # 参数
+ * - `callback`: 用于接收日志消息的函数指针。不能为 NULL。
+ * - `userdata`: 将被原样传递给回调函数的用户自定义指针。
+ * - `max_level`: 要捕获的最高日志级别。
+ *
+ * # 返回
+ * - `SmtcResult::Success`: 如果成功初始化。
+ * - `SmtcResult::InternalError`: 如果日志系统已经被初始化过，或者发生其他内部错误。
  *
  * # 安全性
- * `s` 必须是一个由本库的 FFI 函数返回、且尚未被释放的有效指针。
- * 传入 `NULL` 是安全的。
+ * 必须保证 `callback` 是一个有效的指针。
  */
-void smtc_suite_free_string(char *s);
+enum SmtcResult smtc_suite_init_logging(LogCallback callback,
+                                        void *userdata,
+                                        enum CLogLevel max_level);
 
 #endif  /* SMTC_SUITE_H */

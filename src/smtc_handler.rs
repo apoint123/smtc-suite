@@ -51,27 +51,34 @@ struct MonitoredSessionGuard {
 
 impl MonitoredSessionGuard {
     fn new(session: MediaSession, smtc_event_tx: &TokioSender<SmtcEventSignal>) -> WinResult<Self> {
+        let session_id = session.SourceAppUserModelId()?.to_string_lossy();
         let tx_media = smtc_event_tx.clone();
         let tx_playback = smtc_event_tx.clone();
         let tx_timeline = smtc_event_tx.clone();
 
-        let media_token =
+        let media_token = {
+            let id = session_id.clone();
             session.MediaPropertiesChanged(&TypedEventHandler::new(move |_, _| {
-                let _ = tx_media.try_send(SmtcEventSignal::MediaProperties);
+                let _ = tx_media.try_send(SmtcEventSignal::MediaProperties(id.clone()));
                 Ok(())
-            }))?;
+            }))?
+        };
 
-        let playback_token =
+        let playback_token = {
+            let id = session_id.clone();
             session.PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-                let _ = tx_playback.try_send(SmtcEventSignal::PlaybackInfo);
+                let _ = tx_playback.try_send(SmtcEventSignal::PlaybackInfo(id.clone()));
                 Ok(())
-            }))?;
+            }))?
+        };
 
-        let timeline_token =
+        let timeline_token = {
+            let id = session_id.clone();
             session.TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
-                let _ = tx_timeline.try_send(SmtcEventSignal::TimelineProperties);
+                let _ = tx_timeline.try_send(SmtcEventSignal::TimelineProperties(id.clone()));
                 Ok(())
-            }))?;
+            }))?
+        };
         Ok(Self {
             session,
             tokens: (media_token, playback_token, timeline_token),
@@ -295,31 +302,23 @@ pub fn calculate_cover_hash(data: &[u8]) -> u64 {
     hasher.finish()
 }
 
-/// SMTC 内部事件信号，用于在 `WinRT` 事件处理器和主事件循环之间传递具体事件类型。
-///
-/// 由于 `WinRT` 的事件回调是异步触发的，我们不能在回调中直接处理复杂逻辑。
-/// 相反，回调仅发送一个简单的信号，由主循环的 `select!` 统一处理。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum SmtcEventSignal {
-    /// 媒体属性（标题、艺术家等）已更改。
-    MediaProperties,
-    /// 播放信息（播放/暂停状态、可用控件）已更改。
-    PlaybackInfo,
-    /// 时间线属性（播放位置、总时长）已更改。
-    TimelineProperties,
-    /// 系统中的媒体会话列表已更改。
+    MediaProperties(String),
+    PlaybackInfo(String),
+    TimelineProperties(String),
     Sessions,
 }
 
 /// 封装了所有可能从后台异步任务返回的结果。
-///
-/// 主循环通过一个通道接收此枚举，以统一处理所有异步操作的完成或失败。
-#[derive(Debug)]
 enum AsyncTaskResult {
     /// `MediaSessionManager::RequestAsync` 的结果。
     ManagerReady(WinResult<MediaSessionManager>),
     /// `TryGetMediaPropertiesAsync` 的结果。
-    MediaPropertiesReady(WinResult<GlobalSystemMediaTransportControlsSessionMediaProperties>),
+    MediaPropertiesReady(
+        String,
+        WinResult<GlobalSystemMediaTransportControlsSessionMediaProperties>,
+    ),
     /// 媒体控制命令（如播放、暂停）的异步执行结果。
     MediaControlCompleted(SmtcControlCommand, WinResult<bool>),
     /// 封面数据获取任务的结果。
@@ -778,7 +777,12 @@ impl SmtcRunner {
                         None // TextConversionMode::Off
                     };
 
-                    let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
+                    if let Some(guard) = &self.state.session_guard
+                        && let Ok(id_hstr) = guard.session.SourceAppUserModelId()
+                    {
+                        let _ = smtc_event_tx
+                            .try_send(SmtcEventSignal::MediaProperties(id_hstr.to_string_lossy()));
+                    }
                 }
             }
             InternalCommand::SelectSmtcSession(id) => {
@@ -852,132 +856,127 @@ impl SmtcRunner {
                     log::warn!("[SmtcRunner] 收到 SessionsChanged 信号，但管理器尚未就绪。");
                 }
             }
-            SmtcEventSignal::MediaProperties => {
-                if let Some(guard) = &self.state.session_guard {
+            SmtcEventSignal::MediaProperties(event_session_id) => {
+                if let Some(guard) = &self.state.session_guard
+                    && guard
+                        .session
+                        .SourceAppUserModelId()
+                        .ok()
+                        .map(|h| h.to_string_lossy())
+                        == Some(event_session_id.clone())
+                {
                     let s = &guard.session;
                     spawn_async_op(
                         s.TryGetMediaPropertiesAsync(),
                         async_result_tx,
-                        AsyncTaskResult::MediaPropertiesReady,
+                        move |res| AsyncTaskResult::MediaPropertiesReady(event_session_id, res),
                     );
                 }
             }
-            SmtcEventSignal::PlaybackInfo => {
+            SmtcEventSignal::PlaybackInfo(event_session_id) => {
+                let current_session_id = self
+                    .state
+                    .session_guard
+                    .as_ref()
+                    .and_then(|g| g.session.SourceAppUserModelId().ok())
+                    .map(|h| h.to_string_lossy());
+
+                if current_session_id != Some(event_session_id) {
+                    return Ok(());
+                }
+
                 if let Some(guard) = &self.state.session_guard
                     && let Ok(info) = guard.session.GetPlaybackInfo()
                 {
-                    let is_playing_now = info.PlaybackStatus()
+                    let mut state_guard = self.player_state_arc.lock().await;
+
+                    let session_id_after_await = self
+                        .state
+                        .session_guard
+                        .as_ref()
+                        .and_then(|g| g.session.SourceAppUserModelId().ok())
+                        .map(|h| h.to_string_lossy());
+
+                    if current_session_id != session_id_after_await {
+                        return Ok(());
+                    }
+
+                    state_guard.is_playing = info.PlaybackStatus()
                         == Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing);
 
-                    let should_update_state;
-                    {
-                        let player_state = self.player_state_arc.lock().await;
-                        should_update_state = player_state.is_playing != is_playing_now;
+                    state_guard.is_shuffle_active = info
+                        .IsShuffleActive()
+                        .and_then(|iref| iref.Value())
+                        .unwrap_or(false);
+                    state_guard.repeat_mode = info
+                        .AutoRepeatMode()
+                        .and_then(|iref| iref.Value())
+                        .map(|rm| match rm {
+                            MediaPlaybackAutoRepeatMode::None => RepeatMode::Off,
+                            MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
+                            MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
+                            _ => RepeatMode::Off,
+                        })
+                        .unwrap_or(RepeatMode::Off);
+
+                    if let Ok(c) = info.Controls() {
+                        state_guard.can_pause = c.IsPauseEnabled().unwrap_or(false);
+                        state_guard.can_play = c.IsPlayEnabled().unwrap_or(false);
+                        state_guard.can_skip_next = c.IsNextEnabled().unwrap_or(false);
+                        state_guard.can_skip_previous = c.IsPreviousEnabled().unwrap_or(false);
+                        state_guard.can_seek = c.IsPlaybackPositionEnabled().unwrap_or(false);
+                        state_guard.can_change_shuffle = c.IsShuffleEnabled().unwrap_or(false);
+                        state_guard.can_change_repeat = c.IsRepeatEnabled().unwrap_or(false);
                     }
-
-                    if should_update_state {
-                        log::trace!(
-                            "[State Update] 播放状态发生改变 -> {}",
-                            if is_playing_now { "播放" } else { "暂停" }
-                        );
-                        let current_pos_ms = guard
-                            .session
-                            .GetTimelineProperties()
-                            .ok()
-                            .and_then(|props| props.Position().ok())
-                            .map(|d| (d.Duration / 10000) as u64);
-
-                        {
-                            let mut state_guard = self.player_state_arc.lock().await;
-                            state_guard.is_playing = is_playing_now;
-                            state_guard.last_known_position_report_time = Some(Instant::now());
-
-                            if let Some(pos) = current_pos_ms {
-                                state_guard.last_known_position_ms = pos;
-                            }
-                        }
-                    }
-
-                    {
-                        let mut state_guard = self.player_state_arc.lock().await;
-                        state_guard.is_shuffle_active = info
-                            .IsShuffleActive()
-                            .and_then(|iref| iref.Value())
-                            .unwrap_or(false);
-                        state_guard.repeat_mode = info
-                            .AutoRepeatMode()
-                            .and_then(|iref| iref.Value())
-                            .map(|rm| match rm {
-                                MediaPlaybackAutoRepeatMode::None => RepeatMode::Off,
-                                MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
-                                MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
-                                _ => RepeatMode::Off,
-                            })
-                            .unwrap_or(RepeatMode::Off);
-
-                        if let Ok(c) = info.Controls() {
-                            state_guard.can_pause = c.IsPauseEnabled().unwrap_or(false);
-                            state_guard.can_play = c.IsPlayEnabled().unwrap_or(false);
-                            state_guard.can_skip_next = c.IsNextEnabled().unwrap_or(false);
-                            state_guard.can_skip_previous = c.IsPreviousEnabled().unwrap_or(false);
-                            state_guard.can_seek = c.IsPlaybackPositionEnabled().unwrap_or(false);
-                            state_guard.can_change_shuffle = c.IsShuffleEnabled().unwrap_or(false);
-                            state_guard.can_change_repeat = c.IsRepeatEnabled().unwrap_or(false);
-                        }
-                    }
-                    let player_state = self.player_state_arc.lock().await;
-                    send_now_playing_update(&player_state, &self.now_playing_tx);
+                    send_now_playing_update(&state_guard, &self.now_playing_tx);
                 }
             }
-            SmtcEventSignal::TimelineProperties => {
-                if let Some(guard) = &self.state.session_guard {
-                    let session_id_before_await = guard.session.SourceAppUserModelId().ok();
-                    match guard.session.GetTimelineProperties() {
-                        Ok(props) => {
-                            let new_pos_ms =
-                                props.Position().map_or(0, |d| (d.Duration / 10000) as u64);
-                            let dur_ms = props.EndTime().map_or(0, |d| (d.Duration / 10000) as u64);
+            SmtcEventSignal::TimelineProperties(event_session_id) => {
+                let current_session_id = self
+                    .state
+                    .session_guard
+                    .as_ref()
+                    .and_then(|g| g.session.SourceAppUserModelId().ok())
+                    .map(|h| h.to_string_lossy());
 
-                            let mut state_guard = self.player_state_arc.lock().await;
+                if current_session_id != Some(event_session_id) {
+                    return Ok(());
+                }
 
-                            let current_session_id = self
-                                .state
-                                .session_guard
-                                .as_ref()
-                                .and_then(|g| g.session.SourceAppUserModelId().ok());
+                if let Some(guard) = &self.state.session_guard
+                    && let Ok(props) = guard.session.GetTimelineProperties()
+                {
+                    let mut state_guard = self.player_state_arc.lock().await;
 
-                            if session_id_before_await == current_session_id {
-                                let estimated_current_pos_ms =
-                                    state_guard.get_estimated_current_position_ms();
+                    let session_id_after_await = self
+                        .state
+                        .session_guard
+                        .as_ref()
+                        .and_then(|g| g.session.SourceAppUserModelId().ok())
+                        .map(|h| h.to_string_lossy());
 
-                                let is_seek = (new_pos_ms as i64 - estimated_current_pos_ms as i64)
-                                    .abs()
-                                    > SEEK_DETECTION_THRESHOLD_MS as i64;
+                    if current_session_id != session_id_after_await {
+                        return Ok(());
+                    }
 
-                                if is_seek || new_pos_ms > state_guard.last_known_position_ms {
-                                    state_guard.last_known_position_ms = new_pos_ms;
-                                    state_guard.last_known_position_report_time =
-                                        Some(Instant::now());
+                    let new_pos_ms = props.Position().map_or(0, |d| (d.Duration / 10000) as u64);
+                    let dur_ms = props.EndTime().map_or(0, |d| (d.Duration / 10000) as u64);
 
-                                    if dur_ms > 0 {
-                                        state_guard.song_duration_ms = dur_ms;
-                                    }
+                    let estimated_current_pos_ms = state_guard.get_estimated_current_position_ms();
+                    let is_seek = (new_pos_ms as i64 - estimated_current_pos_ms as i64).abs()
+                        > SEEK_DETECTION_THRESHOLD_MS as i64;
 
-                                    if state_guard.is_waiting_for_initial_update {
-                                        state_guard.is_waiting_for_initial_update = false;
-                                        log::debug!(
-                                            "[SmtcRunner] 收到第一次 SMTC 更新，已清除等待标志。"
-                                        );
-                                    }
-                                    send_now_playing_update(&state_guard, &self.now_playing_tx);
-                                }
-                            } else {
-                                log::debug!(
-                                    "[Timeline] 由于在 await 期间会话发生更改，已忽略过时的时间线更新。"
-                                );
-                            }
+                    if is_seek || new_pos_ms > state_guard.last_known_position_ms {
+                        state_guard.last_known_position_ms = new_pos_ms;
+                        state_guard.last_known_position_report_time = Some(Instant::now());
+                        if dur_ms > 0 {
+                            state_guard.song_duration_ms = dur_ms;
                         }
-                        Err(e) => log::warn!("[SmtcRunner] 获取 TimelineProperties 失败: {e:?}"),
+                        if state_guard.is_waiting_for_initial_update {
+                            state_guard.is_waiting_for_initial_update = false;
+                            log::debug!("[SmtcRunner] 收到第一次 SMTC 更新，已清除等待标志。");
+                        }
+                        send_now_playing_update(&state_guard, &self.now_playing_tx);
                     }
                 }
             }
@@ -993,8 +992,9 @@ impl SmtcRunner {
     ) -> WinResult<()> {
         match result {
             AsyncTaskResult::ManagerReady(res) => self.on_manager_ready(res, smtc_event_tx),
-            AsyncTaskResult::MediaPropertiesReady(res) => {
-                self.on_media_properties_ready(res, async_result_tx).await
+            AsyncTaskResult::MediaPropertiesReady(session_id, res) => {
+                self.on_media_properties_ready(session_id, res, async_result_tx)
+                    .await
             }
             AsyncTaskResult::MediaControlCompleted(cmd, res) => {
                 self.on_media_control_completed(cmd, res)
@@ -1027,87 +1027,93 @@ impl SmtcRunner {
 
     async fn on_media_properties_ready(
         &mut self,
+        session_id: String,
         result: WinResult<GlobalSystemMediaTransportControlsSessionMediaProperties>,
         async_result_tx: &TokioSender<AsyncTaskResult>,
     ) -> WinResult<()> {
-        match result {
-            Ok(props) => {
-                let get_prop_string = |prop_res: WinResult<HSTRING>, name: &str| {
-                    prop_res.map_or_else(
-                        |e| {
-                            log::warn!("[SmtcRunner] 获取媒体属性 '{name}' 失败: {e:?}");
-                            String::new()
-                        },
-                        |hstr| {
-                            crate::utils::convert_text(
-                                &hstring_to_string(&hstr),
-                                self.state.text_converter.as_ref(),
-                            )
-                        },
-                    )
-                };
+        let current_session_id = self
+            .state
+            .session_guard
+            .as_ref()
+            .and_then(|g| g.session.SourceAppUserModelId().ok())
+            .map(|h| h.to_string_lossy());
 
-                let title = get_prop_string(props.Title(), "Title");
-                let artist = get_prop_string(props.Artist(), "Artist");
-                let album = get_prop_string(props.AlbumTitle(), "AlbumTitle");
+        if current_session_id != Some(session_id) {
+            return Ok(());
+        }
 
-                const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
-                if IGNORED_TITLES.iter().any(|&ignored| title == ignored) {
-                    return Ok(());
-                }
+        if let Ok(props) = result {
+            let get_prop_string = |prop_res: WinResult<HSTRING>, name: &str| {
+                prop_res.map_or_else(
+                    |e| {
+                        log::warn!("[SmtcRunner] 获取媒体属性 '{name}' 失败: {e:?}");
+                        String::new()
+                    },
+                    |hstr| {
+                        crate::utils::convert_text(
+                            &hstring_to_string(&hstr),
+                            self.state.text_converter.as_ref(),
+                        )
+                    },
+                )
+            };
 
-                let is_new_track;
-                {
-                    let mut player_state = self.player_state_arc.lock().await;
-                    is_new_track = player_state.title != title || player_state.artist != artist;
+            let title = get_prop_string(props.Title(), "Title");
+            let artist = get_prop_string(props.Artist(), "Artist");
+            let album = get_prop_string(props.AlbumTitle(), "AlbumTitle");
 
-                    if is_new_track {
-                        log::info!(
-                            "[SmtcRunner] 接收到新曲目信息: '{}' - '{}'",
-                            &artist,
-                            &title
-                        );
-                        player_state.cover_data = None;
-                        player_state.cover_data_hash = None;
-                        player_state.is_waiting_for_initial_update = true;
-                    }
-                    player_state.title = title;
-                    player_state.artist = artist;
-                    player_state.album = album;
-                }
+            const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
+            if IGNORED_TITLES.iter().any(|&ignored| title == ignored) {
+                return Ok(());
+            }
 
-                if is_new_track && let Ok(thumb_ref) = props.Thumbnail() {
-                    if let Some((old_task, old_token)) = self.state.active_cover_fetch_task.take() {
-                        old_token.cancel();
-                        tokio::task::spawn_local(async move {
-                            let _ = old_task.await;
-                            log::debug!("[SmtcRunner] 旧的封面获取任务已结束。");
-                        });
-                        log::debug!("[SmtcRunner] 已取消旧的封面获取任务");
-                    }
-                    let async_result_tx_clone = async_result_tx.clone();
-                    let cancel_token = CancellationToken::new();
-                    let token_for_task = cancel_token.clone();
+            let mut player_state = self.player_state_arc.lock().await;
 
-                    let cover_task = tokio::task::spawn_local(async move {
-                        let result = fetch_cover_data_task(thumb_ref, token_for_task).await;
-                        if async_result_tx_clone
-                            .send(AsyncTaskResult::CoverDataReady(result))
-                            .await
-                            .is_err()
-                        {
-                            log::warn!("[Cover Fetcher] 无法将封面结果发送回主循环，通道已关闭。");
-                        }
+            let is_new_track = player_state.title != title || player_state.artist != artist;
+
+            if is_new_track {
+                log::info!(
+                    "[SmtcRunner] 接收到新曲目信息: '{}' - '{}'",
+                    &artist,
+                    &title
+                );
+                player_state.cover_data = None;
+                player_state.cover_data_hash = None;
+                player_state.is_waiting_for_initial_update = true;
+            }
+            player_state.title = title;
+            player_state.artist = artist;
+            player_state.album = album;
+
+            if is_new_track && let Ok(thumb_ref) = props.Thumbnail() {
+                if let Some((old_task, old_token)) = self.state.active_cover_fetch_task.take() {
+                    old_token.cancel();
+                    tokio::task::spawn_local(async move {
+                        let _ = old_task.await;
+                        log::debug!("[SmtcRunner] 旧的封面获取任务已结束。");
                     });
-                    self.state.active_cover_fetch_task = Some((cover_task, cancel_token));
+                    log::debug!("[SmtcRunner] 已取消旧的封面获取任务");
                 }
+                let async_result_tx_clone = async_result_tx.clone();
+                let cancel_token = CancellationToken::new();
+                let token_for_task = cancel_token.clone();
 
-                let player_state = self.player_state_arc.lock().await;
-                send_now_playing_update(&player_state, &self.now_playing_tx);
+                let cover_task = tokio::task::spawn_local(async move {
+                    let result = fetch_cover_data_task(thumb_ref, token_for_task).await;
+                    if async_result_tx_clone
+                        .send(AsyncTaskResult::CoverDataReady(result))
+                        .await
+                        .is_err()
+                    {
+                        log::warn!("[Cover Fetcher] 无法将封面结果发送回主循环，通道已关闭。");
+                    }
+                });
+                self.state.active_cover_fetch_task = Some((cover_task, cancel_token));
             }
-            Err(e) => {
-                log::warn!("[SmtcRunner] 获取媒体属性失败: {e:?}");
-            }
+
+            send_now_playing_update(&player_state, &self.now_playing_tx);
+        } else if let Err(e) = result {
+            log::warn!("[SmtcRunner] 获取媒体属性失败: {e:?}");
         }
         Ok(())
     }
@@ -1342,13 +1348,19 @@ impl SmtcRunner {
         send_now_playing_update(&player_state, &self.now_playing_tx);
 
         if let Some(new_s) = new_session_to_monitor {
-            let new_guard = MonitoredSessionGuard::new(new_s, smtc_event_tx)?;
+            let new_guard = MonitoredSessionGuard::new(new_s.clone(), smtc_event_tx)?;
             self.state.session_guard = Some(new_guard);
 
             log::info!("[会话处理器] 会话切换完成，正在获取初始状态。");
-            let _ = smtc_event_tx.try_send(SmtcEventSignal::MediaProperties);
-            let _ = smtc_event_tx.try_send(SmtcEventSignal::PlaybackInfo);
-            let _ = smtc_event_tx.try_send(SmtcEventSignal::TimelineProperties);
+            if let Ok(id_hstr) = new_s.SourceAppUserModelId() {
+                let new_session_id_str = id_hstr.to_string_lossy();
+                let _ = smtc_event_tx
+                    .try_send(SmtcEventSignal::MediaProperties(new_session_id_str.clone()));
+                let _ = smtc_event_tx
+                    .try_send(SmtcEventSignal::PlaybackInfo(new_session_id_str.clone()));
+                let _ =
+                    smtc_event_tx.try_send(SmtcEventSignal::TimelineProperties(new_session_id_str));
+            }
         } else {
             log::info!("[会话处理器] 没有可用的媒体会话，已重置状态。");
         }
