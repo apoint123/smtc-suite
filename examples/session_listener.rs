@@ -15,8 +15,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
-    let command_tx = controller.command_tx.clone();
-
     let update_task = tokio::spawn(async move {
         while let Some(update) = update_rx.recv().await {
             match update {
@@ -36,10 +34,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     });
-
-    command_tx
-        .send(smtc_suite::MediaCommand::RequestUpdate)
-        .await?;
 
     info!("按 Enter 键即可退出程序。");
 

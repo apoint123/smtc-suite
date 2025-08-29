@@ -343,6 +343,8 @@ struct SmtcState {
     active_cover_fetch_task: Option<(JoinHandle<()>, CancellationToken)>,
     /// 主动进度更新计时器任务的句柄和取消令牌。
     active_progress_timer_task: Option<(JoinHandle<()>, CancellationToken)>,
+    /// SMTC 管理器是否已成功初始化。
+    is_manager_ready: bool,
     /// 用于为音量缓动任务生成唯一 ID。
     next_easing_task_id: Arc<std::sync::atomic::AtomicU64>,
 }
@@ -359,6 +361,7 @@ impl SmtcState {
             active_volume_easing_task: None,
             active_cover_fetch_task: None,
             active_progress_timer_task: None,
+            is_manager_ready: false,
             next_easing_task_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
     }
@@ -813,6 +816,10 @@ impl SmtcRunner {
                 }
             }
             InternalCommand::RequestStateUpdate => {
+                if !self.state.is_manager_ready {
+                    log::warn!("[SmtcRunner] 收到状态更新请求，但 SMTC 管理器尚未就绪，已忽略。");
+                    return Ok(());
+                }
                 log::info!("[SmtcRunner] 正在重新获取所有状态...");
                 self.state.session_guard = None;
                 self.handle_sessions_changed(smtc_event_tx).await?;
@@ -1013,6 +1020,7 @@ impl SmtcRunner {
         match result {
             Ok(mgr) => {
                 log::trace!("[SmtcRunner] SMTC 管理器已就绪。");
+                self.state.is_manager_ready = true;
                 let guard = ManagerEventGuard::new(mgr, smtc_event_tx)?;
                 self.state.manager_guard = Some(guard);
                 let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
