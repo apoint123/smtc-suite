@@ -73,7 +73,7 @@ impl MonitoredSessionGuard {
         };
 
         let timeline_token = {
-            let id = session_id.clone();
+            let id = session_id;
             session.TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
                 let _ = tx_timeline.try_send(SmtcEventSignal::TimelineProperties(id.clone()));
                 Ok(())
@@ -919,7 +919,6 @@ impl SmtcRunner {
                         .AutoRepeatMode()
                         .and_then(|iref| iref.Value())
                         .map(|rm| match rm {
-                            MediaPlaybackAutoRepeatMode::None => RepeatMode::Off,
                             MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
                             MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
                             _ => RepeatMode::Off,
@@ -1324,10 +1323,11 @@ impl SmtcRunner {
         new_session_to_monitor: Option<MediaSession>,
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
     ) -> WinResult<()> {
-        let new_session_id = new_session_to_monitor
+        let new_session_id_hstring = new_session_to_monitor
             .as_ref()
-            .and_then(|s| s.SourceAppUserModelId().ok())
-            .map(|h| h.to_string_lossy());
+            .and_then(|s| s.SourceAppUserModelId().ok());
+
+        let new_session_id = new_session_id_hstring.as_ref().map(|h| h.to_string_lossy());
 
         let current_session_id = self
             .state
@@ -1337,6 +1337,13 @@ impl SmtcRunner {
             .map(|h| h.to_string_lossy());
 
         if new_session_id == current_session_id {
+            if let Some(id_str) = new_session_id {
+                let pid = volume_control::get_pid_from_identifier(&id_str);
+                let _ = self
+                    .connector_update_tx
+                    .send(InternalUpdate::ActiveSmtcSessionChanged { pid })
+                    .await;
+            }
             return Ok(());
         }
 
@@ -1345,6 +1352,26 @@ impl SmtcRunner {
             current_session_id.as_deref().unwrap_or("无"),
             new_session_id.as_deref().unwrap_or("无")
         );
+
+        let pid_for_update = if let Some(id_str) = new_session_id.as_deref() {
+            let id_owned = id_str.to_string();
+            tokio::task::spawn_blocking(move || volume_control::get_pid_from_identifier(&id_owned))
+                .await
+                .unwrap_or(None)
+        } else {
+            None
+        };
+
+        if self
+            .connector_update_tx
+            .send(InternalUpdate::ActiveSmtcSessionChanged {
+                pid: pid_for_update,
+            })
+            .await
+            .is_err()
+        {
+            log::warn!("[会话处理器] 发送 ActiveSmtcSessionChanged 更新失败。");
+        }
 
         self.state.session_guard = None;
 
@@ -1356,11 +1383,11 @@ impl SmtcRunner {
         send_now_playing_update(&player_state, &self.now_playing_tx);
 
         if let Some(new_s) = new_session_to_monitor {
-            let new_guard = MonitoredSessionGuard::new(new_s.clone(), smtc_event_tx)?;
+            let new_guard = MonitoredSessionGuard::new(new_s, smtc_event_tx)?;
             self.state.session_guard = Some(new_guard);
 
             log::info!("[会话处理器] 会话切换完成，正在获取初始状态。");
-            if let Ok(id_hstr) = new_s.SourceAppUserModelId() {
+            if let Some(id_hstr) = new_session_id_hstring {
                 let new_session_id_str = id_hstr.to_string_lossy();
                 let _ = smtc_event_tx
                     .try_send(SmtcEventSignal::MediaProperties(new_session_id_str.clone()));

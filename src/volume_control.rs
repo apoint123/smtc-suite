@@ -204,7 +204,7 @@ fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSession
 /// 从给定的标识符（可执行文件名或 AUMID）动态地获取进程ID (PID)。
 ///
 /// 此函数同样采用多策略来提高成功率。
-fn get_pid_from_identifier(identifier: &str) -> Option<u32> {
+pub fn get_pid_from_identifier(identifier: &str) -> Option<u32> {
     log::debug!("[音量控制] 尝试从标识符 '{identifier}' 获取 PID。");
 
     // 策略 1: 直接将标识符作为可执行文件名进行匹配。

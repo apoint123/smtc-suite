@@ -37,6 +37,7 @@ windows = { version = "0.61", features = [
     "Win32_System_Variant",
     "Win32_UI_WindowsAndMessaging",
     "Win32_Security",
+    "Media_Audio",
 ] }
 windows-core = "0.61.2"
 windows-future = { version = "0.2" }

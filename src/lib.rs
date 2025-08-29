@@ -88,6 +88,7 @@
 
 mod api;
 mod audio_capture;
+mod audio_session_monitor;
 mod error;
 mod ffi;
 mod smtc_handler;

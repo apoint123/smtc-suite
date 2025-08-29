@@ -13,6 +13,7 @@ use windows::{
     core::Result as WinResult,
 };
 
+use crate::audio_session_monitor::{self, AudioMonitorCommand};
 use crate::{
     api::{
         DiagnosticInfo, MediaCommand, MediaUpdate, NowPlayingInfo, SmtcControlCommand,
@@ -47,6 +48,10 @@ pub(crate) enum InternalCommand {
 /// 然后将它们转换为外部可见的 `MediaUpdate`。
 #[derive(Debug, Clone)]
 pub(crate) enum InternalUpdate {
+    /// 由 `smtc_handler` 发出，表示活动的 SMTC 会话已更改。
+    ActiveSmtcSessionChanged { pid: Option<u32> },
+    /// 由 `audio_session_monitor` 的回调发出，表示被监听的会话已失效（如关闭、崩溃）。
+    MonitoredAudioSessionExpired,
     /// 由 `smtc_handler` 发出，表示可用的 SMTC 会话列表已更新。
     SmtcSessionListChanged(Vec<SmtcSessionInfo>),
     /// 由 `smtc_handler` 发出，表示之前选中的会话已消失。
@@ -71,6 +76,9 @@ pub(crate) struct MediaWorker {
     diagnostics_rx: Option<TokioReceiver<DiagnosticInfo>>,
     now_playing_rx: watch::Receiver<NowPlayingInfo>,
     smtc_listener_task_handle: Option<TokioJoinHandle<Result<()>>>,
+    smtc_shutdown_tx: Option<TokioSender<()>>,
+    audio_monitor_command_tx: Option<TokioSender<AudioMonitorCommand>>,
+    audio_monitor_task_handle: Option<TokioJoinHandle<()>>,
     audio_capturer: Option<AudioCapturer>,
     audio_update_rx: Option<TokioReceiver<InternalUpdate>>,
     _shared_player_state: Arc<tokio::sync::Mutex<SharedPlayerState>>,
@@ -89,7 +97,15 @@ impl MediaWorker {
         let (diagnostics_tx, diagnostics_rx) = channel::<DiagnosticInfo>(32);
         let player_state = Arc::new(tokio::sync::Mutex::new(SharedPlayerState::default()));
 
-        let (_shutdown_tx, shutdown_rx) = channel::<()>(1);
+        let (audio_monitor_command_tx, audio_monitor_command_rx) =
+            channel::<AudioMonitorCommand>(8);
+        let audio_monitor = audio_session_monitor::AudioSessionMonitor::new(
+            audio_monitor_command_rx,
+            smtc_update_tx.clone(),
+        );
+        let audio_monitor_handle = tokio::task::spawn_local(audio_monitor.run());
+
+        let (shutdown_tx, shutdown_rx) = channel::<()>(1);
         let smtc_listener_handle = tokio::task::spawn_local(smtc_handler::run_smtc_listener(
             smtc_update_tx.clone(),
             smtc_control_rx,
@@ -107,6 +123,9 @@ impl MediaWorker {
             diagnostics_rx: Some(diagnostics_rx),
             now_playing_rx,
             smtc_listener_task_handle: Some(smtc_listener_handle),
+            smtc_shutdown_tx: Some(shutdown_tx),
+            audio_monitor_command_tx: Some(audio_monitor_command_tx),
+            audio_monitor_task_handle: Some(audio_monitor_handle),
             audio_capturer: None,
             audio_update_rx: None,
             _shared_player_state: player_state,
@@ -216,10 +235,33 @@ impl MediaWorker {
     }
 
     async fn handle_internal_update(&mut self, internal_update: InternalUpdate, source: &str) {
-        let public_update: MediaUpdate = internal_update.into();
+        match internal_update {
+            InternalUpdate::ActiveSmtcSessionChanged { pid } => {
+                let command = if let Some(pid_val) = pid {
+                    AudioMonitorCommand::StartMonitoring(pid_val)
+                } else {
+                    AudioMonitorCommand::StopMonitoring
+                };
+                if let Some(tx) = &self.audio_monitor_command_tx
+                    && tx.send(command).await.is_err()
+                {
+                    log::error!("[MediaWorker] 发送命令到音量监听器失败。");
+                }
+            }
+            InternalUpdate::MonitoredAudioSessionExpired => {
+                if let Some(tx) = &self.audio_monitor_command_tx
+                    && tx.send(AudioMonitorCommand::StopMonitoring).await.is_err()
+                {
+                    log::error!("[MediaWorker] 发送 StopMonitoring 命令到音量监听器失败。");
+                }
+            }
 
-        if self.update_tx.send(public_update).await.is_err() {
-            log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败。");
+            other => {
+                let public_update: MediaUpdate = other.into();
+                if self.update_tx.send(public_update).await.is_err() {
+                    log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败。");
+                }
+            }
         }
     }
 
@@ -270,9 +312,21 @@ impl MediaWorker {
     async fn shutdown_all_subsystems(&mut self) {
         log::info!("[MediaWorker] 正在关闭所有子系统...");
         self.smtc_control_tx.take();
-        if let Some(handle) = self.smtc_listener_task_handle.take() {
-            log::debug!("[MediaWorker] 正在中止 SMTC 监听器任务...");
+        if self.audio_monitor_command_tx.take().is_some() {
+            log::debug!("[MediaWorker] 音量监听器命令通道已关闭。");
+        }
+        if let Some(handle) = self.audio_monitor_task_handle.take() {
             handle.abort();
+        }
+        if let Some(tx) = self.smtc_shutdown_tx.take() {
+            let _ = tx.send(()).await;
+        }
+        if let Some(handle) = self.smtc_listener_task_handle.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+                .await
+                .is_err()
+        {
+            log::warn!("[MediaWorker] SMTC 监听器优雅退出超时，将强制中止。");
         }
         self.stop_audio_capture_internal();
     }
@@ -349,6 +403,10 @@ impl From<InternalUpdate> for MediaUpdate {
                 MediaUpdate::SelectedSessionVanished(session_id)
             }
             InternalUpdate::AudioCaptureError(err) => MediaUpdate::Error(err),
+            // 内部事件已在上层处理，理论上不应该到达这里
+            _ => {
+                panic!("尝试将一个内部事件 ({:?}) 转换为公共更新。", internal)
+            }
         }
     }
 }
