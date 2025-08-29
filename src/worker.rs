@@ -269,6 +269,7 @@ impl MediaWorker {
 
     async fn shutdown_all_subsystems(&mut self) {
         log::info!("[MediaWorker] 正在关闭所有子系统...");
+        self.smtc_control_tx.take();
         if let Some(handle) = self.smtc_listener_task_handle.take() {
             log::debug!("[MediaWorker] 正在中止 SMTC 监听器任务...");
             handle.abort();
