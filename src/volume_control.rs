@@ -1,5 +1,10 @@
+use easer::functions::Easing;
 use std::ffi::OsString;
 use std::os::windows::ffi::OsStringExt;
+use tokio::sync::mpsc::Sender as TokioSender;
+use tokio::task::JoinHandle;
+use tokio::time::Duration as TokioDuration;
+use tokio_util::sync::CancellationToken;
 use windows::{
     Win32::{
         Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE},
@@ -20,6 +25,105 @@ use windows::{
 };
 
 use crate::error::{Result, SmtcError};
+use crate::worker::InternalUpdate;
+
+/// 音量缓动动画的总时长（毫秒）。
+const VOLUME_EASING_DURATION_MS: f32 = 250.0;
+
+/// 音量缓动动画的总步数。
+const VOLUME_EASING_STEPS: u32 = 15;
+
+/// 音量变化小于此阈值时，不执行缓动动画，直接设置最终值。
+const VOLUME_EASING_THRESHOLD: f32 = 0.01;
+
+/// 一个独立的任务，用于平滑地调整指定进程的音量
+async fn volume_easing_task(
+    task_id: u64,
+    target_vol: f32,
+    session_id: String,
+    connector_tx: TokioSender<InternalUpdate>,
+    cancel_token: CancellationToken,
+) {
+    log::debug!(
+        "[音量缓动任务][ID:{task_id}] 启动。目标音量: {target_vol:.2}，会话: '{session_id}'"
+    );
+
+    if let Ok((initial_vol, _)) = crate::volume_control::get_volume_for_identifier(&session_id) {
+        if (target_vol - initial_vol).abs() < VOLUME_EASING_THRESHOLD {
+            let _ = crate::volume_control::set_volume_for_identifier(
+                &session_id,
+                Some(target_vol),
+                None,
+            );
+            return;
+        }
+
+        log::trace!("[音量缓动任务][ID:{task_id}] 初始音量: {initial_vol:.2}");
+        let animation_duration_ms = VOLUME_EASING_DURATION_MS;
+        let steps = VOLUME_EASING_STEPS;
+        let step_duration =
+            TokioDuration::from_millis((animation_duration_ms / steps as f32) as u64);
+
+        for s in 0..=steps {
+            tokio::select! {
+                biased;
+                () = cancel_token.cancelled() => {
+                    log::debug!("[音量缓动任务][ID:{task_id}] 任务被取消。");
+                    break;
+                }
+                () = tokio::time::sleep(step_duration) => {
+                    let current_time = (s as f32 / steps as f32) * animation_duration_ms;
+                    let change_in_vol = target_vol - initial_vol;
+                    let current_vol = easer::functions::Quad::ease_out(
+                        current_time,
+                        initial_vol,
+                        change_in_vol,
+                        animation_duration_ms,
+                    );
+
+                    if crate::volume_control::set_volume_for_identifier(&session_id, Some(current_vol), None)
+                        .is_err()
+                    {
+                        log::warn!("[音量缓动任务][ID:{task_id}] 设置音量失败，任务中止。");
+                        break;
+                    }
+                }
+            }
+        }
+
+        if let Ok((final_vol, final_mute)) =
+            crate::volume_control::get_volume_for_identifier(&session_id)
+        {
+            log::debug!("[音量缓动任务][ID:{task_id}] 完成。最终音量: {final_vol:.2}");
+            let _ = connector_tx
+                .send(InternalUpdate::AudioSessionVolumeChanged {
+                    session_id,
+                    volume: final_vol,
+                    is_muted: final_mute,
+                })
+                .await;
+        }
+    } else {
+        log::warn!("[音量缓动任务][ID:{task_id}] 无法获取初始音量，任务中止。");
+    }
+}
+
+pub fn spawn_volume_easing_task(
+    task_id: u64,
+    level: f32,
+    session_id: String,
+    connector_update_tx: TokioSender<InternalUpdate>,
+) -> (JoinHandle<()>, CancellationToken) {
+    let cancel_token = CancellationToken::new();
+    let handle = tokio::task::spawn_local(volume_easing_task(
+        task_id,
+        level,
+        session_id,
+        connector_update_tx,
+        cancel_token.clone(),
+    ));
+    (handle, cancel_token)
+}
 
 /// 通过应用程序的标识符（AUMID 或可执行文件名）获取其音量和静音状态。
 ///

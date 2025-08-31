@@ -13,15 +13,16 @@ use windows::{
     core::Result as WinResult,
 };
 
-use crate::audio_session_monitor::{self, AudioMonitorCommand};
 use crate::{
+    api::SharedPlayerState,
     api::{
         DiagnosticInfo, MediaCommand, MediaUpdate, NowPlayingInfo, SmtcControlCommand,
         SmtcSessionInfo, TextConversionMode,
     },
     audio_capture::AudioCapturer,
+    audio_session_monitor::{self, AudioMonitorCommand},
     error::{Result, SmtcError},
-    smtc_handler::{self, SharedPlayerState},
+    smtc_handler::{self},
 };
 
 /// 在 `MediaWorker` 内部使用的命令，用于控制其子模块。

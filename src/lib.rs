@@ -92,6 +92,7 @@ mod audio_session_monitor;
 mod error;
 mod ffi;
 mod smtc_handler;
+mod tasks;
 mod utils;
 mod volume_control;
 mod worker;

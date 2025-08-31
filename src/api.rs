@@ -72,6 +72,83 @@ pub enum TextConversionMode {
     HongKongToSimplified,
 }
 
+/// SMTC Handler 内部用于聚合和管理当前播放状态的可变结构。
+#[derive(Debug, Clone, Default)]
+pub struct SharedPlayerState {
+    /// 歌曲标题。
+    pub title: String,
+    /// 艺术家。
+    pub artist: String,
+    /// 专辑。
+    pub album: String,
+    /// 歌曲总时长（毫秒）。
+    pub song_duration_ms: u64,
+    /// 上次从 SMTC 获取到的播放位置（毫秒）。
+    pub last_known_position_ms: u64,
+    /// `last_known_position_ms` 被更新时的时间点。
+    pub last_known_position_report_time: Option<Instant>,
+    /// 当前的播放状态。
+    pub playback_status: PlaybackStatus,
+    /// 当前媒体源支持的控制选项。
+    pub controls: Controls,
+    /// 当前是否处于随机播放模式。
+    pub is_shuffle_active: bool,
+    /// 当前的重复播放模式。
+    pub repeat_mode: RepeatMode,
+    pub cover_data: Option<Vec<u8>>,
+    pub cover_data_hash: Option<u64>,
+    /// 一个标志，表示正在等待来自SMTC的第一次更新。
+    /// 在此期间，应暂停进度计时器。
+    pub is_waiting_for_initial_update: bool,
+}
+
+impl SharedPlayerState {
+    /// 将播放状态重置为空白/默认状态。
+    /// 通常在没有活动媒体会话时调用。
+    pub fn reset_to_empty(&mut self) {
+        *self = Self {
+            is_waiting_for_initial_update: true,
+            ..Self::default()
+        };
+    }
+
+    /// 根据上次报告的播放位置和当前时间，估算实时的播放进度。
+    pub fn get_estimated_current_position_ms(&self) -> u64 {
+        if self.playback_status == PlaybackStatus::Playing
+            && let Some(report_time) = self.last_known_position_report_time
+        {
+            let elapsed_ms = report_time.elapsed().as_millis() as u64;
+            let estimated_pos = self.last_known_position_ms + elapsed_ms;
+            // 确保估算的位置不超过歌曲总时长（如果时长有效）
+            if self.song_duration_ms > 0 {
+                return estimated_pos.min(self.song_duration_ms);
+            }
+            return estimated_pos;
+        }
+        self.last_known_position_ms
+    }
+}
+
+/// 实现从内部共享状态到公共 `NowPlayingInfo` 的转换。
+impl From<&SharedPlayerState> for NowPlayingInfo {
+    fn from(state: &SharedPlayerState) -> Self {
+        Self {
+            title: Some(state.title.clone()),
+            artist: Some(state.artist.clone()),
+            album_title: Some(state.album.clone()),
+            duration_ms: Some(state.song_duration_ms),
+            position_ms: Some(state.get_estimated_current_position_ms()),
+            playback_status: Some(state.playback_status),
+            is_shuffle_active: Some(state.is_shuffle_active),
+            repeat_mode: Some(state.repeat_mode),
+            controls: Some(state.controls),
+            cover_data: state.cover_data.clone(),
+            cover_data_hash: state.cover_data_hash,
+            position_report_time: state.last_known_position_report_time,
+        }
+    }
+}
+
 /// 包含当前正在播放曲目所有信息的、唯一的、完整的状态快照。
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct NowPlayingInfo {

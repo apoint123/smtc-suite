@@ -1,7 +1,6 @@
 use std::{future::IntoFuture, sync::Arc, time::Instant};
 
 use chrono::Utc;
-use easer::functions::Easing;
 use ferrous_opencc::{OpenCC, config::BuiltinConfig};
 use tokio::{
     sync::{
@@ -24,21 +23,19 @@ use windows::{
         },
         MediaPlaybackAutoRepeatMode,
     },
-    Storage::Streams::{Buffer, DataReader, IRandomAccessStreamReference, InputStreamOptions},
     Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, TranslateMessage},
     core::{Error as WinError, HSTRING, Result as WinResult},
 };
 
-use windows_core::Interface;
-use windows_future::{IAsyncInfo, IAsyncOperation};
+use windows_future::IAsyncOperation;
 
 use crate::{
     api::{
         Controls, DiagnosticInfo, DiagnosticLevel, NowPlayingInfo, PlaybackStatus, RepeatMode,
-        SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
+        SharedPlayerState, SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
     },
     error::Result,
-    volume_control,
+    tasks, volume_control,
     worker::{InternalCommand, InternalUpdate},
 };
 
@@ -138,98 +135,6 @@ const SMTC_ASYNC_OPERATION_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
 /// 用于在超时发生时手动构造一个错误。
 const E_ABORT_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x8000_4004_u32 as i32);
 
-/// 音量缓动动画的总时长（毫秒）。
-const VOLUME_EASING_DURATION_MS: f32 = 250.0;
-
-/// 音量缓动动画的总步数。
-const VOLUME_EASING_STEPS: u32 = 15;
-
-/// 音量变化小于此阈值时，不执行缓动动画，直接设置最终值。
-const VOLUME_EASING_THRESHOLD: f32 = 0.01;
-
-/// 允许获取的封面图片的最大字节数，防止过大的图片消耗过多内存。
-const MAX_COVER_SIZE_BYTES: usize = 20_971_520; // 20 MB
-
-/// SMTC Handler 内部用于聚合和管理当前播放状态的可变结构。
-///
-/// 这个结构体被一个 `Arc<TokioMutex<...>>` 包裹，在多个异步任务之间安全共享。
-/// “状态管理器 Actor” 任务是唯一有权直接修改此结构体的地方。
-#[derive(Debug, Clone, Default)]
-pub struct SharedPlayerState {
-    /// 歌曲标题。
-    pub title: String,
-    /// 艺术家。
-    pub artist: String,
-    /// 专辑。
-    pub album: String,
-    /// 歌曲总时长（毫秒）。
-    pub song_duration_ms: u64,
-    /// 上次从 SMTC 获取到的播放位置（毫秒）。
-    pub last_known_position_ms: u64,
-    /// `last_known_position_ms` 被更新时的时间点。
-    pub last_known_position_report_time: Option<Instant>,
-    /// 当前的播放状态。
-    pub playback_status: PlaybackStatus,
-    /// 当前媒体源支持的控制选项。
-    pub controls: Controls,
-    /// 当前是否处于随机播放模式。
-    pub is_shuffle_active: bool,
-    /// 当前的重复播放模式。
-    pub repeat_mode: RepeatMode,
-    pub cover_data: Option<Vec<u8>>,
-    pub cover_data_hash: Option<u64>,
-    /// 一个标志，表示正在等待来自SMTC的第一次更新。
-    /// 在此期间，应暂停进度计时器。
-    pub is_waiting_for_initial_update: bool,
-}
-
-impl SharedPlayerState {
-    /// 将播放状态重置为空白/默认状态。
-    /// 通常在没有活动媒体会话时调用。
-    pub fn reset_to_empty(&mut self) {
-        *self = Self {
-            is_waiting_for_initial_update: true,
-            ..Self::default()
-        };
-    }
-
-    /// 根据上次报告的播放位置和当前时间，估算实时的播放进度。
-    pub fn get_estimated_current_position_ms(&self) -> u64 {
-        if self.playback_status == PlaybackStatus::Playing
-            && let Some(report_time) = self.last_known_position_report_time
-        {
-            let elapsed_ms = report_time.elapsed().as_millis() as u64;
-            let estimated_pos = self.last_known_position_ms + elapsed_ms;
-            // 确保估算的位置不超过歌曲总时长（如果时长有效）
-            if self.song_duration_ms > 0 {
-                return estimated_pos.min(self.song_duration_ms);
-            }
-            return estimated_pos;
-        }
-        self.last_known_position_ms
-    }
-}
-
-/// 实现从内部共享状态到公共 `NowPlayingInfo` 的转换。
-impl From<&SharedPlayerState> for NowPlayingInfo {
-    fn from(state: &SharedPlayerState) -> Self {
-        Self {
-            title: Some(state.title.clone()),
-            artist: Some(state.artist.clone()),
-            album_title: Some(state.album.clone()),
-            duration_ms: Some(state.song_duration_ms),
-            position_ms: Some(state.get_estimated_current_position_ms()),
-            playback_status: Some(state.playback_status),
-            is_shuffle_active: Some(state.is_shuffle_active),
-            repeat_mode: Some(state.repeat_mode),
-            controls: Some(state.controls),
-            cover_data: state.cover_data.clone(),
-            cover_data_hash: state.cover_data_hash,
-            position_report_time: state.last_known_position_report_time,
-        }
-    }
-}
-
 /// 将 Windows HSTRING 转换为 Rust String。
 /// 如果 HSTRING 为空或无效，则返回空 String。
 fn hstring_to_string(hstr: &HSTRING) -> String {
@@ -237,41 +142,6 @@ fn hstring_to_string(hstr: &HSTRING) -> String {
         String::new()
     } else {
         hstr.to_string_lossy()
-    }
-}
-
-/// 使用超时来执行一个 `WinRT` 异步操作。
-/// 如果超时，会尝试取消该操作。
-async fn run_winrt_op_with_timeout<F, T>(operation: F) -> WinResult<T>
-where
-    T: windows::core::RuntimeType + 'static,
-    T::Default: 'static,
-    F: IntoFuture<Output = WinResult<T>> + Interface + Clone,
-{
-    match tokio_timeout(
-        SMTC_ASYNC_OPERATION_TIMEOUT,
-        operation.clone().into_future(),
-    )
-    .await
-    {
-        // 异步操作在超时前成功完成
-        Ok(Ok(result)) => Ok(result),
-        // 异步操作在超时前完成，但自身返回了错误
-        Ok(Err(e)) => Err(e),
-        // tokio_timeout 返回超时错误
-        Err(_) => {
-            log::warn!("WinRT 异步操作超时 (>{SMTC_ASYNC_OPERATION_TIMEOUT:?}).");
-
-            if let Ok(async_info) = operation.cast::<IAsyncInfo>() {
-                if let Err(e) = async_info.Cancel() {
-                    log::warn!("取消 WinRT 异步操作失败: {e:?}");
-                }
-            } else {
-                log::warn!("无法将异步操作转换为 IAsyncInfo 来执行取消操作。");
-            }
-
-            Err(WinError::from(E_ABORT_HRESULT))
-        }
     }
 }
 
@@ -404,171 +274,6 @@ fn send_now_playing_update(
     }
 }
 
-/// 从 SMTC 会话中获取封面图片数据。
-async fn fetch_cover_data_task(
-    thumb_ref: IRandomAccessStreamReference,
-    cancel_token: CancellationToken,
-) -> WinResult<Option<Vec<u8>>> {
-    let start_time = Instant::now();
-    log::debug!("[Cover Fetcher] 正在获取封面数据...");
-
-    let result = tokio::select! {
-        biased;
-        () = cancel_token.cancelled() => {
-            log::debug!("[Cover Fetcher] 任务被协作式取消。");
-            return Err(WinError::from(E_ABORT_HRESULT));
-        }
-        res = async {
-            let stream = run_winrt_op_with_timeout(thumb_ref.OpenReadAsync()?).await?;
-            log::debug!("[Cover Fetcher] 成功获取到封面流 (IRandomAccessStreamWithContentType)。");
-
-            let stream_size = stream.Size()?;
-
-            if stream_size == 0 {
-                log::warn!("[Cover Fetcher] 未能获取到封面（流大小为0）。");
-                return Ok(None);
-            }
-            if stream_size > MAX_COVER_SIZE_BYTES as u64 {
-                log::warn!(
-                    "[Cover Fetcher] 封面数据 ({stream_size} 字节) 超出最大限制 ({MAX_COVER_SIZE_BYTES} 字节)，已丢弃。"
-                );
-                return Ok(None);
-            }
-
-            let buffer = Buffer::Create(stream_size as u32)?;
-
-            let read_operation = stream.ReadAsync(&buffer, buffer.Capacity()?, InputStreamOptions::None)?;
-            let bytes_buffer = run_winrt_op_with_timeout(read_operation).await?;
-
-            let reader = DataReader::FromBuffer(&bytes_buffer)?;
-            let mut bytes = vec![0u8; bytes_buffer.Length()? as usize];
-            reader.ReadBytes(&mut bytes)?;
-            Ok(Some(bytes))
-        } => res
-    };
-
-    match &result {
-        Ok(Some(bytes)) => {
-            log::debug!(
-                "[Cover Fetcher] 获取到 {} 字节的封面数据。总耗时: {:?}",
-                bytes.len(),
-                start_time.elapsed()
-            );
-        }
-        Ok(None) => {
-            log::debug!(
-                "[Cover Fetcher] 任务成功完成，但无有效封面数据。总耗时: {:?}",
-                start_time.elapsed()
-            );
-        }
-        Err(e) => {
-            log::warn!(
-                "[Cover Fetcher] 任务失败: {e:?}, 总耗时: {:?}",
-                start_time.elapsed()
-            );
-        }
-    }
-
-    result
-}
-
-/// 一个独立的任务，用于平滑地调整指定进程的音量
-async fn volume_easing_task(
-    task_id: u64,
-    target_vol: f32,
-    session_id: String,
-    connector_tx: TokioSender<InternalUpdate>,
-    cancel_token: CancellationToken,
-) {
-    log::debug!(
-        "[音量缓动任务][ID:{task_id}] 启动。目标音量: {target_vol:.2}，会话: '{session_id}'"
-    );
-
-    if let Ok((initial_vol, _)) = volume_control::get_volume_for_identifier(&session_id) {
-        if (target_vol - initial_vol).abs() < VOLUME_EASING_THRESHOLD {
-            let _ = volume_control::set_volume_for_identifier(&session_id, Some(target_vol), None);
-            return;
-        }
-
-        log::trace!("[音量缓动任务][ID:{task_id}] 初始音量: {initial_vol:.2}");
-        let animation_duration_ms = VOLUME_EASING_DURATION_MS;
-        let steps = VOLUME_EASING_STEPS;
-        let step_duration =
-            TokioDuration::from_millis((animation_duration_ms / steps as f32) as u64);
-
-        for s in 0..=steps {
-            tokio::select! {
-                biased;
-                () = cancel_token.cancelled() => {
-                    log::debug!("[音量缓动任务][ID:{task_id}] 任务被取消。");
-                    break;
-                }
-                () = tokio::time::sleep(step_duration) => {
-                    let current_time = (s as f32 / steps as f32) * animation_duration_ms;
-                    let change_in_vol = target_vol - initial_vol;
-                    let current_vol = easer::functions::Quad::ease_out(
-                        current_time,
-                        initial_vol,
-                        change_in_vol,
-                        animation_duration_ms,
-                    );
-
-                    if volume_control::set_volume_for_identifier(&session_id, Some(current_vol), None)
-                        .is_err()
-                    {
-                        log::warn!("[音量缓动任务][ID:{task_id}] 设置音量失败，任务中止。");
-                        break;
-                    }
-                }
-            }
-        }
-
-        if let Ok((final_vol, final_mute)) = volume_control::get_volume_for_identifier(&session_id)
-        {
-            log::debug!("[音量缓动任务][ID:{task_id}] 完成。最终音量: {final_vol:.2}");
-            let _ = connector_tx
-                .send(InternalUpdate::AudioSessionVolumeChanged {
-                    session_id,
-                    volume: final_vol,
-                    is_muted: final_mute,
-                })
-                .await;
-        }
-    } else {
-        log::warn!("[音量缓动任务][ID:{task_id}] 无法获取初始音量，任务中止。");
-    }
-}
-
-/// 一个独立的任务，用于定期计算并发送估算的播放进度。
-async fn progress_timer_task(
-    player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
-    progress_signal_tx: tokio::sync::mpsc::Sender<()>,
-    cancel_token: CancellationToken,
-) {
-    log::debug!("[Timer] 任务已启动。");
-    let mut interval = tokio::time::interval(TokioDuration::from_millis(100));
-
-    loop {
-        tokio::select! {
-            () = cancel_token.cancelled() => {
-                break;
-            }
-            _ = interval.tick() => {
-                let state_guard = player_state_arc.lock().await;
-
-                if state_guard.playback_status == PlaybackStatus::Playing
-                    && !state_guard.is_waiting_for_initial_update
-                    && progress_signal_tx.send(()).await.is_err()
-                {
-                    log::warn!("[Timer] 无法发送进度更新信号，主事件循环可能已关闭。任务退出。");
-                    break;
-                }
-            }
-        }
-    }
-    log::debug!("[Timer] 任务已结束。");
-}
-
 /// `SmtcRunner` 封装了 SMTC 事件循环的所有状态和逻辑。
 struct SmtcRunner {
     /// 内部状态，如 `session_guard`, `text_converter` 等。
@@ -622,25 +327,23 @@ impl SmtcControlCommand {
                     let session_id_str = hstring_to_string(&id_hstr);
                     if !session_id_str.is_empty() {
                         if let Some((old_task, old_token)) =
-                            &context.active_volume_easing_task.take()
+                            context.active_volume_easing_task.take()
                         {
                             old_token.cancel();
                             // 启动一个分离的任务来等待旧任务结束，避免阻塞主循环
                             tokio::task::spawn_local(async move {
-                                let _ = old_task;
+                                let _ = old_task.await;
                             });
                         }
-                        let cancel_token = CancellationToken::new();
                         let task_id = context
                             .next_easing_task_id
                             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let handle = tokio::task::spawn_local(volume_easing_task(
+                        let (handle, cancel_token) = volume_control::spawn_volume_easing_task(
                             task_id,
                             level,
                             session_id_str,
                             context.connector_update_tx.clone(),
-                            cancel_token.clone(),
-                        ));
+                        );
                         *context.active_volume_easing_task = Some((handle, cancel_token));
                     }
                 }
@@ -811,7 +514,7 @@ impl SmtcRunner {
                     if self.state.active_progress_timer_task.is_none() {
                         log::info!("[SmtcRunner] 启用进度计时器。");
                         let cancel_token = CancellationToken::new();
-                        let handle = tokio::task::spawn_local(progress_timer_task(
+                        let handle = tokio::task::spawn_local(tasks::progress_timer_task(
                             self.player_state_arc.clone(),
                             progress_signal_tx.clone(),
                             cancel_token.clone(),
@@ -1201,7 +904,7 @@ impl SmtcRunner {
                 let token_for_task = cancel_token.clone();
 
                 let cover_task = tokio::task::spawn_local(async move {
-                    let result = fetch_cover_data_task(thumb_ref, token_for_task).await;
+                    let result = tasks::fetch_cover_data_task(thumb_ref, token_for_task).await;
                     if async_result_tx_clone
                         .send(AsyncTaskResult::CoverDataReady(result))
                         .await
