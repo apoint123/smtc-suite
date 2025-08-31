@@ -186,8 +186,8 @@ pub struct AudioCapturer {
 }
 
 impl AudioCapturer {
-    pub fn new() -> Self {
-        AudioCapturer {
+    pub const fn new() -> Self {
+        Self {
             capture_thread_handle: None,
             stop_event: None,
         }

@@ -29,7 +29,7 @@ use crate::{
 /// 这个枚举定义了 `MediaWorker` 与其管理的后台任务（如 `smtc_handler`）之间的通信协议。
 /// 它将来自外部公共 API (`MediaCommand`) 的意图，转换为内部模块可以理解的具体指令。
 #[derive(Debug, Clone)]
-pub(crate) enum InternalCommand {
+pub enum InternalCommand {
     /// 指示 `smtc_handler` 切换到指定的媒体会话。
     SelectSmtcSession(String),
     /// 向 `smtc_handler` 转发一个媒体控制指令（如播放、暂停等）。
@@ -47,7 +47,7 @@ pub(crate) enum InternalCommand {
 /// 这个枚举代表了所有子模块可能产生的事件，`MediaWorker` 的主事件循环会监听这些事件，
 /// 然后将它们转换为外部可见的 `MediaUpdate`。
 #[derive(Debug, Clone)]
-pub(crate) enum InternalUpdate {
+pub enum InternalUpdate {
     /// 由 `smtc_handler` 发出，表示活动的 SMTC 会话已更改。
     ActiveSmtcSessionChanged { pid: Option<u32> },
     /// 由 `audio_session_monitor` 的回调发出，表示被监听的会话已失效（如关闭、崩溃）。
@@ -68,7 +68,7 @@ pub(crate) enum InternalUpdate {
     },
 }
 
-pub(crate) struct MediaWorker {
+pub struct MediaWorker {
     command_rx: TokioReceiver<MediaCommand>,
     update_tx: TokioSender<MediaUpdate>,
     smtc_control_tx: Option<TokioSender<InternalCommand>>,
@@ -149,7 +149,7 @@ impl MediaWorker {
 
                 Some(command) = self.command_rx.recv() => {
                     log::trace!("[MediaWorker] 收到外部命令: {command:?}");
-                    if let MediaCommand::Shutdown = command {
+                    if matches!(command, MediaCommand::Shutdown) {
                         log::debug!("[MediaWorker] 收到外部关闭命令，准备退出...");
                         break;
                     }
@@ -234,14 +234,12 @@ impl MediaWorker {
         }
     }
 
-    async fn handle_internal_update(&mut self, internal_update: InternalUpdate, source: &str) {
+    async fn handle_internal_update(&self, internal_update: InternalUpdate, source: &str) {
         match internal_update {
             InternalUpdate::ActiveSmtcSessionChanged { pid } => {
-                let command = if let Some(pid_val) = pid {
+                let command = pid.map_or(AudioMonitorCommand::StopMonitoring, |pid_val| {
                     AudioMonitorCommand::StartMonitoring(pid_val)
-                } else {
-                    AudioMonitorCommand::StopMonitoring
-                };
+                });
                 if let Some(tx) = &self.audio_monitor_command_tx
                     && tx.send(command).await.is_err()
                 {
@@ -353,7 +351,7 @@ pub fn start_media_worker_thread(
             impl ComGuard {
                 fn new() -> WinResult<Self> {
                     unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
-                    Ok(ComGuard)
+                    Ok(Self)
                 }
             }
             impl Drop for ComGuard {
@@ -385,27 +383,28 @@ pub fn start_media_worker_thread(
         .map_err(|e| SmtcError::WorkerThread(e.to_string()))
 }
 
+#[allow(clippy::fallible_impl_from)]
 impl From<InternalUpdate> for MediaUpdate {
     fn from(internal: InternalUpdate) -> Self {
         match internal {
-            InternalUpdate::SmtcSessionListChanged(list) => MediaUpdate::SessionsChanged(list),
-            InternalUpdate::AudioDataPacket(bytes) => MediaUpdate::AudioData(bytes),
+            InternalUpdate::SmtcSessionListChanged(list) => Self::SessionsChanged(list),
+            InternalUpdate::AudioDataPacket(bytes) => Self::AudioData(bytes),
             InternalUpdate::AudioSessionVolumeChanged {
                 session_id,
                 volume,
                 is_muted,
-            } => MediaUpdate::VolumeChanged {
+            } => Self::VolumeChanged {
                 session_id,
                 volume,
                 is_muted,
             },
             InternalUpdate::SelectedSmtcSessionVanished(session_id) => {
-                MediaUpdate::SelectedSessionVanished(session_id)
+                Self::SelectedSessionVanished(session_id)
             }
-            InternalUpdate::AudioCaptureError(err) => MediaUpdate::Error(err),
+            InternalUpdate::AudioCaptureError(err) => Self::Error(err),
             // 内部事件已在上层处理，理论上不应该到达这里
             _ => {
-                panic!("尝试将一个内部事件 ({:?}) 转换为公共更新。", internal)
+                panic!("尝试将一个内部事件 ({internal:?}) 转换为公共更新。")
             }
         }
     }

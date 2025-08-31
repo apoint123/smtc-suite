@@ -1,3 +1,6 @@
+#![allow(clippy::ref_as_ptr)]
+#![allow(clippy::inline_always)]
+
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
@@ -61,7 +64,7 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
     }
     fn OnStateChanged(&self, new_state: AudioSessionState) -> windows::core::Result<()> {
         if new_state != AudioSessionStateActive {
-            log::debug!("[音量监听器] 会话状态变为非活跃 ({:?})", new_state);
+            log::debug!("[音量监听器] 会话状态变为非活跃 ({new_state:?})");
             if let Ok(guard) = self.tx.lock()
                 && let Some(tx) = guard.as_ref()
             {
@@ -74,7 +77,7 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
         &self,
         disconnect_reason: windows::Win32::Media::Audio::AudioSessionDisconnectReason,
     ) -> windows::core::Result<()> {
-        log::debug!("[音量监听器] 会话断开 ({:?})", disconnect_reason);
+        log::debug!("[音量监听器] 会话断开 ({disconnect_reason:?})");
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
         {
@@ -97,7 +100,7 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
                 is_muted: bNewMute.as_bool(),
             };
             if let Err(e) = tx.try_send(update) {
-                log::warn!("[音量监听器] 发送音量更新失败: {}", e);
+                log::warn!("[音量监听器] 发送音量更新失败: {e}");
             }
         }
         Ok(())
@@ -112,7 +115,7 @@ pub struct AudioSessionMonitor {
 }
 
 impl AudioSessionMonitor {
-    pub fn new(
+    pub const fn new(
         command_rx: TokioReceiver<AudioMonitorCommand>,
         update_tx: TokioSender<InternalUpdate>,
     ) -> Self {
@@ -129,7 +132,7 @@ impl AudioSessionMonitor {
             tokio::select! {
                 Some(command) = self.command_rx.recv() => {
                     if let Err(e) = self.handle_command(command).await {
-                        log::error!("[音量监听器] 处理命令失败: {:?}", e);
+                        log::error!("[音量监听器] 处理命令失败: {e:?}");
                     }
                 }
                 else => {
@@ -138,7 +141,7 @@ impl AudioSessionMonitor {
             }
         }
         if let Err(e) = self.stop_monitoring_internal() {
-            log::warn!("[音量监听器] 退出时注销回调失败: {:?}", e);
+            log::warn!("[音量监听器] 退出时注销回调失败: {e:?}");
         }
     }
 

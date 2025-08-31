@@ -1,4 +1,4 @@
-use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo};
+use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo, PlaybackStatus};
 use std::time::Duration;
 
 /// 解析 Apple Music 发送的 "艺术家 — 专辑" 复合字段。
@@ -18,7 +18,7 @@ fn parse_combined_artist_album_info(mut info: NowPlayingInfo) -> NowPlayingInfo 
 
 /// 重新计算并获取最新的估算播放位置（毫秒）。
 fn get_estimated_pos(info: &NowPlayingInfo) -> Option<u64> {
-    if info.is_playing.unwrap_or(false)
+    if info.playback_status == Some(PlaybackStatus::Playing)
         && let (Some(last_pos_ms), Some(report_time)) =
             (info.position_ms, info.position_report_time)
     {
@@ -59,7 +59,7 @@ fn log_smtc_status(info: &NowPlayingInfo) {
         estimated_pos_ms,
         info.position_ms.unwrap_or(0),
         elapsed_since_report,
-        info.is_playing.unwrap_or(false),
+        info.playback_status == Some(PlaybackStatus::Playing),
         duration_ms
     );
 }
@@ -142,7 +142,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 分支 2: 每 500ms 触发一次，用于定时刷新状态日志
             _ = interval.tick() => {
                 if let Some(info) = &last_known_info
-                    && info.is_playing.unwrap_or(false) {
+                    && info.playback_status == Some(PlaybackStatus::Playing)
+                {
                         log_smtc_status(info);
                     }
             }

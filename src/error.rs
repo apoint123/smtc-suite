@@ -64,7 +64,7 @@ pub enum SmtcError {
 
 impl<T> From<std::sync::PoisonError<T>> for SmtcError {
     fn from(err: std::sync::PoisonError<T>) -> Self {
-        SmtcError::MutexPoisoned(err.to_string())
+        Self::MutexPoisoned(err.to_string())
     }
 }
 

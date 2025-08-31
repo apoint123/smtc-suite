@@ -97,8 +97,8 @@ mod volume_control;
 mod worker;
 
 pub use api::{
-    MediaCommand, MediaController, MediaUpdate, NowPlayingInfo, RepeatMode, SmtcControlCommand,
-    SmtcSessionInfo, TextConversionMode,
+    Controls, MediaCommand, MediaController, MediaUpdate, NowPlayingInfo, PlaybackStatus,
+    RepeatMode, SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
 };
 pub use error::{Result, SmtcError};
 
@@ -123,12 +123,13 @@ impl MediaManager {
     ///   - `update_rx`: 一个 `mpsc::Receiver<MediaUpdate>`，用于接收所有事件和状态更新。
     /// - `Err(SmtcError)`: 如果在启动过程中发生严重错误，或服务已在运行。
     pub fn start() -> Result<(MediaController, mpsc::Receiver<MediaUpdate>)> {
-        let mut handle_guard = WORKER_HANDLE.lock()?;
-
-        if let Some(handle) = handle_guard.as_ref()
-            && !handle.is_finished()
         {
-            return Err(SmtcError::AlreadyRunning);
+            let handle_guard = WORKER_HANDLE.lock()?;
+            if let Some(handle) = handle_guard.as_ref()
+                && !handle.is_finished()
+            {
+                return Err(SmtcError::AlreadyRunning);
+            }
         }
 
         let (command_tx, command_rx) = mpsc::channel::<MediaCommand>(32);
@@ -138,7 +139,10 @@ impl MediaManager {
 
         let controller = MediaController { command_tx };
 
-        *handle_guard = Some(new_handle);
+        {
+            let mut handle_guard = WORKER_HANDLE.lock()?;
+            *handle_guard = Some(new_handle);
+        }
 
         Ok((controller, update_rx))
     }

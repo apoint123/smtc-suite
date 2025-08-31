@@ -1,4 +1,4 @@
-use smtc_suite::{MediaManager, MediaUpdate, NowPlayingInfo, RepeatMode};
+use smtc_suite::{Controls, MediaManager, MediaUpdate, NowPlayingInfo, PlaybackStatus, RepeatMode};
 use std::time::Duration;
 
 fn parse_combined_artist_album_info(mut info: NowPlayingInfo) -> NowPlayingInfo {
@@ -16,7 +16,7 @@ fn parse_combined_artist_album_info(mut info: NowPlayingInfo) -> NowPlayingInfo 
 }
 
 fn get_estimated_pos(info: &NowPlayingInfo) -> Option<u64> {
-    if info.is_playing.unwrap_or(false)
+    if info.playback_status == Some(PlaybackStatus::Playing)
         && let (Some(last_pos_ms), Some(report_time)) =
             (info.position_ms, info.position_report_time)
     {
@@ -41,23 +41,18 @@ fn ms_to_hms(ms: u64) -> String {
 }
 
 fn controls_status(info: &NowPlayingInfo) {
-    let to_symbol = |flag: Option<bool>| {
-        if flag.unwrap_or(false) {
-            "True"
-        } else {
-            "False"
-        }
-    };
+    let to_symbol = |flag: bool| if flag { "True" } else { "False" };
+    let controls = info.controls.unwrap_or_default();
 
     log::info!(
         "可用操作: [播放: {}], [暂停: {}], [上一首: {}], [下一首: {}], [跳转: {}], [随机: {}], [循环: {}]",
-        to_symbol(info.can_play),
-        to_symbol(info.can_pause),
-        to_symbol(info.can_skip_previous),
-        to_symbol(info.can_skip_next),
-        to_symbol(info.can_seek),
-        to_symbol(info.can_change_shuffle),
-        to_symbol(info.can_change_repeat)
+        to_symbol(controls.contains(Controls::CAN_PLAY)),
+        to_symbol(controls.contains(Controls::CAN_PAUSE)),
+        to_symbol(controls.contains(Controls::CAN_SKIP_PREVIOUS)),
+        to_symbol(controls.contains(Controls::CAN_SKIP_NEXT)),
+        to_symbol(controls.contains(Controls::CAN_SEEK)),
+        to_symbol(controls.contains(Controls::CAN_CHANGE_SHUFFLE)),
+        to_symbol(controls.contains(Controls::CAN_CHANGE_REPEAT))
     );
 }
 
@@ -73,10 +68,10 @@ fn timeline_status(info: &NowPlayingInfo) {
 }
 
 fn log_playback_status(info: &NowPlayingInfo) {
-    let play_state = if info.is_playing.unwrap_or(false) {
-        "正在播放"
-    } else {
-        "已暂停"
+    let play_state = match info.playback_status {
+        Some(PlaybackStatus::Playing) => "正在播放",
+        Some(PlaybackStatus::Paused) => "已暂停",
+        _ => "已停止",
     };
     let shuffle_state = if info.is_shuffle_active.unwrap_or(false) {
         "True"
@@ -110,21 +105,13 @@ fn handle_track_changed(
     };
 
     let has_controls_changed = match last_known_info {
-        Some(last) => {
-            last.can_play != new_info.can_play
-                || last.can_pause != new_info.can_pause
-                || last.can_skip_next != new_info.can_skip_next
-                || last.can_skip_previous != new_info.can_skip_previous
-                || last.can_seek != new_info.can_seek
-                || last.can_change_shuffle != new_info.can_change_shuffle
-                || last.can_change_repeat != new_info.can_change_repeat
-        }
+        Some(last) => last.controls != new_info.controls,
         None => true,
     };
 
     let has_playback_state_changed = match last_known_info {
         Some(last) => {
-            last.is_playing != new_info.is_playing
+            last.playback_status != new_info.playback_status
                 || last.is_shuffle_active != new_info.is_shuffle_active
                 || last.repeat_mode != new_info.repeat_mode
         }
@@ -199,7 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // 分支 2: 定时器触发，用于更新时间线
             _ = interval.tick() => {
                 if let Some(info) = &last_known_info
-                    && info.is_playing.unwrap_or(false) {
+                    && info.playback_status == Some(PlaybackStatus::Playing)
+                {
                         timeline_status(info);
                     }
             }

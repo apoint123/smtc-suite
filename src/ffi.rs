@@ -202,11 +202,11 @@ pub enum CLogLevel {
 impl From<CLogLevel> for LevelFilter {
     fn from(level: CLogLevel) -> Self {
         match level {
-            CLogLevel::Error => LevelFilter::Error,
-            CLogLevel::Warn => LevelFilter::Warn,
-            CLogLevel::Info => LevelFilter::Info,
-            CLogLevel::Debug => LevelFilter::Debug,
-            CLogLevel::Trace => LevelFilter::Trace,
+            CLogLevel::Error => Self::Error,
+            CLogLevel::Warn => Self::Warn,
+            CLogLevel::Info => Self::Info,
+            CLogLevel::Debug => Self::Debug,
+            CLogLevel::Trace => Self::Trace,
         }
     }
 }
@@ -214,11 +214,11 @@ impl From<CLogLevel> for LevelFilter {
 impl From<Level> for CLogLevel {
     fn from(level: Level) -> Self {
         match level {
-            Level::Error => CLogLevel::Error,
-            Level::Warn => CLogLevel::Warn,
-            Level::Info => CLogLevel::Info,
-            Level::Debug => CLogLevel::Debug,
-            Level::Trace => CLogLevel::Trace,
+            Level::Error => Self::Error,
+            Level::Warn => Self::Warn,
+            Level::Info => Self::Info,
+            Level::Debug => Self::Debug,
+            Level::Trace => Self::Trace,
         }
     }
 }
@@ -588,7 +588,7 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
 /// # 安全性
 /// 导出此函数是安全的，因为它不接受任何输入并返回一个静态的、常量的数据。
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
+pub const unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0")
         .as_ptr()
         .cast::<c_char>()
@@ -622,11 +622,12 @@ pub unsafe extern "C" fn smtc_suite_request_update(handle_ptr: *mut SmtcHandle) 
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller {
-        handle_try_send_result(controller.command_tx.try_send(MediaCommand::RequestUpdate))
-    } else {
-        SmtcResult::InvalidHandle
-    }
+    handle
+        .controller
+        .as_ref()
+        .map_or(SmtcResult::InvalidHandle, |controller| {
+            handle_try_send_result(controller.command_tx.try_send(MediaCommand::RequestUpdate))
+        })
 }
 
 /// 向 SMTC 套件发送一个媒体控制命令。
@@ -701,15 +702,16 @@ pub unsafe extern "C" fn smtc_suite_set_high_frequency_progress_updates(
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller {
-        handle_try_send_result(
-            controller
-                .command_tx
-                .try_send(MediaCommand::SetHighFrequencyProgressUpdates(enabled)),
-        )
-    } else {
-        SmtcResult::InvalidHandle
-    }
+    handle
+        .controller
+        .as_ref()
+        .map_or(SmtcResult::InvalidHandle, |controller| {
+            handle_try_send_result(
+                controller
+                    .command_tx
+                    .try_send(MediaCommand::SetHighFrequencyProgressUpdates(enabled)),
+            )
+        })
 }
 
 /// 选择一个 SMTC 会话进行监控。
@@ -764,13 +766,14 @@ pub unsafe extern "C" fn smtc_suite_set_text_conversion_mode(
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller {
-        let rust_mode = crate::api::TextConversionMode::from(mode);
-        let command = MediaCommand::SetTextConversion(rust_mode);
-        handle_try_send_result(controller.command_tx.try_send(command))
-    } else {
-        SmtcResult::InvalidHandle
-    }
+    handle
+        .controller
+        .as_ref()
+        .map_or(SmtcResult::InvalidHandle, |controller| {
+            let rust_mode = crate::api::TextConversionMode::from(mode);
+            let command = MediaCommand::SetTextConversion(rust_mode);
+            handle_try_send_result(controller.command_tx.try_send(command))
+        })
 }
 
 /// 请求开始音频捕获。
@@ -783,15 +786,16 @@ pub unsafe extern "C" fn smtc_suite_start_audio_capture(handle_ptr: *mut SmtcHan
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller {
-        handle_try_send_result(
-            controller
-                .command_tx
-                .try_send(MediaCommand::StartAudioCapture),
-        )
-    } else {
-        SmtcResult::InvalidHandle
-    }
+    handle
+        .controller
+        .as_ref()
+        .map_or(SmtcResult::InvalidHandle, |controller| {
+            handle_try_send_result(
+                controller
+                    .command_tx
+                    .try_send(MediaCommand::StartAudioCapture),
+            )
+        })
 }
 
 /// 请求停止音频捕获。
@@ -804,15 +808,16 @@ pub unsafe extern "C" fn smtc_suite_stop_audio_capture(handle_ptr: *mut SmtcHand
     validate_handle!(handle_ptr);
     let handle = unsafe { &*handle_ptr };
 
-    if let Some(controller) = &handle.controller {
-        handle_try_send_result(
-            controller
-                .command_tx
-                .try_send(MediaCommand::StopAudioCapture),
-        )
-    } else {
-        SmtcResult::InvalidHandle
-    }
+    handle
+        .controller
+        .as_ref()
+        .map_or(SmtcResult::InvalidHandle, |controller| {
+            handle_try_send_result(
+                controller
+                    .command_tx
+                    .try_send(MediaCommand::StopAudioCapture),
+            )
+        })
 }
 
 /// 初始化日志系统，并将所有日志消息重定向到指定的 C 回调函数。
@@ -1040,7 +1045,7 @@ fn convert_to_c_now_playing_info(info: &NowPlayingInfo) -> CNowPlayingInfo {
         album_title: to_c_char(info.album_title.as_deref().unwrap_or("")),
         duration_ms: info.duration_ms.unwrap_or(0),
         position_ms: info.position_ms.unwrap_or(0),
-        is_playing: info.is_playing.unwrap_or(false),
+        is_playing: info.playback_status == Some(crate::api::PlaybackStatus::Playing),
     }
 }
 

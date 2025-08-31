@@ -14,13 +14,7 @@ pub fn convert_text(text: &str, converter: Option<&OpenCC>) -> String {
         return String::new();
     }
 
-    if let Some(converter) = converter {
-        // 使用传入的转换器实例进行转换
-        converter.convert(text)
-    } else {
-        // 如果没有提供转换器，直接返回原文
-        text.to_string()
-    }
+    converter.map_or_else(|| text.to_string(), |converter| converter.convert(text))
 }
 
 /// 从 SMTC 会话 ID（通常是 AUMID 或可执行文件名）中提取一个更易读的显示名称。

@@ -1,9 +1,44 @@
+use bitflags::bitflags;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::time::Instant;
 use tokio::sync::mpsc;
 
 use crate::error::{Result, SmtcError};
+
+bitflags! {
+    /// 当前可用的控制操作
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+    #[serde(transparent)]
+    pub struct Controls: u8 {
+        /// 是否可以播放
+        const CAN_PLAY            = 1 << 0;
+        /// 是否可以暂停
+        const CAN_PAUSE           = 1 << 1;
+        /// 是否可以跳到下一首
+        const CAN_SKIP_NEXT       = 1 << 2;
+        /// 是否可以跳到上一首
+        const CAN_SKIP_PREVIOUS   = 1 << 3;
+        /// 是否可以跳转进度
+        const CAN_SEEK            = 1 << 4;
+        /// 是否可以改变随机播放模式
+        const CAN_CHANGE_SHUFFLE  = 1 << 5;
+        /// 是否可以改变重复播放模式
+        const CAN_CHANGE_REPEAT   = 1 << 6;
+    }
+}
+
+/// 播放状态
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum PlaybackStatus {
+    #[default]
+    /// 已停止
+    Stopped,
+    /// 播放中
+    Playing,
+    /// 已暂停
+    Paused,
+}
 
 /// 定义重复播放模式的枚举。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
@@ -38,7 +73,7 @@ pub enum TextConversionMode {
 }
 
 /// 包含当前正在播放曲目所有信息的、唯一的、完整的状态快照。
-#[derive(Debug, Clone, Default, PartialEq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct NowPlayingInfo {
     /// 曲目标题。
     pub title: Option<String>,
@@ -50,58 +85,39 @@ pub struct NowPlayingInfo {
     /// 曲目总时长（毫秒）。
     pub duration_ms: Option<u64>,
     /// 当前播放位置（毫秒）。
-    ///
-    /// 这是一个估算值，结合了 SMTC 上次报告的位置和自那时起经过的时间，
-    /// 以便在没有高频事件时也能提供相对平滑的进度。
     pub position_ms: Option<u64>,
 
-    /// 当前是否正在播放。
-    pub is_playing: Option<bool>,
+    /// 当前的播放状态。
+    pub playback_status: Option<PlaybackStatus>,
     /// 当前是否处于随机播放模式。
     pub is_shuffle_active: Option<bool>,
     /// 当前的重复播放模式。
     pub repeat_mode: Option<RepeatMode>,
-
-    /// 指示媒体源当前是否允许“播放”操作。
-    pub can_play: Option<bool>,
-    /// 指示媒体源当前是否允许“暂停”操作。
-    pub can_pause: Option<bool>,
-    /// 指示媒体源当前是否允许“下一首”操作。
-    pub can_skip_next: Option<bool>,
-    /// 指示媒体源当前是否允许“上一首”操作。
-    pub can_skip_previous: Option<bool>,
-    /// 指示媒体源当前是否允许“跳转”操作。
-    pub can_seek: Option<bool>,
-    /// 指示媒体源当前是否允许切换“随机播放”模式。
-    pub can_change_shuffle: Option<bool>,
-    /// 指示媒体源当前是否允许切换“循环”模式。
-    pub can_change_repeat: Option<bool>,
-
+    /// 当前媒体源支持的控制选项。
+    pub controls: Option<Controls>,
     /// 封面图片的原始字节数据 (`Vec<u8>`)。
     #[serde(skip)]
     pub cover_data: Option<Vec<u8>>,
     /// 封面数据的哈希值。
-    ///
-    /// 可用于快速比较封面是否已更改。
     #[serde(skip)]
     pub cover_data_hash: Option<u64>,
 
-    /// (内部使用) SMTC 上次报告播放位置的时间点。
+    /// SMTC 上次报告播放位置的时间点。
     #[serde(skip)]
     pub position_report_time: Option<Instant>,
 }
 
 impl NowPlayingInfo {
     /// 用另一份 `NowPlayingInfo` 的非 None 字段更新自身
-    pub fn update_with(&mut self, other: &NowPlayingInfo) {
+    pub fn update_with(&mut self, other: &Self) {
         if let Some(pos) = other.position_ms {
             self.position_ms = Some(pos);
         }
         if let Some(time) = other.position_report_time {
             self.position_report_time = Some(time);
         }
-        if let Some(playing) = other.is_playing {
-            self.is_playing = Some(playing);
+        if let Some(status) = other.playback_status {
+            self.playback_status = Some(status);
         }
         if let Some(duration) = other.duration_ms {
             self.duration_ms = Some(duration);
@@ -111,6 +127,9 @@ impl NowPlayingInfo {
         }
         if let Some(repeat) = other.repeat_mode {
             self.repeat_mode = Some(repeat);
+        }
+        if let Some(controls) = other.controls {
+            self.controls = Some(controls);
         }
         if let Some(cover) = other.cover_data.clone() {
             self.cover_data = Some(cover);
@@ -224,9 +243,9 @@ pub enum CTextConversionMode {
 impl From<CRepeatMode> for RepeatMode {
     fn from(c_mode: CRepeatMode) -> Self {
         match c_mode {
-            CRepeatMode::Off => RepeatMode::Off,
-            CRepeatMode::One => RepeatMode::One,
-            CRepeatMode::All => RepeatMode::All,
+            CRepeatMode::Off => Self::Off,
+            CRepeatMode::One => Self::One,
+            CRepeatMode::All => Self::All,
         }
     }
 }
@@ -234,17 +253,13 @@ impl From<CRepeatMode> for RepeatMode {
 impl From<CTextConversionMode> for TextConversionMode {
     fn from(c_mode: CTextConversionMode) -> Self {
         match c_mode {
-            CTextConversionMode::Off => TextConversionMode::Off,
-            CTextConversionMode::TraditionalToSimplified => {
-                TextConversionMode::TraditionalToSimplified
-            }
-            CTextConversionMode::SimplifiedToTraditional => {
-                TextConversionMode::SimplifiedToTraditional
-            }
-            CTextConversionMode::SimplifiedToTaiwan => TextConversionMode::SimplifiedToTaiwan,
-            CTextConversionMode::TaiwanToSimplified => TextConversionMode::TaiwanToSimplified,
-            CTextConversionMode::SimplifiedToHongKong => TextConversionMode::SimplifiedToHongKong,
-            CTextConversionMode::HongKongToSimplified => TextConversionMode::HongKongToSimplified,
+            CTextConversionMode::Off => Self::Off,
+            CTextConversionMode::TraditionalToSimplified => Self::TraditionalToSimplified,
+            CTextConversionMode::SimplifiedToTraditional => Self::SimplifiedToTraditional,
+            CTextConversionMode::SimplifiedToTaiwan => Self::SimplifiedToTaiwan,
+            CTextConversionMode::TaiwanToSimplified => Self::TaiwanToSimplified,
+            CTextConversionMode::SimplifiedToHongKong => Self::SimplifiedToHongKong,
+            CTextConversionMode::HongKongToSimplified => Self::HongKongToSimplified,
         }
     }
 }

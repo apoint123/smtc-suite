@@ -66,10 +66,11 @@ pub fn set_volume_for_identifier(
     unsafe {
         if let Some(vol) = volume_level {
             // GUID::default() 表示此音量变化事件的上下文为通用，没有特定的事件源。
-            simple_audio_volume.SetMasterVolume(vol.clamp(0.0, 1.0), &Default::default())?;
+            simple_audio_volume
+                .SetMasterVolume(vol.clamp(0.0, 1.0), &windows_core::GUID::default())?;
         }
         if let Some(m) = mute {
-            simple_audio_volume.SetMute(m, &Default::default())?;
+            simple_audio_volume.SetMute(m, &windows_core::GUID::default())?;
         }
     }
     Ok(())
@@ -168,10 +169,9 @@ fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSession
                             .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
                         _ => String::new(),
                     };
-                    let session_id = match session_control2.GetSessionIdentifier() {
-                        Ok(s) => s.to_string().unwrap_or_default(),
-                        Err(_) => String::new(),
-                    };
+                    let session_id = session_control2
+                        .GetSessionIdentifier()
+                        .map_or_else(|_| String::new(), |s| s.to_string().unwrap_or_default());
                     let icon_path = match session_control2.GetIconPath() {
                         Ok(s) if !s.is_null() => s
                             .to_string()
