@@ -432,104 +432,149 @@ impl SmtcRunner {
         async_result_tx: &TokioSender<AsyncTaskResult>,
         progress_signal_tx: &TokioSender<()>,
     ) -> WinResult<()> {
-        log::debug!("[SmtcRunner] 收到外部命令: {command:?}");
+        log::debug!("[SmtcRunner] 收到命令: {command:?}");
         match command {
             InternalCommand::SetTextConversion(mode) => {
-                if self.state.text_conversion_mode != mode {
-                    log::info!("[SmtcRunner] 切换文本转换模式 -> {mode:?}");
-                    self.state.text_conversion_mode = mode;
-
-                    let config = match mode {
-                        TextConversionMode::Off => None,
-                        TextConversionMode::TraditionalToSimplified => Some(BuiltinConfig::T2s),
-                        TextConversionMode::SimplifiedToTraditional => Some(BuiltinConfig::S2t),
-                        TextConversionMode::SimplifiedToTaiwan => Some(BuiltinConfig::S2tw),
-                        TextConversionMode::TaiwanToSimplified => Some(BuiltinConfig::Tw2s),
-                        TextConversionMode::SimplifiedToHongKong => Some(BuiltinConfig::S2hk),
-                        TextConversionMode::HongKongToSimplified => Some(BuiltinConfig::Hk2s),
-                    };
-
-                    self.state.text_converter = if let Some(config) = config {
-                        match ferrous_opencc::OpenCC::from_config(config) {
-                            Ok(converter) => Some(converter),
-                            Err(e) => {
-                                self.send_diagnostic(
-                                    DiagnosticLevel::Error,
-                                    format!("加载 OpenCC 配置 '{config:?}' 失败: {e}"),
-                                )
-                                .await;
-                                None
-                            }
-                        }
-                    } else {
-                        None // TextConversionMode::Off
-                    };
-
-                    if let Some(guard) = &self.state.session_guard
-                        && let Ok(id_hstr) = guard.session.SourceAppUserModelId()
-                    {
-                        let _ = smtc_event_tx
-                            .try_send(SmtcEventSignal::MediaProperties(id_hstr.to_string_lossy()));
-                    }
-                }
+                self.on_set_text_conversion(mode, smtc_event_tx).await
             }
             InternalCommand::SelectSmtcSession(id) => {
-                let new_target = if id.is_empty() { None } else { Some(id) };
-                log::info!("[SmtcRunner] 切换目标会话 -> {new_target:?}");
-                self.state.target_session_id = new_target;
-                let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
+                self.on_select_session(id, smtc_event_tx);
+                Ok(())
             }
             InternalCommand::MediaControl(media_cmd) => {
-                let Some(guard) = &self.state.session_guard else {
-                    log::warn!(
-                        "[SmtcRunner] 收到媒体控制命令 {media_cmd:?}，但没有活动的会话，已忽略。"
-                    );
-                    return Ok(());
-                };
-
-                let mut context = SmtcExecutionContext {
-                    session: &guard.session,
-                    active_volume_easing_task: &mut self.state.active_volume_easing_task,
-                    next_easing_task_id: &self.state.next_easing_task_id,
-                    connector_update_tx: &self.connector_update_tx,
-                };
-
-                if let Some(async_op_result) = media_cmd.execute(&mut context) {
-                    spawn_async_op(async_op_result, async_result_tx, move |res| {
-                        AsyncTaskResult::MediaControlCompleted(media_cmd, res)
-                    });
-                }
+                self.on_media_control(media_cmd, async_result_tx);
+                Ok(())
             }
             InternalCommand::RequestStateUpdate => {
-                if !self.state.is_manager_ready {
-                    log::warn!("[SmtcRunner] 收到状态更新请求，但 SMTC 管理器尚未就绪，已忽略。");
-                    return Ok(());
-                }
-                log::info!("[SmtcRunner] 正在重新获取所有状态...");
-                self.state.session_guard = None;
-                self.handle_sessions_changed(smtc_event_tx).await?;
+                self.on_request_state_update(smtc_event_tx).await
             }
             InternalCommand::SetProgressTimer(enabled) => {
-                if enabled {
-                    if self.state.active_progress_timer_task.is_none() {
-                        log::info!("[SmtcRunner] 启用进度计时器。");
-                        let cancel_token = CancellationToken::new();
-                        let handle = tokio::task::spawn_local(tasks::progress_timer_task(
-                            self.player_state_arc.clone(),
-                            progress_signal_tx.clone(),
-                            cancel_token.clone(),
-                        ));
-                        self.state.active_progress_timer_task = Some((handle, cancel_token));
-                    }
-                } else if let Some((task, token)) = self.state.active_progress_timer_task.take() {
-                    log::info!("[SmtcRunner] 禁用进度计时器。");
-                    token.cancel();
-                    tokio::task::spawn_local(async move {
-                        let _ = task.await;
-                    });
+                self.on_set_progress_timer(enabled, progress_signal_tx);
+                Ok(())
+            }
+            InternalCommand::SetProgressOffset(offset) => self.on_set_progress_offset(offset).await,
+        }
+    }
+
+    async fn on_set_text_conversion(
+        &mut self,
+        mode: TextConversionMode,
+        smtc_event_tx: &TokioSender<SmtcEventSignal>,
+    ) -> WinResult<()> {
+        if self.state.text_conversion_mode == mode {
+            return Ok(());
+        }
+
+        log::info!("[SmtcRunner] 切换文本转换模式 -> {mode:?}");
+        self.state.text_conversion_mode = mode;
+
+        let config = match mode {
+            TextConversionMode::Off => None,
+            TextConversionMode::TraditionalToSimplified => Some(BuiltinConfig::T2s),
+            TextConversionMode::SimplifiedToTraditional => Some(BuiltinConfig::S2t),
+            TextConversionMode::SimplifiedToTaiwan => Some(BuiltinConfig::S2tw),
+            TextConversionMode::TaiwanToSimplified => Some(BuiltinConfig::Tw2s),
+            TextConversionMode::SimplifiedToHongKong => Some(BuiltinConfig::S2hk),
+            TextConversionMode::HongKongToSimplified => Some(BuiltinConfig::Hk2s),
+        };
+
+        self.state.text_converter = if let Some(config) = config {
+            match ferrous_opencc::OpenCC::from_config(config) {
+                Ok(converter) => Some(converter),
+                Err(e) => {
+                    self.send_diagnostic(
+                        DiagnosticLevel::Error,
+                        format!("加载 OpenCC 配置 '{config:?}' 失败: {e}"),
+                    )
+                    .await;
+                    None
                 }
             }
+        } else {
+            None // TextConversionMode::Off
+        };
+
+        if let Some(guard) = &self.state.session_guard
+            && let Ok(id_hstr) = guard.session.SourceAppUserModelId()
+        {
+            let _ =
+                smtc_event_tx.try_send(SmtcEventSignal::MediaProperties(id_hstr.to_string_lossy()));
         }
+
+        Ok(())
+    }
+
+    fn on_select_session(&mut self, id: String, smtc_event_tx: &TokioSender<SmtcEventSignal>) {
+        let new_target = if id.is_empty() { None } else { Some(id) };
+        log::info!("[SmtcRunner] 切换目标会话 -> {new_target:?}");
+        self.state.target_session_id = new_target;
+        let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
+    }
+
+    fn on_media_control(
+        &mut self,
+        media_cmd: SmtcControlCommand,
+        async_result_tx: &TokioSender<AsyncTaskResult>,
+    ) {
+        let Some(guard) = &self.state.session_guard else {
+            log::warn!("[SmtcRunner] 收到媒体控制命令 {media_cmd:?}，但没有活动的会话，已忽略。");
+            return;
+        };
+
+        let mut context = SmtcExecutionContext {
+            session: &guard.session,
+            active_volume_easing_task: &mut self.state.active_volume_easing_task,
+            next_easing_task_id: &self.state.next_easing_task_id,
+            connector_update_tx: &self.connector_update_tx,
+        };
+
+        if let Some(async_op_result) = media_cmd.execute(&mut context) {
+            spawn_async_op(async_op_result, async_result_tx, move |res| {
+                AsyncTaskResult::MediaControlCompleted(media_cmd, res)
+            });
+        }
+    }
+
+    async fn on_request_state_update(
+        &mut self,
+        smtc_event_tx: &TokioSender<SmtcEventSignal>,
+    ) -> WinResult<()> {
+        if !self.state.is_manager_ready {
+            log::warn!("[SmtcRunner] 收到状态更新请求，但 SMTC 管理器尚未就绪，已忽略。");
+            return Ok(());
+        }
+        log::info!("[SmtcRunner] 正在重新获取所有状态...");
+        self.state.session_guard = None;
+        self.handle_sessions_changed(smtc_event_tx).await
+    }
+
+    fn on_set_progress_timer(&mut self, enabled: bool, progress_signal_tx: &TokioSender<()>) {
+        if enabled {
+            if self.state.active_progress_timer_task.is_none() {
+                log::info!("[SmtcRunner] 启用进度计时器。");
+                let cancel_token = CancellationToken::new();
+                let handle = tokio::task::spawn_local(tasks::progress_timer_task(
+                    self.player_state_arc.clone(),
+                    progress_signal_tx.clone(),
+                    cancel_token.clone(),
+                ));
+                self.state.active_progress_timer_task = Some((handle, cancel_token));
+            }
+        } else if let Some((task, token)) = self.state.active_progress_timer_task.take() {
+            log::info!("[SmtcRunner] 禁用进度计时器。");
+            token.cancel();
+            tokio::task::spawn_local(async move {
+                let _ = task.await;
+            });
+        }
+    }
+
+    async fn on_set_progress_offset(&self, offset: i64) -> WinResult<()> {
+        log::info!("[SmtcRunner] 设置进度偏移量: {offset}ms");
+        let mut player_state = self.player_state_arc.lock().await;
+        player_state.position_offset_ms = offset;
+        send_now_playing_update(&player_state, &self.now_playing_tx);
+        drop(player_state);
         Ok(())
     }
 

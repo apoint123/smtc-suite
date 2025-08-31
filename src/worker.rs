@@ -41,6 +41,8 @@ pub enum InternalCommand {
     SetTextConversion(TextConversionMode),
     /// 指示 `smtc_handler` 启动或停止其内部的进度模拟计时器。
     SetProgressTimer(bool),
+    /// 指示 `smtc_handler` 设置一个偏移量。
+    SetProgressOffset(i64),
 }
 
 /// 在 `MediaWorker` 内部使用的更新事件，由其子模块发出。
@@ -227,6 +229,10 @@ impl MediaWorker {
             }
             MediaCommand::SetHighFrequencyProgressUpdates(enabled) => {
                 self.send_internal_command_to_smtc(InternalCommand::SetProgressTimer(enabled))
+                    .await;
+            }
+            MediaCommand::SetProgressOffset(offset) => {
+                self.send_internal_command_to_smtc(InternalCommand::SetProgressOffset(offset))
                     .await;
             }
             MediaCommand::Shutdown => {

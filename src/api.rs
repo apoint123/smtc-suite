@@ -100,6 +100,7 @@ pub struct SharedPlayerState {
     /// 一个标志，表示正在等待来自SMTC的第一次更新。
     /// 在此期间，应暂停进度计时器。
     pub is_waiting_for_initial_update: bool,
+    pub position_offset_ms: i64,
 }
 
 impl SharedPlayerState {
@@ -114,18 +115,22 @@ impl SharedPlayerState {
 
     /// 根据上次报告的播放位置和当前时间，估算实时的播放进度。
     pub fn get_estimated_current_position_ms(&self) -> u64 {
-        if self.playback_status == PlaybackStatus::Playing
+        let base_pos = if self.playback_status == PlaybackStatus::Playing
             && let Some(report_time) = self.last_known_position_report_time
         {
             let elapsed_ms = report_time.elapsed().as_millis() as u64;
-            let estimated_pos = self.last_known_position_ms + elapsed_ms;
-            // 确保估算的位置不超过歌曲总时长（如果时长有效）
-            if self.song_duration_ms > 0 {
-                return estimated_pos.min(self.song_duration_ms);
-            }
-            return estimated_pos;
+            self.last_known_position_ms + elapsed_ms
+        } else {
+            self.last_known_position_ms
+        };
+
+        let offset_pos = (base_pos as i64 + self.position_offset_ms).max(0) as u64;
+
+        // 确保估算的位置不超过歌曲总时长（如果时长有效）
+        if self.song_duration_ms > 0 {
+            return offset_pos.min(self.song_duration_ms);
         }
-        self.last_known_position_ms
+        offset_pos
     }
 }
 
@@ -366,6 +371,8 @@ pub enum MediaCommand {
     ///
     /// 当启用时，smtc-suite 会以 100ms 的频率主动发送 `TrackChanged` 事件来模拟平滑进度。
     SetHighFrequencyProgressUpdates(bool),
+    /// 为当前播放进度设置一个偏移量（毫秒）。
+    SetProgressOffset(i64),
     /// 请求关闭整个媒体服务后台线程。
     Shutdown,
 }
@@ -402,21 +409,14 @@ pub enum MediaUpdate {
     SelectedSessionVanished(String),
 }
 
-/// 与媒体库后台服务交互的控制器。
-///
-/// 这是库的公共入口点。它包含一个命令发送端和一个更新接收端，
-/// 用于与在后台运行的 `MediaWorker` 进行通信。
+/// 与后台服务交互的控制器。
 pub struct MediaController {
     /// 用于向后台服务发送 `MediaCommand` 的通道发送端。
     pub command_tx: mpsc::Sender<MediaCommand>,
 }
 
 impl MediaController {
-    /// 终止媒体服务的后台线程。
-    ///
-    /// # 返回
-    /// - `Ok(())`: 如果命令成功发送。
-    /// - `Err(SmtcError)`: 如果后台线程已经关闭，无法接收命令。
+    /// 终止后台线程。
     pub async fn shutdown(&self) -> Result<()> {
         self.command_tx
             .send(MediaCommand::Shutdown)
