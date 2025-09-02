@@ -6,7 +6,6 @@ use tokio::{
     sync::{
         Mutex as TokioMutex, MutexGuard,
         mpsc::{Receiver as TokioReceiver, Sender as TokioSender, channel as tokio_channel},
-        watch,
     },
     task::JoinHandle,
     time::{Duration as TokioDuration, timeout as tokio_timeout},
@@ -30,8 +29,9 @@ use windows::{
 use windows_future::IAsyncOperation;
 
 use crate::{
+    Controls,
     api::{
-        Controls, DiagnosticInfo, DiagnosticLevel, NowPlayingInfo, PlaybackStatus, RepeatMode,
+        DiagnosticInfo, DiagnosticLevel, NowPlayingInfo, PlaybackStatus, RepeatMode,
         SharedPlayerState, SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
     },
     error::Result,
@@ -219,14 +219,6 @@ impl SmtcState {
     }
 }
 
-/// 一个通用的辅助函数，用于将返回 `IAsyncOperation` 的 `WinRT` API 调用派发到 Tokio 的本地任务中执行。
-///
-/// 它处理超时逻辑，并将最终结果（成功或失败）通过通道发送回主循环进行统一处理。
-///
-/// # 参数
-/// * `async_op_result`: 一个 `WinResult`，其中应包含了要执行的 `IAsyncOperation`。
-/// * `result_tx`: 用于发送异步任务结果的 Tokio 通道发送端。
-/// * `result_mapper`: 一个闭包，用于将 `IAsyncOperation` 的最终结果 (`WinResult<T>`) 包装成 `AsyncTaskResult` 枚举。
 fn spawn_async_op<T, F>(
     async_op_result: WinResult<IAsyncOperation<T>>,
     result_tx: &tokio::sync::mpsc::Sender<AsyncTaskResult>,
@@ -239,8 +231,6 @@ fn spawn_async_op<T, F>(
 {
     if let Ok(async_op) = async_op_result {
         let tx = result_tx.clone();
-        // 使用 spawn_local 至关重要，因为它不要求 Future 是 `Send`。
-        // WinRT 的代理对象不是 `Send` 的，因此不能在多线程运行时中被 `.await`。
         tokio::task::spawn_local(async move {
             let result = tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, async_op.into_future()).await;
             let mapped_result = if let Ok(res) = result {
@@ -255,7 +245,6 @@ fn spawn_async_op<T, F>(
             }
         });
     } else if let Err(e) = async_op_result {
-        // 如果创建 IAsyncOperation 本身就失败了，直接将错误打包发送回去。
         log::warn!("[异步操作] 启动失败: {e:?}");
         if result_tx.try_send(result_mapper(Err(e))).is_err() {
             log::warn!("[异步操作] 启动失败，且无法将错误发送回主循环。");
@@ -265,11 +254,14 @@ fn spawn_async_op<T, F>(
 
 fn send_now_playing_update(
     state_guard: &MutexGuard<SharedPlayerState>,
-    now_playing_tx: &watch::Sender<NowPlayingInfo>,
+    connector_update_tx: &TokioSender<InternalUpdate>,
 ) {
     let latest_info = NowPlayingInfo::from(&**state_guard);
 
-    if now_playing_tx.send(latest_info).is_err() {
+    if connector_update_tx
+        .try_send(InternalUpdate::TrackChanged(latest_info))
+        .is_err()
+    {
         log::warn!("[SMTC] 状态广播失败，所有接收者可能已关闭");
     }
 }
@@ -282,8 +274,6 @@ struct SmtcRunner {
     connector_update_tx: TokioSender<InternalUpdate>,
     /// 共享的播放器状态。
     player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
-    /// 用于向外部广播当前播放信息。
-    now_playing_tx: watch::Sender<NowPlayingInfo>,
     control_rx: TokioReceiver<InternalCommand>,
     shutdown_rx: TokioReceiver<()>,
     diagnostics_tx: TokioSender<DiagnosticInfo>,
@@ -573,7 +563,7 @@ impl SmtcRunner {
         log::info!("[SmtcRunner] 设置进度偏移量: {offset}ms");
         let mut player_state = self.player_state_arc.lock().await;
         player_state.position_offset_ms = offset;
-        send_now_playing_update(&player_state, &self.now_playing_tx);
+        send_now_playing_update(&player_state, &self.connector_update_tx);
         drop(player_state);
         Ok(())
     }
@@ -676,12 +666,22 @@ impl SmtcRunner {
                     }
                     _ => PlaybackStatus::Stopped,
                 };
-                let is_shuffle_active = info.IsShuffleActive()?.Value().unwrap_or(false);
-                let repeat_mode = match info.AutoRepeatMode()?.Value()? {
-                    MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
-                    MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
-                    _ => RepeatMode::Off,
-                };
+
+                let is_shuffle_active = info
+                    .IsShuffleActive()
+                    .and_then(|opt| opt.Value())
+                    .unwrap_or(false);
+
+                let repeat_mode = info
+                    .AutoRepeatMode()
+                    .and_then(|opt| opt.Value())
+                    .map(|mode| match mode {
+                        MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
+                        MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
+                        _ => RepeatMode::Off,
+                    })
+                    .unwrap_or(RepeatMode::Off);
+
                 let c = info.Controls()?;
                 let mut controls = Controls::empty();
                 if c.IsPlayEnabled().unwrap_or(false) {
@@ -736,12 +736,14 @@ impl SmtcRunner {
                 state_guard.repeat_mode = safe_info.repeat_mode;
                 state_guard.controls = safe_info.controls;
 
-                send_now_playing_update(&state_guard, &self.now_playing_tx);
+                send_now_playing_update(&state_guard, &self.connector_update_tx);
                 drop(state_guard);
             }
-            Ok(_) => {}
-            Err(_) => {
-                log::error!("[CRASH HANDLED] 为 '{event_session_id}' 调用 FFI 接口时 Panic");
+            Ok(Err(e)) => {
+                log::warn!("[SmtcRunner] 获取播放信息失败: {e:?}");
+            }
+            Err(e) => {
+                log::error!("[CRASH HANDLED] 为 '{event_session_id}' 调用 FFI 接口时 Panic: {e:?}");
             }
         }
 
@@ -814,7 +816,7 @@ impl SmtcRunner {
                     if state_guard.is_waiting_for_initial_update {
                         state_guard.is_waiting_for_initial_update = false;
                     }
-                    send_now_playing_update(&state_guard, &self.now_playing_tx);
+                    send_now_playing_update(&state_guard, &self.connector_update_tx);
                     drop(state_guard);
                 }
             }
@@ -930,7 +932,7 @@ impl SmtcRunner {
                 player_state.artist = artist;
                 player_state.album = album;
 
-                send_now_playing_update(&player_state, &self.now_playing_tx);
+                send_now_playing_update(&player_state, &self.connector_update_tx);
 
                 drop(player_state);
             }
@@ -987,7 +989,7 @@ impl SmtcRunner {
                     log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
                     player_state.cover_data = Some(bytes);
                     player_state.cover_data_hash = Some(new_hash);
-                    send_now_playing_update(&player_state, &self.now_playing_tx);
+                    send_now_playing_update(&player_state, &self.connector_update_tx);
                     drop(player_state);
                 }
             }
@@ -997,7 +999,7 @@ impl SmtcRunner {
                     log::debug!("[State Update] 清空封面数据。");
                     player_state.cover_data = None;
                     player_state.cover_data_hash = None;
-                    send_now_playing_update(&player_state, &self.now_playing_tx);
+                    send_now_playing_update(&player_state, &self.connector_update_tx);
                     drop(player_state);
                 }
             }
@@ -1009,7 +1011,7 @@ impl SmtcRunner {
                     player_state.cover_data_hash = None;
                 }
                 let player_state = self.player_state_arc.lock().await;
-                send_now_playing_update(&player_state, &self.now_playing_tx);
+                send_now_playing_update(&player_state, &self.connector_update_tx);
 
                 self.state.session_guard = None;
 
@@ -1053,7 +1055,7 @@ impl SmtcRunner {
             };
         }
         let player_state = self.player_state_arc.lock().await;
-        send_now_playing_update(&player_state, &self.now_playing_tx);
+        send_now_playing_update(&player_state, &self.connector_update_tx);
     }
 
     fn handle_session_check_tick(&self, smtc_event_tx: &TokioSender<SmtcEventSignal>) {
@@ -1162,10 +1164,18 @@ impl SmtcRunner {
                     ))
                     .await;
                 self.state.target_session_id = None;
-                manager.GetCurrentSession().map(Some)
+                match manager.GetCurrentSession() {
+                    Ok(session) => Ok(Some(session)),
+                    Err(e) if e.code().is_ok() => Ok(None),
+                    Err(e) => Err(e),
+                }
             }
         } else {
-            manager.GetCurrentSession().map(Some)
+            match manager.GetCurrentSession() {
+                Ok(session) => Ok(Some(session)),
+                Err(e) if e.code().is_ok() => Ok(None),
+                Err(e) => Err(e),
+            }
         }
     }
 
@@ -1234,7 +1244,7 @@ impl SmtcRunner {
             player_state.reset_to_empty();
         }
         let player_state = self.player_state_arc.lock().await;
-        send_now_playing_update(&player_state, &self.now_playing_tx);
+        send_now_playing_update(&player_state, &self.connector_update_tx);
 
         if let Some(new_s) = new_session_to_monitor {
             let new_guard = MonitoredSessionGuard::new(new_s, smtc_event_tx)?;
@@ -1300,14 +1310,12 @@ pub async fn run_smtc_listener(
     control_rx: TokioReceiver<InternalCommand>,
     player_state_arc: Arc<TokioMutex<SharedPlayerState>>,
     shutdown_rx: TokioReceiver<()>,
-    now_playing_tx: watch::Sender<NowPlayingInfo>,
     diagnostics_tx: TokioSender<DiagnosticInfo>,
 ) -> Result<()> {
     let mut runner = SmtcRunner {
         state: SmtcState::new(),
         connector_update_tx,
         player_state_arc,
-        now_playing_tx,
         control_rx,
         shutdown_rx,
         diagnostics_tx,

@@ -88,11 +88,7 @@ fn log_playback_status(info: &NowPlayingInfo) {
     log::info!("播放状态: {play_state} | 随机: {shuffle_state} | 循环: {repeat_state}");
 }
 
-fn handle_track_changed(
-    info: NowPlayingInfo,
-    last_known_info: &mut Option<NowPlayingInfo>,
-    is_forced: bool,
-) {
+fn handle_track_changed(info: NowPlayingInfo, last_known_info: &mut Option<NowPlayingInfo>) {
     let new_info = parse_combined_artist_album_info(info);
 
     let has_text_info_changed = match last_known_info {
@@ -122,8 +118,7 @@ fn handle_track_changed(
         let title = new_info.title.as_deref().unwrap_or("N/A");
         let artist = new_info.artist.as_deref().unwrap_or("N/A");
         let album = new_info.album_title.as_deref().unwrap_or("N/A");
-        let force_str = if is_forced { "(强制)" } else { "" };
-        log::info!("曲目信息变更{force_str}: {artist} - {title} (专辑: {album})");
+        log::info!("曲目信息变更: {artist} - {title} (专辑: {album})");
     }
 
     if has_controls_changed {
@@ -140,7 +135,7 @@ fn handle_track_changed(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("trace")).init();
 
     let (controller, mut update_rx) = MediaManager::start()?;
     let mut last_known_info: Option<NowPlayingInfo> = None;
@@ -170,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         println!();
                     }
                     MediaUpdate::TrackChanged(info) => {
-                        handle_track_changed(info, &mut last_known_info, false);
+                        handle_track_changed(info, &mut last_known_info);
                     }
                     MediaUpdate::SelectedSessionVanished(session_id) => {
                         log::warn!("当前选择的会话 '{session_id}' 已消失。");

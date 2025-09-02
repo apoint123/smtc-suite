@@ -143,6 +143,7 @@ impl From<&SharedPlayerState> for NowPlayingInfo {
             album_title: Some(state.album.clone()),
             duration_ms: Some(state.song_duration_ms),
             position_ms: Some(state.get_estimated_current_position_ms()),
+            smtc_position_ms: Some(state.last_known_position_ms),
             playback_status: Some(state.playback_status),
             is_shuffle_active: Some(state.is_shuffle_active),
             repeat_mode: Some(state.repeat_mode),
@@ -166,8 +167,10 @@ pub struct NowPlayingInfo {
 
     /// 曲目总时长（毫秒）。
     pub duration_ms: Option<u64>,
-    /// 当前播放位置（毫秒）。
+    /// 当前播放位置（毫秒）。如果启用了高频更新，这将是一个估算值。
     pub position_ms: Option<u64>,
+    /// SMTC 系统报告的原始播放位置（毫秒），未经插值。
+    pub smtc_position_ms: Option<u64>,
 
     /// 当前的播放状态。
     pub playback_status: Option<PlaybackStatus>,
@@ -438,4 +441,64 @@ pub struct DiagnosticInfo {
     pub level: DiagnosticLevel,
     pub message: String,
     pub timestamp: DateTime<Utc>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn test_get_estimated_current_position_ms() {
+        let mut state = SharedPlayerState {
+            last_known_position_ms: 10000, // 10 seconds
+            song_duration_ms: 60000,       // 60 seconds
+            ..Default::default()
+        };
+
+        state.playback_status = PlaybackStatus::Paused;
+        state.last_known_position_report_time = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(150));
+        assert_eq!(
+            state.get_estimated_current_position_ms(),
+            10000,
+            "Position should not advance when paused"
+        );
+
+        state.playback_status = PlaybackStatus::Playing;
+        state.last_known_position_report_time = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(500));
+        let estimated_pos = state.get_estimated_current_position_ms();
+        assert!(
+            (10490..=10700).contains(&estimated_pos),
+            "Expected position to be around 10500, but it was {estimated_pos}"
+        );
+
+        state.position_offset_ms = -2000;
+        state.last_known_position_report_time = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(100));
+        let estimated_pos_with_offset = state.get_estimated_current_position_ms();
+        assert!(
+            (8090..=8300).contains(&estimated_pos_with_offset),
+            "Expected position with offset to be around 8100, but it was {estimated_pos_with_offset}"
+        );
+
+        state.position_offset_ms = 3000;
+        state.last_known_position_report_time = Some(Instant::now());
+        let estimated_pos_with_positive_offset = state.get_estimated_current_position_ms();
+        assert!(
+            (12990..=13200).contains(&estimated_pos_with_positive_offset),
+            "Expected position with positive offset to be around 13000, but it was {estimated_pos_with_positive_offset}"
+        );
+
+        state.position_offset_ms = 0;
+        state.last_known_position_ms = 59800;
+        state.last_known_position_report_time = Some(Instant::now());
+        std::thread::sleep(Duration::from_millis(500));
+        assert_eq!(
+            state.get_estimated_current_position_ms(),
+            60000,
+            "Position should be capped at song duration"
+        );
+    }
 }

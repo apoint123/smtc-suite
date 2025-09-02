@@ -2,10 +2,7 @@ use std::{sync::Arc, thread};
 
 use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::{
-    sync::{
-        mpsc::{Receiver as TokioReceiver, Sender as TokioSender, channel},
-        watch,
-    },
+    sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender, channel},
     task::LocalSet,
 };
 use windows::{
@@ -51,6 +48,8 @@ pub enum InternalCommand {
 /// 然后将它们转换为外部可见的 `MediaUpdate`。
 #[derive(Debug, Clone)]
 pub enum InternalUpdate {
+    /// 由 `smtc_handler` 发出，表示当前曲目信息已更新。
+    TrackChanged(NowPlayingInfo),
     /// 由 `smtc_handler` 发出，表示活动的 SMTC 会话已更改。
     ActiveSmtcSessionChanged { pid: Option<u32> },
     /// 由 `audio_session_monitor` 的回调发出，表示被监听的会话已失效（如关闭、崩溃）。
@@ -77,7 +76,6 @@ pub struct MediaWorker {
     smtc_control_tx: Option<TokioSender<InternalCommand>>,
     smtc_update_rx: TokioReceiver<InternalUpdate>,
     diagnostics_rx: Option<TokioReceiver<DiagnosticInfo>>,
-    now_playing_rx: watch::Receiver<NowPlayingInfo>,
     smtc_listener_task_handle: Option<TokioJoinHandle<Result<()>>>,
     smtc_shutdown_tx: Option<TokioSender<()>>,
     audio_monitor_command_tx: Option<TokioSender<AudioMonitorCommand>>,
@@ -96,7 +94,6 @@ impl MediaWorker {
 
         let (smtc_update_tx, smtc_update_rx) = channel::<InternalUpdate>(32);
         let (smtc_control_tx, smtc_control_rx) = channel::<InternalCommand>(32);
-        let (now_playing_tx, now_playing_rx) = watch::channel(NowPlayingInfo::default());
         let (diagnostics_tx, diagnostics_rx) = channel::<DiagnosticInfo>(32);
         let player_state = Arc::new(tokio::sync::Mutex::new(SharedPlayerState::default()));
 
@@ -114,7 +111,6 @@ impl MediaWorker {
             smtc_control_rx,
             player_state.clone(),
             shutdown_rx,
-            now_playing_tx,
             diagnostics_tx,
         ));
 
@@ -124,7 +120,6 @@ impl MediaWorker {
             smtc_control_tx: Some(smtc_control_tx),
             smtc_update_rx,
             diagnostics_rx: Some(diagnostics_rx),
-            now_playing_rx,
             smtc_listener_task_handle: Some(smtc_listener_handle),
             smtc_shutdown_tx: Some(shutdown_tx),
             audio_monitor_command_tx: Some(audio_monitor_command_tx),
@@ -134,14 +129,10 @@ impl MediaWorker {
             _shared_player_state: player_state,
         };
 
-        log::debug!("[MediaWorker] 初始化完成，即将进入核心异步事件循环。");
-
         worker_instance.main_event_loop().await;
 
-        log::trace!("[MediaWorker] 核心事件循环已退出，正在执行清理...");
         worker_instance.shutdown_all_subsystems().await;
 
-        log::trace!("[MediaWorker] 核心事件循环已退出，工作线程即将终止。");
         Ok(())
     }
 
@@ -157,14 +148,6 @@ impl MediaWorker {
                         break;
                     }
                     self.handle_command_from_app(command).await;
-                },
-
-                Ok(()) = self.now_playing_rx.changed() => {
-                    let info = self.now_playing_rx.borrow().clone();
-                    if info.title.is_some()
-                        && self.update_tx.send(MediaUpdate::TrackChanged(info)).await.is_err() {
-                            log::error!("[MediaWorker] 发送 TrackChanged 更新到外部失败。");
-                        }
                 },
 
                 Some(update) = self.smtc_update_rx.recv() => {
@@ -254,11 +237,11 @@ impl MediaWorker {
                 }
             }
             InternalUpdate::MonitoredAudioSessionExpired => {
-                if let Some(tx) = &self.audio_monitor_command_tx
-                    && tx.send(AudioMonitorCommand::StopMonitoring).await.is_err()
-                {
-                    log::error!("[MediaWorker] 发送 StopMonitoring 命令到音量监听器失败。");
-                }
+                // if let Some(tx) = &self.audio_monitor_command_tx
+                //     && tx.send(AudioMonitorCommand::StopMonitoring).await.is_err()
+                // {
+                //     log::error!("[MediaWorker] 发送 StopMonitoring 命令到音量监听器失败。");
+                // }
             }
 
             other => {
@@ -394,6 +377,7 @@ pub fn start_media_worker_thread(
 impl From<InternalUpdate> for MediaUpdate {
     fn from(internal: InternalUpdate) -> Self {
         match internal {
+            InternalUpdate::TrackChanged(info) => Self::TrackChanged(info),
             InternalUpdate::SmtcSessionListChanged(list) => Self::SessionsChanged(list),
             InternalUpdate::AudioDataPacket(bytes) => Self::AudioData(bytes),
             InternalUpdate::AudioSessionVolumeChanged {

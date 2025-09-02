@@ -68,3 +68,71 @@ pub fn get_display_name_from_smtc_id(id_str: &str) -> String {
     // 如果所有处理都成功，则返回处理后的名称，否则返回原始 ID。
     prettified_name.unwrap_or_else(|| id_str.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ferrous_opencc::{OpenCC, config::BuiltinConfig};
+
+    #[test]
+    fn test_convert_text_with_converter() {
+        let converter = OpenCC::from_config(BuiltinConfig::S2t).unwrap();
+        let input = "一个项目";
+        let expected = "一個項目";
+        assert_eq!(convert_text(input, Some(&converter)), expected);
+    }
+
+    #[test]
+    fn test_convert_text_without_converter() {
+        let input = "Hello, World";
+        assert_eq!(convert_text(input, None), input.to_string());
+    }
+
+    #[test]
+    fn test_convert_text_with_empty_string() {
+        let converter = OpenCC::from_config(BuiltinConfig::S2t).unwrap();
+        assert_eq!(convert_text("", Some(&converter)), "");
+        assert_eq!(convert_text("", None), "");
+    }
+
+    #[test]
+    fn test_display_name_from_plain_exe() {
+        let id = "Spotify.exe";
+        assert_eq!(get_display_name_from_smtc_id(id), "Spotify.exe");
+    }
+
+    #[test]
+    fn test_display_name_from_apple_music_aumid() {
+        let id = "AppleInc.AppleMusicWin_nzyj5cx40ttqa!App";
+        assert_eq!(get_display_name_from_smtc_id(id), "Apple Music");
+    }
+
+    #[test]
+    fn test_display_name_from_zune_aumid() {
+        let id = "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic";
+        assert_eq!(get_display_name_from_smtc_id(id), "Zune Music");
+    }
+
+    #[test]
+    fn test_display_name_from_another_camelcase_aumid() {
+        let id = "SomeDeveloper.MyAwesomePlayerUwp_abcdef123!Main";
+        assert_eq!(get_display_name_from_smtc_id(id), "My Awesome Player");
+    }
+
+    #[test]
+    fn test_display_name_fallback_when_prettify_is_empty() {
+        let id = "Vendor.Win_hash!App";
+        assert_eq!(get_display_name_from_smtc_id(id), id);
+    }
+
+    #[test]
+    fn test_display_name_with_empty_input() {
+        assert_eq!(get_display_name_from_smtc_id(""), "");
+    }
+
+    #[test]
+    fn test_display_name_with_no_dots_in_pfn() {
+        let id = "MyCoolApp_hash!App";
+        assert_eq!(get_display_name_from_smtc_id(id), "My Cool App");
+    }
+}
