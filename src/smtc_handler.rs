@@ -199,6 +199,7 @@ struct SmtcState {
     is_manager_ready: bool,
     /// 用于为音量缓动任务生成唯一 ID。
     next_easing_task_id: Arc<std::sync::atomic::AtomicU64>,
+    last_failed_cover_track: Option<(String, String)>,
 }
 
 impl SmtcState {
@@ -215,6 +216,7 @@ impl SmtcState {
             active_progress_timer_task: None,
             is_manager_ready: false,
             next_easing_task_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            last_failed_cover_track: None,
         }
     }
 }
@@ -919,6 +921,12 @@ impl SmtcRunner {
                 is_new_track = player_state.title != title || player_state.artist != artist;
 
                 if is_new_track {
+                    if self.state.last_failed_cover_track.as_ref()
+                        == Some(&(artist.clone(), title.clone()))
+                    {
+                    } else {
+                        self.state.last_failed_cover_track = None;
+                    }
                     log::info!(
                         "[SmtcRunner] 接收到新曲目信息: '{}' - '{}'",
                         &artist,
@@ -937,7 +945,10 @@ impl SmtcRunner {
                 drop(player_state);
             }
 
-            if is_new_track && let Ok(thumb_ref) = props.Thumbnail() {
+            if is_new_track
+                && self.state.last_failed_cover_track.is_none()
+                && let Ok(thumb_ref) = props.Thumbnail()
+            {
                 if let Some((old_task, old_token)) = self.state.active_cover_fetch_task.take() {
                     old_token.cancel();
                     tokio::task::spawn_local(async move {
@@ -1007,6 +1018,12 @@ impl SmtcRunner {
                 log::warn!("[SmtcRunner] 获取封面失败: {e:?}，正在重置会话。");
                 {
                     let mut player_state = self.player_state_arc.lock().await;
+
+                    if !player_state.artist.is_empty() || !player_state.title.is_empty() {
+                        self.state.last_failed_cover_track =
+                            Some((player_state.artist.clone(), player_state.title.clone()));
+                    }
+
                     player_state.cover_data = None;
                     player_state.cover_data_hash = None;
                 }
