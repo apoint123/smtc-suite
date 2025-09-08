@@ -1,3 +1,5 @@
+#![allow(clippy::ptr_as_ptr)]
+#![allow(clippy::borrow_as_ptr)]
 #![allow(clippy::ref_as_ptr)]
 #![allow(clippy::inline_always)]
 
