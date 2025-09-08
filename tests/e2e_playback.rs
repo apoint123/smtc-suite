@@ -105,8 +105,8 @@ fn create_dummy_thumbnail() -> WinResult<RandomAccessStreamReference> {
     let writer = DataWriter::CreateDataWriter(&stream)?;
     let dummy_data: Vec<u8> = (0..1024).map(|i| (i % 256) as u8).collect();
     writer.WriteBytes(&dummy_data)?;
-    writer.StoreAsync()?;
-    writer.FlushAsync()?;
+    writer.StoreAsync()?.get()?;
+    writer.FlushAsync()?.get()?;
     RandomAccessStreamReference::CreateFromStream(&stream)
 }
 

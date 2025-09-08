@@ -433,7 +433,7 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
         // SAFETY: Process32NextW 用于移动到下一个进程。
         if unsafe { Process32NextW(snapshot_handle, &raw mut process_entry) }.is_err() {
             // 如果错误是 ERROR_NO_MORE_FILES，说明已遍历完所有进程，这是正常情况。
-            if windows::core::Error::from_thread().code() == ERROR_NO_MORE_FILES.to_hresult() {
+            if windows::core::Error::from_win32().code() == ERROR_NO_MORE_FILES.to_hresult() {
                 break;
             }
         }

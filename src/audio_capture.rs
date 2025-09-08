@@ -109,7 +109,7 @@ impl EventHandleGuard {
         let handle = unsafe { CreateEventW(None, manual_reset, initial_state, None)? };
         if handle.is_invalid() {
             return Err(SmtcError::AudioCapture(
-                windows::core::Error::from_thread().into(),
+                windows::core::Error::from_win32().into(),
             ));
         }
         Ok(Self(handle))
@@ -526,7 +526,7 @@ impl AudioCapturer {
                 }
                 // 等待失败或其他未知情况
                 _ => {
-                    let err = windows::core::Error::from_thread();
+                    let err = windows::core::Error::from_win32();
                     log::error!("[音频捕获线程] WaitForMultipleObjects 失败: {err:?}");
                     return Err(SmtcError::AudioCapture(err.into()));
                 }
