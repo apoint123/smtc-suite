@@ -162,6 +162,14 @@ enum SmtcEventSignal {
     Sessions,
 }
 
+#[derive(Debug)]
+struct PlaybackInfoUpdate {
+    playback_status: PlaybackStatus,
+    is_shuffle_active: bool,
+    repeat_mode: RepeatMode,
+    controls: Controls,
+}
+
 /// 封装了所有可能从后台异步任务返回的结果。
 enum AsyncTaskResult {
     /// `MediaSessionManager::RequestAsync` 的结果。
@@ -631,14 +639,6 @@ impl SmtcRunner {
     }
 
     async fn handle_playback_info_signal(&self, event_session_id: String) -> WinResult<()> {
-        #[derive(Debug)]
-        struct SafePlaybackInfo {
-            playback_status: PlaybackStatus,
-            is_shuffle_active: bool,
-            repeat_mode: RepeatMode,
-            controls: Controls,
-        }
-
         let Some(manager_guard) = &self.state.manager_guard else {
             return Ok(());
         };
@@ -656,69 +656,11 @@ impl SmtcRunner {
             return Ok(());
         };
 
-        let unwind_result = std::panic::catch_unwind(move || {
-            (|| -> WinResult<SafePlaybackInfo> {
-                let info = fresh_session.GetPlaybackInfo()?;
-                let playback_status = match info.PlaybackStatus()? {
-                    GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => {
-                        PlaybackStatus::Playing
-                    }
-                    GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => {
-                        PlaybackStatus::Paused
-                    }
-                    _ => PlaybackStatus::Stopped,
-                };
-
-                let is_shuffle_active = info
-                    .IsShuffleActive()
-                    .and_then(|opt| opt.Value())
-                    .unwrap_or(false);
-
-                let repeat_mode = info
-                    .AutoRepeatMode()
-                    .and_then(|opt| opt.Value())
-                    .map(|mode| match mode {
-                        MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
-                        MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
-                        _ => RepeatMode::Off,
-                    })
-                    .unwrap_or(RepeatMode::Off);
-
-                let c = info.Controls()?;
-                let mut controls = Controls::empty();
-                if c.IsPlayEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_PLAY);
-                }
-                if c.IsPauseEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_PAUSE);
-                }
-                if c.IsNextEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_SKIP_NEXT);
-                }
-                if c.IsPreviousEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_SKIP_PREVIOUS);
-                }
-                if c.IsPlaybackPositionEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_SEEK);
-                }
-                if c.IsShuffleEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_CHANGE_SHUFFLE);
-                }
-                if c.IsRepeatEnabled().unwrap_or(false) {
-                    controls.insert(Controls::CAN_CHANGE_REPEAT);
-                }
-
-                Ok(SafePlaybackInfo {
-                    playback_status,
-                    is_shuffle_active,
-                    repeat_mode,
-                    controls,
-                })
-            })()
-        });
+        let unwind_result =
+            std::panic::catch_unwind(|| extract_playback_info_from_session(&fresh_session));
 
         match unwind_result {
-            Ok(Ok(safe_info)) => {
+            Ok(Ok(update)) => {
                 let mut state_guard = self.player_state_arc.lock().await;
 
                 if self
@@ -733,10 +675,10 @@ impl SmtcRunner {
                     return Ok(());
                 }
 
-                state_guard.playback_status = safe_info.playback_status;
-                state_guard.is_shuffle_active = safe_info.is_shuffle_active;
-                state_guard.repeat_mode = safe_info.repeat_mode;
-                state_guard.controls = safe_info.controls;
+                state_guard.playback_status = update.playback_status;
+                state_guard.is_shuffle_active = update.is_shuffle_active;
+                state_guard.repeat_mode = update.repeat_mode;
+                state_guard.controls = update.controls;
 
                 send_now_playing_update(&state_guard, &self.connector_update_tx);
                 drop(state_guard);
@@ -1346,6 +1288,61 @@ impl SmtcRunner {
             log::warn!("[诊断信息] 诊断通道已关闭，无法发送信息。");
         }
     }
+}
+
+fn extract_playback_info_from_session(session: &MediaSession) -> WinResult<PlaybackInfoUpdate> {
+    let info = session.GetPlaybackInfo()?;
+    let playback_status = match info.PlaybackStatus()? {
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => PlaybackStatus::Playing,
+        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => PlaybackStatus::Paused,
+        _ => PlaybackStatus::Stopped,
+    };
+
+    let is_shuffle_active = info
+        .IsShuffleActive()
+        .and_then(|opt| opt.Value())
+        .unwrap_or(false);
+
+    let repeat_mode = info
+        .AutoRepeatMode()
+        .and_then(|opt| opt.Value())
+        .map(|mode| match mode {
+            MediaPlaybackAutoRepeatMode::Track => RepeatMode::One,
+            MediaPlaybackAutoRepeatMode::List => RepeatMode::All,
+            _ => RepeatMode::Off,
+        })
+        .unwrap_or(RepeatMode::Off);
+
+    let c = info.Controls()?;
+    let mut controls = Controls::empty();
+    if c.IsPlayEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_PLAY);
+    }
+    if c.IsPauseEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_PAUSE);
+    }
+    if c.IsNextEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_SKIP_NEXT);
+    }
+    if c.IsPreviousEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_SKIP_PREVIOUS);
+    }
+    if c.IsPlaybackPositionEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_SEEK);
+    }
+    if c.IsShuffleEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_CHANGE_SHUFFLE);
+    }
+    if c.IsRepeatEnabled().unwrap_or(false) {
+        controls.insert(Controls::CAN_CHANGE_REPEAT);
+    }
+
+    Ok(PlaybackInfoUpdate {
+        playback_status,
+        is_shuffle_active,
+        repeat_mode,
+        controls,
+    })
 }
 
 fn pump_pending_messages() {
