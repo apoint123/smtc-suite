@@ -1041,38 +1041,45 @@ impl SmtcRunner {
     }
 
     async fn handle_progress_update_signal(&self) {
+        let mut should_send_update = false;
+        let mut is_currently_playing = false;
+
         if let Some(guard) = &self.state.session_guard {
             let unwind_result = std::panic::catch_unwind(|| {
-                guard
-                    .session
-                    .GetPlaybackInfo()
-                    .map_or(None, |info| match info.PlaybackStatus() {
-                        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing) => {
-                            Some(PlaybackStatus::Playing)
+                guard.session.GetPlaybackInfo().ok().and_then(|info| {
+                    info.PlaybackStatus().ok().map(|status| match status {
+                        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => {
+                            PlaybackStatus::Playing
                         }
-                        Ok(GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused) => {
-                            Some(PlaybackStatus::Paused)
+                        GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => {
+                            PlaybackStatus::Paused
                         }
-                        _ => Some(PlaybackStatus::Stopped),
+                        _ => PlaybackStatus::Stopped,
                     })
+                })
             });
 
-            let is_playing_now = match unwind_result {
-                Ok(Some(PlaybackStatus::Playing)) => true,
-                Ok(_) | Err(_) => false,
-            };
-
+            if let Ok(Some(current_status)) = unwind_result {
+                let mut player_state = self.player_state_arc.lock().await;
+                if player_state.playback_status != current_status {
+                    player_state.playback_status = current_status;
+                    should_send_update = true;
+                }
+                is_currently_playing = player_state.playback_status == PlaybackStatus::Playing;
+                drop(player_state);
+            }
+        } else {
             let mut player_state = self.player_state_arc.lock().await;
-            player_state.playback_status = if is_playing_now {
-                PlaybackStatus::Playing
-            } else if player_state.playback_status == PlaybackStatus::Playing {
-                PlaybackStatus::Paused
-            } else {
-                player_state.playback_status
-            };
+            if player_state.playback_status != PlaybackStatus::Stopped {
+                should_send_update = true;
+                player_state.playback_status = PlaybackStatus::Stopped;
+            }
         }
-        let player_state = self.player_state_arc.lock().await;
-        send_now_playing_update(&player_state, &self.connector_update_tx);
+
+        if is_currently_playing || should_send_update {
+            let player_state = self.player_state_arc.lock().await;
+            send_now_playing_update(&player_state, &self.connector_update_tx);
+        }
     }
 
     fn handle_session_check_tick(&self, smtc_event_tx: &TokioSender<SmtcEventSignal>) {
@@ -1101,6 +1108,43 @@ impl SmtcRunner {
 
                 let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
             }
+        }
+
+        if let Some(session_guard) = &self.state.session_guard {
+            let session_id_res = session_guard.session.SourceAppUserModelId();
+            if session_id_res.is_err() {
+                let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
+                return;
+            }
+
+            let player_state_clone = self.player_state_arc.clone();
+            let connector_tx_clone = self.connector_update_tx.clone();
+            let session_clone = session_guard.session.clone();
+
+            tokio::task::spawn_local(async move {
+                let unwind_result = std::panic::catch_unwind(move || {
+                    session_clone.GetPlaybackInfo().ok().and_then(|info| {
+                        info.PlaybackStatus().ok().map(|status| match status {
+                            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => {
+                                PlaybackStatus::Playing
+                            }
+                            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => {
+                                PlaybackStatus::Paused
+                            }
+                            _ => PlaybackStatus::Stopped,
+                        })
+                    })
+                });
+
+                if let Ok(Some(current_status)) = unwind_result {
+                    let mut player_state = player_state_clone.lock().await;
+                    if player_state.playback_status != current_status {
+                        player_state.playback_status = current_status;
+                        send_now_playing_update(&player_state, &connector_tx_clone);
+                        drop(player_state);
+                    }
+                }
+            });
         }
     }
 
