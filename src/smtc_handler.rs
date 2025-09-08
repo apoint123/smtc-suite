@@ -377,14 +377,8 @@ impl SmtcRunner {
             tokio::time::interval(std::time::Duration::from_millis(250));
 
         loop {
-            pump_pending_messages();
-
             tokio::select! {
                 biased;
-
-                () = tokio::time::sleep(std::time::Duration::from_millis(16)) => {
-                    // 这个分支的目的就是为了唤醒 select!
-                },
 
                 maybe_shutdown = self.shutdown_rx.recv() => {
                     if maybe_shutdown.is_some() {
@@ -1370,6 +1364,13 @@ pub async fn run_smtc_listener(
     shutdown_rx: TokioReceiver<()>,
     diagnostics_tx: TokioSender<DiagnosticInfo>,
 ) -> Result<()> {
+    let message_pump_task = tokio::task::spawn_local(async {
+        loop {
+            pump_pending_messages();
+            tokio::task::yield_now().await;
+        }
+    });
+
     let mut runner = SmtcRunner {
         state: SmtcState::new(),
         connector_update_tx,
@@ -1382,6 +1383,8 @@ pub async fn run_smtc_listener(
     if let Err(e) = runner.run().await {
         log::error!("[SmtcRunner] 事件循环因错误退出: {e:?}");
     }
+
+    message_pump_task.abort();
 
     let state = runner.state;
     if let Some((task, token)) = state.active_volume_easing_task {
