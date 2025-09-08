@@ -377,14 +377,8 @@ impl SmtcRunner {
             tokio::time::interval(std::time::Duration::from_millis(250));
 
         loop {
-            pump_pending_messages();
-
             tokio::select! {
                 biased;
-
-                () = tokio::time::sleep(std::time::Duration::from_millis(16)) => {
-                    // 这个分支的目的就是为了唤醒 select!
-                },
 
                 maybe_shutdown = self.shutdown_rx.recv() => {
                     if maybe_shutdown.is_some() {
@@ -639,6 +633,15 @@ impl SmtcRunner {
     }
 
     async fn handle_playback_info_signal(&self, event_session_id: String) -> WinResult<()> {
+        // FIXME:
+        // 这里存在一个竞态条件，PlaybackInfoChanged通知几乎是瞬时到达Tokio
+        // 通道的，但播放状态依赖于一个需要被pump_pending_messages所处理的底层消息。
+        // 我们可能在收到事件通知后、但在下一次pump_pending_messages调用前来执行此函数。
+        // 如果立刻调用GetPlaybackInfo，几乎肯定会查询到事件发生前的、已经过时的状态。
+        //
+        // TODO: 我觉得应该换到同步通道来解决这个问题。
+        tokio::time::sleep(TokioDuration::from_millis(20)).await;
+
         let Some(manager_guard) = &self.state.manager_guard else {
             return Ok(());
         };
@@ -695,6 +698,9 @@ impl SmtcRunner {
     }
 
     async fn handle_timeline_properties_signal(&self, event_session_id: String) -> WinResult<()> {
+        // FIXME: 见上面
+        tokio::time::sleep(TokioDuration::from_millis(20)).await;
+
         #[derive(Debug)]
         struct SafeTimelineProperties {
             position_ms: u64,
@@ -1370,6 +1376,13 @@ pub async fn run_smtc_listener(
     shutdown_rx: TokioReceiver<()>,
     diagnostics_tx: TokioSender<DiagnosticInfo>,
 ) -> Result<()> {
+    let message_pump_task = tokio::task::spawn_local(async {
+        loop {
+            pump_pending_messages();
+            tokio::task::yield_now().await;
+        }
+    });
+
     let mut runner = SmtcRunner {
         state: SmtcState::new(),
         connector_update_tx,
@@ -1382,6 +1395,8 @@ pub async fn run_smtc_listener(
     if let Err(e) = runner.run().await {
         log::error!("[SmtcRunner] 事件循环因错误退出: {e:?}");
     }
+
+    message_pump_task.abort();
 
     let state = runner.state;
     if let Some((task, token)) = state.active_volume_easing_task {
