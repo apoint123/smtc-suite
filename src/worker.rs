@@ -6,7 +6,10 @@ use tokio::{
     task::LocalSet,
 };
 use windows::{
-    Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+    Win32::{
+        Media::Audio::{AudioSessionState, AudioSessionStateExpired},
+        System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize},
+    },
     core::Result as WinResult,
 };
 
@@ -52,8 +55,11 @@ pub enum InternalUpdate {
     TrackChanged(NowPlayingInfo),
     /// 由 `smtc_handler` 发出，表示活动的 SMTC 会话已更改。
     ActiveSmtcSessionChanged { pid: Option<u32> },
-    /// 由 `audio_session_monitor` 的回调发出，表示被监听的会话已失效（如关闭、崩溃）。
-    MonitoredAudioSessionExpired,
+    /// 由 `audio_session_monitor` 的回调发出，表示被监听的会话状态已发生变化。
+    AudioSessionStateChanged {
+        session_id: String,
+        new_state: AudioSessionState,
+    },
     /// 由 `smtc_handler` 发出，表示可用的 SMTC 会话列表已更新。
     SmtcSessionListChanged(Vec<SmtcSessionInfo>),
     /// 由 `smtc_handler` 发出，表示之前选中的会话已消失。
@@ -154,14 +160,25 @@ impl MediaWorker {
                     self.handle_internal_update(update, "SMTC").await;
                 },
 
-                Some(diag_info) = self.diagnostics_rx.as_mut().unwrap().recv(), if self.diagnostics_rx.is_some() => {
-                    if self.update_tx.send(MediaUpdate::Diagnostic(diag_info)).await.is_err() {
-                        log::error!("[MediaWorker] 发送 Diagnostic 更新到外部失败。");
+                diag_result = async {
+                    match self.diagnostics_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
                     }
+                }, if self.diagnostics_rx.is_some() => {
+                    if let Some(diag_info) = diag_result
+                        && self.update_tx.send(MediaUpdate::Diagnostic(diag_info)).await.is_err() {
+                            log::error!("[MediaWorker] 发送 Diagnostic 更新到外部失败。");
+                        }
                 },
 
-                maybe_update = self.audio_update_rx.as_mut().unwrap().recv(), if self.audio_update_rx.is_some() => {
-                    if let Some(update) = maybe_update {
+                audio_result = async {
+                    match self.audio_update_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.audio_update_rx.is_some() => {
+                    if let Some(update) = audio_result {
                          self.handle_internal_update(update, "Audio").await;
                     } else {
                         log::warn!("[MediaWorker] 音频捕获更新通道已断开 (线程可能已退出)。");
@@ -224,7 +241,22 @@ impl MediaWorker {
                 }
                 None
             }
-            InternalUpdate::MonitoredAudioSessionExpired => None,
+            InternalUpdate::AudioSessionStateChanged {
+                session_id,
+                new_state,
+            } => {
+                log::debug!("[MediaWorker] 音频会话 '{session_id}' 状态变为: {new_state:?}");
+
+                if new_state == AudioSessionStateExpired {
+                    log::info!("[MediaWorker] 音频会话已过期，停止监听。");
+                    if let Some(tx) = &self.audio_monitor_command_tx
+                        && tx.send(AudioMonitorCommand::StopMonitoring).await.is_err()
+                    {
+                        log::error!("[MediaWorker] 发送 StopMonitoring 命令失败。");
+                    }
+                }
+                None
+            }
             InternalUpdate::TrackChanged(info) => Some(MediaUpdate::TrackChanged(info)),
             InternalUpdate::SmtcSessionListChanged(list) => {
                 Some(MediaUpdate::SessionsChanged(list))

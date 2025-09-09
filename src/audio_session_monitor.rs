@@ -9,7 +9,7 @@ use tokio::sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender};
 use windows::{
     Win32::{
         Media::Audio::{
-            AudioSessionState, AudioSessionStateActive, IAudioSessionControl,
+            AudioSessionState, AudioSessionStateExpired, IAudioSessionControl,
             IAudioSessionControl2, IAudioSessionEvents, IAudioSessionEvents_Impl,
             IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
             eConsole, eRender,
@@ -65,12 +65,20 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
         Ok(())
     }
     fn OnStateChanged(&self, new_state: AudioSessionState) -> windows::core::Result<()> {
-        if new_state != AudioSessionStateActive {
-            log::debug!("[音量监听器] 会话状态变为非活跃 ({new_state:?})");
-            if let Ok(guard) = self.tx.lock()
-                && let Some(tx) = guard.as_ref()
-            {
-                let _ = tx.try_send(InternalUpdate::MonitoredAudioSessionExpired);
+        log::debug!(
+            "[音量监听器] 会话 '{}' 状态变为: {:?}",
+            self.session_id,
+            new_state
+        );
+        if let Ok(guard) = self.tx.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            let update = InternalUpdate::AudioSessionStateChanged {
+                session_id: self.session_id.clone(),
+                new_state,
+            };
+            if tx.try_send(update).is_err() {
+                log::warn!("[音量监听器] 发送状态更新失败。");
             }
         }
         Ok(())
@@ -79,11 +87,21 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
         &self,
         disconnect_reason: windows::Win32::Media::Audio::AudioSessionDisconnectReason,
     ) -> windows::core::Result<()> {
-        log::debug!("[音量监听器] 会话断开 ({disconnect_reason:?})");
+        log::debug!(
+            "[音量监听器] 会话 '{}' 断开 ({:?})",
+            self.session_id,
+            disconnect_reason
+        );
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
         {
-            let _ = tx.try_send(InternalUpdate::MonitoredAudioSessionExpired);
+            let update = InternalUpdate::AudioSessionStateChanged {
+                session_id: self.session_id.clone(),
+                new_state: AudioSessionStateExpired,
+            };
+            if tx.try_send(update).is_err() {
+                log::warn!("[音量监听器] 发送断开连接事件失败。");
+            }
         }
         Ok(())
     }
