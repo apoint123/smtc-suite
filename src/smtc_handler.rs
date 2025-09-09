@@ -713,6 +713,14 @@ impl SmtcRunner {
             return Ok(());
         }
 
+        if let Some(guard) = &self.state.session_guard
+            && let Ok(props) = guard.session.GetTimelineProperties()
+            && let Ok(end_time) = props.EndTime()
+        {
+            let new_dur_ms = (end_time.Duration / 10000) as u64;
+            state_guard.song_duration_ms = new_dur_ms;
+        }
+
         let estimated_current_pos_ms = state_guard.get_estimated_current_position_ms();
         let is_seek = (new_pos_ms as i64 - estimated_current_pos_ms as i64).abs()
             > SEEK_DETECTION_THRESHOLD_MS as i64;
@@ -1170,9 +1178,7 @@ impl SmtcRunner {
                 if let Some((pos_ms, dur_ms)) = initial_timeline_info {
                     player_state.last_known_position_ms = pos_ms;
                     player_state.last_known_position_report_time = Some(Instant::now());
-                    if dur_ms > 0 {
-                        player_state.song_duration_ms = dur_ms;
-                    }
+                    player_state.song_duration_ms = dur_ms;
                 }
                 send_now_playing_update(&player_state, &self.connector_update_tx);
                 drop(player_state);
