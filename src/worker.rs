@@ -86,6 +86,7 @@ pub struct MediaWorker {
     smtc_shutdown_tx: Option<TokioSender<()>>,
     audio_monitor_command_tx: Option<TokioSender<AudioMonitorCommand>>,
     audio_monitor_task_handle: Option<TokioJoinHandle<()>>,
+    audio_monitor_shutdown_tx: Option<TokioSender<()>>,
     audio_capturer: Option<AudioCapturer>,
     audio_update_rx: Option<TokioReceiver<InternalUpdate>>,
     _shared_player_state: Arc<tokio::sync::Mutex<SharedPlayerState>>,
@@ -105,11 +106,13 @@ impl MediaWorker {
 
         let (audio_monitor_command_tx, audio_monitor_command_rx) =
             channel::<AudioMonitorCommand>(8);
+        let (audio_monitor_shutdown_tx, audio_monitor_shutdown_rx) = channel::<()>(1);
         let audio_monitor = audio_session_monitor::AudioSessionMonitor::new(
             audio_monitor_command_rx,
             smtc_update_tx.clone(),
         );
-        let audio_monitor_handle = tokio::task::spawn_local(audio_monitor.run());
+        let audio_monitor_handle =
+            tokio::task::spawn_local(audio_monitor.run(audio_monitor_shutdown_rx));
 
         let (shutdown_tx, shutdown_rx) = channel::<()>(1);
         let smtc_listener_handle = tokio::task::spawn_local(smtc_handler::run_smtc_listener(
@@ -130,6 +133,7 @@ impl MediaWorker {
             smtc_shutdown_tx: Some(shutdown_tx),
             audio_monitor_command_tx: Some(audio_monitor_command_tx),
             audio_monitor_task_handle: Some(audio_monitor_handle),
+            audio_monitor_shutdown_tx: Some(audio_monitor_shutdown_tx),
             audio_capturer: None,
             audio_update_rx: None,
             _shared_player_state: player_state,
@@ -191,40 +195,32 @@ impl MediaWorker {
     }
 
     async fn handle_command_from_app(&mut self, command: MediaCommand) {
-        match command {
+        let internal_command = match command {
             MediaCommand::SelectSession(session_id) => {
-                self.send_internal_command_to_smtc(InternalCommand::SelectSmtcSession(session_id))
-                    .await;
+                Some(InternalCommand::SelectSmtcSession(session_id))
             }
-            MediaCommand::Control(smtc_cmd) => {
-                self.send_internal_command_to_smtc(InternalCommand::MediaControl(smtc_cmd))
-                    .await;
+            MediaCommand::Control(smtc_cmd) => Some(InternalCommand::MediaControl(smtc_cmd)),
+            MediaCommand::SetTextConversion(mode) => Some(InternalCommand::SetTextConversion(mode)),
+            MediaCommand::RequestUpdate => Some(InternalCommand::RequestStateUpdate),
+            MediaCommand::SetHighFrequencyProgressUpdates(enabled) => {
+                Some(InternalCommand::SetProgressTimer(enabled))
+            }
+            MediaCommand::SetProgressOffset(offset) => {
+                Some(InternalCommand::SetProgressOffset(offset))
             }
             MediaCommand::StartAudioCapture => {
                 self.start_audio_capture_internal();
+                None
             }
             MediaCommand::StopAudioCapture => {
                 self.stop_audio_capture_internal();
+                None
             }
-            MediaCommand::SetTextConversion(mode) => {
-                self.send_internal_command_to_smtc(InternalCommand::SetTextConversion(mode))
-                    .await;
-            }
-            MediaCommand::RequestUpdate => {
-                self.send_internal_command_to_smtc(InternalCommand::RequestStateUpdate)
-                    .await;
-            }
-            MediaCommand::SetHighFrequencyProgressUpdates(enabled) => {
-                self.send_internal_command_to_smtc(InternalCommand::SetProgressTimer(enabled))
-                    .await;
-            }
-            MediaCommand::SetProgressOffset(offset) => {
-                self.send_internal_command_to_smtc(InternalCommand::SetProgressOffset(offset))
-                    .await;
-            }
-            MediaCommand::Shutdown => {
-                // 已在上面循环中优先处理
-            }
+            MediaCommand::Shutdown => None,
+        };
+
+        if let Some(cmd) = internal_command {
+            self.send_internal_command_to_smtc(cmd).await;
         }
     }
 
@@ -331,11 +327,17 @@ impl MediaWorker {
     async fn shutdown_all_subsystems(&mut self) {
         log::info!("[MediaWorker] 正在关闭所有子系统...");
         self.smtc_control_tx.take();
-        if self.audio_monitor_command_tx.take().is_some() {
-            log::debug!("[MediaWorker] 音量监听器命令通道已关闭。");
+        self.audio_monitor_command_tx.take();
+
+        if let Some(tx) = self.audio_monitor_shutdown_tx.take() {
+            let _ = tx.send(()).await;
         }
-        if let Some(handle) = self.audio_monitor_task_handle.take() {
-            handle.abort();
+        if let Some(handle) = self.audio_monitor_task_handle.take()
+            && tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+                .await
+                .is_err()
+        {
+            log::warn!("[MediaWorker] 音频监视器退出超时，将强制中止。");
         }
         if let Some(tx) = self.smtc_shutdown_tx.take() {
             let _ = tx.send(()).await;
@@ -345,7 +347,7 @@ impl MediaWorker {
                 .await
                 .is_err()
         {
-            log::warn!("[MediaWorker] SMTC 监听器优雅退出超时，将强制中止。");
+            log::warn!("[MediaWorker] SMTC 监听器退出超时，将强制中止。");
         }
         self.stop_audio_capture_internal();
     }
@@ -355,8 +357,6 @@ impl Drop for MediaWorker {
     fn drop(&mut self) {
         if self.smtc_control_tx.is_some() {
             log::warn!("[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)。");
-        } else {
-            log::trace!("[MediaWorker] MediaWorker 实例被正常丢弃。");
         }
     }
 }

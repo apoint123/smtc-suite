@@ -147,14 +147,21 @@ impl AudioSessionMonitor {
         }
     }
 
-    pub async fn run(mut self) {
+    pub async fn run(mut self, mut shutdown_rx: TokioReceiver<()>) {
         loop {
             tokio::select! {
+                biased;
+
+                _ = shutdown_rx.recv() => {
+                    break;
+                },
+
                 Some(command) = self.command_rx.recv() => {
                     if let Err(e) = self.handle_command(command).await {
                         log::error!("[音量监听器] 处理命令失败: {e:?}");
                     }
-                }
+                },
+
                 else => {
                     break;
                 }

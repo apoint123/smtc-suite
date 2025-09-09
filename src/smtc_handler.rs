@@ -428,13 +428,14 @@ impl SmtcRunner {
 
                 Some(command) = self.control_rx.recv() => {
                     if let Err(e) = self.handle_internal_command(command, &smtc_event_tx, &async_result_tx, &progress_signal_tx).await {
-                        log::error!("[SmtcRunner] 处理内部命令时发生致命错误: {e:?}，循环将终止。");
-                        return Err(crate::error::SmtcError::Windows(e));
+                        log::error!("[SmtcRunner] 处理内部命令时发生错误: {e:?}");
                     }
                 },
 
                 Some(signal) = smtc_event_rx.recv() => {
-                    self.handle_smtc_event(signal, &smtc_event_tx, &async_result_tx).await?;
+                    if let Err(e) = self.handle_smtc_event(signal, &smtc_event_tx, &async_result_tx).await {
+                        log::error!("[SmtcRunner] 处理 SMTC 事件时发生错误: {e:?}");
+                    }
                 },
 
                 Some(result) = async_result_rx.recv() => {
@@ -641,29 +642,24 @@ impl SmtcRunner {
         event_session_id: String,
         async_result_tx: &TokioSender<AsyncTaskResult>,
     ) {
-        let session_clone = self.state.session_guard.as_ref().map_or_else(
-            || None,
-            |guard| {
-                guard.session.SourceAppUserModelId().map_or_else(
-                    |_| None,
-                    |id_hstr| {
-                        if id_hstr.to_string_lossy() == event_session_id {
-                            Some(guard.session.clone())
-                        } else {
-                            None
-                        }
-                    },
-                )
-            },
-        );
+        let Some(guard) = self.state.session_guard.as_ref() else {
+            return;
+        };
 
-        if let Some(session_clone) = session_clone {
-            spawn_async_op(
-                session_clone.TryGetMediaPropertiesAsync(),
-                async_result_tx,
-                move |res| AsyncTaskResult::MediaPropertiesReady(event_session_id, res),
-            );
+        let Ok(id_hstr) = guard.session.SourceAppUserModelId() else {
+            return;
+        };
+
+        if id_hstr.to_string_lossy() != event_session_id {
+            return;
         }
+
+        let session_clone = guard.session.clone();
+        spawn_async_op(
+            session_clone.TryGetMediaPropertiesAsync(),
+            async_result_tx,
+            move |res| AsyncTaskResult::MediaPropertiesReady(event_session_id, res),
+        );
     }
 
     async fn handle_playback_info_update(
@@ -747,15 +743,23 @@ impl SmtcRunner {
         match result {
             AsyncTaskResult::ManagerReady(res) => self.on_manager_ready(res, smtc_event_tx),
             AsyncTaskResult::MediaPropertiesReady(session_id, res) => {
-                self.on_media_properties_ready(session_id, res, async_result_tx)
+                if let Err(e) = self
+                    .on_media_properties_ready(session_id, res, async_result_tx)
                     .await
+                {
+                    log::warn!("[SmtcRunner] 处理媒体属性结果时出错: {e:?}");
+                }
+                Ok(())
             }
             AsyncTaskResult::MediaControlCompleted(cmd, res) => {
                 Self::on_media_control_completed(cmd, res);
                 Ok(())
             }
             AsyncTaskResult::CoverDataReady(res) => {
-                self.on_cover_data_ready(res, smtc_event_tx).await
+                if let Err(e) = self.on_cover_data_ready(res, smtc_event_tx).await {
+                    log::warn!("[SmtcRunner] 处理封面数据结果时出错: {e:?}");
+                }
+                Ok(())
             }
         }
     }
@@ -831,9 +835,8 @@ impl SmtcRunner {
 
                 if is_new_track {
                     if self.state.last_failed_cover_track.as_ref()
-                        == Some(&(artist.clone(), title.clone()))
+                        != Some(&(artist.clone(), title.clone()))
                     {
-                    } else {
                         self.state.last_failed_cover_track = None;
                     }
                     log::info!(
@@ -1237,27 +1240,19 @@ fn extract_playback_info_from_session(session: &MediaSession) -> WinResult<Playb
 
     let c = info.Controls()?;
     let mut controls = Controls::empty();
-    if c.IsPlayEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_PLAY);
-    }
-    if c.IsPauseEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_PAUSE);
-    }
-    if c.IsNextEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_SKIP_NEXT);
-    }
-    if c.IsPreviousEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_SKIP_PREVIOUS);
-    }
-    if c.IsPlaybackPositionEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_SEEK);
-    }
-    if c.IsShuffleEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_CHANGE_SHUFFLE);
-    }
-    if c.IsRepeatEnabled().unwrap_or(false) {
-        controls.insert(Controls::CAN_CHANGE_REPEAT);
-    }
+    let mut add_control = |flag, check: WinResult<bool>| {
+        if check.unwrap_or(false) {
+            controls.insert(flag);
+        }
+    };
+
+    add_control(Controls::CAN_PLAY, c.IsPlayEnabled());
+    add_control(Controls::CAN_PAUSE, c.IsPauseEnabled());
+    add_control(Controls::CAN_SKIP_NEXT, c.IsNextEnabled());
+    add_control(Controls::CAN_SKIP_PREVIOUS, c.IsPreviousEnabled());
+    add_control(Controls::CAN_SEEK, c.IsPlaybackPositionEnabled());
+    add_control(Controls::CAN_CHANGE_SHUFFLE, c.IsShuffleEnabled());
+    add_control(Controls::CAN_CHANGE_REPEAT, c.IsRepeatEnabled());
 
     Ok(PlaybackInfoUpdate {
         playback_status,

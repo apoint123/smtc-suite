@@ -107,10 +107,8 @@ impl SharedPlayerState {
     /// 将播放状态重置为空白/默认状态。
     /// 通常在没有活动媒体会话时调用。
     pub fn reset_to_empty(&mut self) {
-        *self = Self {
-            is_waiting_for_initial_update: true,
-            ..Self::default()
-        };
+        *self = Self::default();
+        self.is_waiting_for_initial_update = true;
     }
 
     /// 根据上次报告的播放位置和当前时间，估算实时的播放进度。
