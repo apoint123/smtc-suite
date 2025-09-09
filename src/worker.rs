@@ -154,27 +154,14 @@ impl MediaWorker {
                     self.handle_internal_update(update, "SMTC").await;
                 },
 
-                maybe_diag_update = async {
-                    if let Some(rx) = self.diagnostics_rx.as_mut() {
-                        rx.recv().await
-                    } else {
-                        std::future::pending().await
+                Some(diag_info) = self.diagnostics_rx.as_mut().unwrap().recv(), if self.diagnostics_rx.is_some() => {
+                    if self.update_tx.send(MediaUpdate::Diagnostic(diag_info)).await.is_err() {
+                        log::error!("[MediaWorker] 发送 Diagnostic 更新到外部失败。");
                     }
-                }, if self.diagnostics_rx.is_some() => {
-                     if let Some(diag_info) = maybe_diag_update
-                        && self.update_tx.send(MediaUpdate::Diagnostic(diag_info)).await.is_err() {
-                            log::error!("[MediaWorker] 发送 Diagnostic 更新到外部失败。");
-                        }
                 },
 
-                maybe_audio_update = async {
-                    if let Some(rx) = self.audio_update_rx.as_mut() {
-                        rx.recv().await
-                    } else {
-                        std::future::pending().await
-                    }
-                }, if self.audio_update_rx.is_some() => {
-                    if let Some(update) = maybe_audio_update {
+                maybe_update = self.audio_update_rx.as_mut().unwrap().recv(), if self.audio_update_rx.is_some() => {
+                    if let Some(update) = maybe_update {
                          self.handle_internal_update(update, "Audio").await;
                     } else {
                         log::warn!("[MediaWorker] 音频捕获更新通道已断开 (线程可能已退出)。");
@@ -225,7 +212,7 @@ impl MediaWorker {
     }
 
     async fn handle_internal_update(&self, internal_update: InternalUpdate, source: &str) {
-        match internal_update {
+        let maybe_public_update = match internal_update {
             InternalUpdate::ActiveSmtcSessionChanged { pid } => {
                 let command = pid.map_or(AudioMonitorCommand::StopMonitoring, |pid_val| {
                     AudioMonitorCommand::StartMonitoring(pid_val)
@@ -233,23 +220,35 @@ impl MediaWorker {
                 if let Some(tx) = &self.audio_monitor_command_tx
                     && tx.send(command).await.is_err()
                 {
-                    log::error!("[MediaWorker] 发送命令到音量监听器失败。");
+                    log::error!("[MediaWorker] 发送命令到音频会话监视器失败。");
                 }
+                None
             }
-            InternalUpdate::MonitoredAudioSessionExpired => {
-                // if let Some(tx) = &self.audio_monitor_command_tx
-                //     && tx.send(AudioMonitorCommand::StopMonitoring).await.is_err()
-                // {
-                //     log::error!("[MediaWorker] 发送 StopMonitoring 命令到音量监听器失败。");
-                // }
+            InternalUpdate::MonitoredAudioSessionExpired => None,
+            InternalUpdate::TrackChanged(info) => Some(MediaUpdate::TrackChanged(info)),
+            InternalUpdate::SmtcSessionListChanged(list) => {
+                Some(MediaUpdate::SessionsChanged(list))
             }
+            InternalUpdate::AudioDataPacket(bytes) => Some(MediaUpdate::AudioData(bytes)),
+            InternalUpdate::AudioSessionVolumeChanged {
+                session_id,
+                volume,
+                is_muted,
+            } => Some(MediaUpdate::VolumeChanged {
+                session_id,
+                volume,
+                is_muted,
+            }),
+            InternalUpdate::SelectedSmtcSessionVanished(session_id) => {
+                Some(MediaUpdate::SelectedSessionVanished(session_id))
+            }
+            InternalUpdate::AudioCaptureError(err) => Some(MediaUpdate::Error(err)),
+        };
 
-            other => {
-                let public_update: MediaUpdate = other.into();
-                if self.update_tx.send(public_update).await.is_err() {
-                    log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败。");
-                }
-            }
+        if let Some(public_update) = maybe_public_update
+            && self.update_tx.send(public_update).await.is_err()
+        {
+            log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败。");
         }
     }
 
@@ -371,32 +370,4 @@ pub fn start_media_worker_thread(
             });
         })
         .map_err(|e| SmtcError::WorkerThread(e.to_string()))
-}
-
-#[allow(clippy::fallible_impl_from)]
-impl From<InternalUpdate> for MediaUpdate {
-    fn from(internal: InternalUpdate) -> Self {
-        match internal {
-            InternalUpdate::TrackChanged(info) => Self::TrackChanged(info),
-            InternalUpdate::SmtcSessionListChanged(list) => Self::SessionsChanged(list),
-            InternalUpdate::AudioDataPacket(bytes) => Self::AudioData(bytes),
-            InternalUpdate::AudioSessionVolumeChanged {
-                session_id,
-                volume,
-                is_muted,
-            } => Self::VolumeChanged {
-                session_id,
-                volume,
-                is_muted,
-            },
-            InternalUpdate::SelectedSmtcSessionVanished(session_id) => {
-                Self::SelectedSessionVanished(session_id)
-            }
-            InternalUpdate::AudioCaptureError(err) => Self::Error(err),
-            // 内部事件已在上层处理，理论上不应该到达这里
-            _ => {
-                panic!("尝试将一个内部事件 ({internal:?}) 转换为公共更新。")
-            }
-        }
-    }
 }
