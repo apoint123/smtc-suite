@@ -17,6 +17,7 @@ use std::{
 };
 use tokio::runtime::Runtime as TokioRuntime;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 // ================================================================================================
 // C-ABI 兼容的公共枚举和数据结构
@@ -287,7 +288,7 @@ pub struct SmtcHandle {
     update_rx: Option<mpsc::Receiver<MediaUpdate>>,
     runtime: Option<TokioRuntime>,
     update_listener_handle: Option<std::thread::JoinHandle<()>>,
-    shutdown_signal: Arc<AtomicBool>,
+    shutdown_token: CancellationToken,
     callback_info: Arc<Mutex<Option<(UpdateCallback, SendableVoidPtr)>>>,
     is_destroyed: AtomicBool,
     listener_creation_mutex: Mutex<()>,
@@ -355,7 +356,7 @@ pub unsafe extern "C" fn smtc_suite_create(out_handle: *mut *mut SmtcHandle) -> 
                 update_rx: Some(update_rx),
                 runtime: Some(runtime),
                 update_listener_handle: None,
-                shutdown_signal: Arc::new(AtomicBool::new(false)),
+                shutdown_token: CancellationToken::new(),
                 callback_info: Arc::new(Mutex::new(None)),
                 is_destroyed: AtomicBool::new(false),
                 listener_creation_mutex: Mutex::new(()),
@@ -399,7 +400,7 @@ pub unsafe extern "C" fn smtc_suite_destroy(handle_ptr: *mut SmtcHandle) {
         }
 
         log::info!("[FFI] 正在销毁 SmtcHandle...");
-        handle.shutdown_signal.store(true, Ordering::Release);
+        handle.shutdown_token.cancel();
 
         // 使用存储的 runtime 来同步执行异步的 shutdown
         if let (Some(controller), Some(runtime)) = (handle.controller.take(), handle.runtime.take())
@@ -505,7 +506,7 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                     return SmtcResult::InternalError;
                 };
 
-                let shutdown_signal = handle.shutdown_signal.clone();
+                let shutdown_token = handle.shutdown_token.clone();
                 let callback_info = handle.callback_info.clone();
 
                 let join_handle = std::thread::spawn(move || {
@@ -551,7 +552,7 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                                     }
                                 },
 
-                                () = tokio::time::sleep(Duration::from_millis(100)), if shutdown_signal.load(Ordering::Acquire) => {
+                                () = shutdown_token.cancelled() => {
                                      log::debug!("[FFI 回调线程] 收到关闭信号，准备退出。");
                                      break;
                                 }
@@ -875,12 +876,12 @@ pub unsafe extern "C" fn smtc_suite_init_logging(
 /// # 安全性
 /// `s` 必须是一个由本库的 FFI 函数返回、且尚未被释放的有效指针。
 /// 传入 `NULL` 是安全的。
-unsafe fn smtc_suite_free_string(s: *mut c_char) {
+fn free_string(s: *mut c_char) {
     if s.is_null() {
         return;
     }
     let _ = catch_unwind(AssertUnwindSafe(|| {
-        drop(unsafe { CString::from_raw(s) });
+        unsafe { drop(CString::from_raw(s)) };
     }));
 }
 
@@ -892,7 +893,7 @@ unsafe fn smtc_suite_free_string(s: *mut c_char) {
 struct StringGuard(*mut c_char);
 impl Drop for StringGuard {
     fn drop(&mut self) {
-        unsafe { smtc_suite_free_string(self.0) };
+        free_string(self.0);
     }
 }
 
@@ -900,11 +901,9 @@ impl Drop for StringGuard {
 struct NowPlayingInfoGuard(CNowPlayingInfo);
 impl Drop for NowPlayingInfoGuard {
     fn drop(&mut self) {
-        unsafe {
-            smtc_suite_free_string(self.0.title.cast_mut());
-            smtc_suite_free_string(self.0.artist.cast_mut());
-            smtc_suite_free_string(self.0.album_title.cast_mut());
-        }
+        free_string(self.0.title.cast_mut());
+        free_string(self.0.artist.cast_mut());
+        free_string(self.0.album_title.cast_mut());
     }
 }
 
@@ -913,11 +912,9 @@ struct SessionListGuard(Vec<CSessionInfo>);
 impl Drop for SessionListGuard {
     fn drop(&mut self) {
         for session in self.0.drain(..) {
-            unsafe {
-                smtc_suite_free_string(session.session_id.cast_mut());
-                smtc_suite_free_string(session.source_app_user_model_id.cast_mut());
-                smtc_suite_free_string(session.display_name.cast_mut());
-            }
+            free_string(session.session_id.cast_mut());
+            free_string(session.source_app_user_model_id.cast_mut());
+            free_string(session.display_name.cast_mut());
         }
     }
 }
@@ -926,9 +923,7 @@ impl Drop for SessionListGuard {
 struct VolumeChangedEventGuard(CVolumeChangedEvent);
 impl Drop for VolumeChangedEventGuard {
     fn drop(&mut self) {
-        unsafe {
-            smtc_suite_free_string(self.0.session_id.cast_mut());
-        }
+        free_string(self.0.session_id.cast_mut());
     }
 }
 
@@ -936,10 +931,8 @@ impl Drop for VolumeChangedEventGuard {
 struct DiagnosticInfoGuard(CDiagnosticInfo);
 impl Drop for DiagnosticInfoGuard {
     fn drop(&mut self) {
-        unsafe {
-            smtc_suite_free_string(self.0.message.cast_mut());
-            smtc_suite_free_string(self.0.timestamp_str.cast_mut());
-        }
+        free_string(self.0.message.cast_mut());
+        free_string(self.0.timestamp_str.cast_mut());
     }
 }
 
