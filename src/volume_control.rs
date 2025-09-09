@@ -1,6 +1,4 @@
 use easer::functions::Easing;
-use std::ffi::OsString;
-use std::os::windows::ffi::OsStringExt;
 use tokio::sync::mpsc::Sender as TokioSender;
 use tokio::task::JoinHandle;
 use tokio::time::Duration as TokioDuration;
@@ -9,9 +7,8 @@ use windows::{
     Win32::{
         Foundation::{CloseHandle, ERROR_NO_MORE_FILES, HANDLE},
         Media::Audio::{
-            AudioSessionStateActive, IAudioSessionControl2, IAudioSessionEnumerator,
-            IAudioSessionManager2, IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator,
-            eConsole, eRender,
+            AudioSessionStateActive, IAudioSessionControl2, IAudioSessionManager2,
+            IMMDeviceEnumerator, ISimpleAudioVolume, MMDeviceEnumerator, eConsole, eRender,
         },
         System::{
             Com::{CLSCTX_ALL, CoCreateInstance},
@@ -21,7 +18,7 @@ use windows::{
             },
         },
     },
-    core::Interface,
+    core::{Interface, PCWSTR},
 };
 
 use crate::error::{Result, SmtcError};
@@ -44,21 +41,33 @@ async fn volume_easing_task(
     connector_tx: TokioSender<InternalUpdate>,
     cancel_token: CancellationToken,
 ) {
-    log::debug!(
-        "[音量缓动任务][ID:{task_id}] 启动。目标音量: {target_vol:.2}，会话: '{session_id}'"
-    );
+    let simple_audio_volume = match find_session_control(&session_id)
+        .and_then(|session| Ok(session.cast::<ISimpleAudioVolume>()?))
+    {
+        Ok(volume_control) => volume_control,
+        Err(e) => {
+            log::warn!("[缓动任务][ID:{task_id}] 无法获取音频会话控制接口: {e}，任务中止。");
+            return;
+        }
+    };
 
-    if let Ok((initial_vol, _)) = crate::volume_control::get_volume_for_identifier(&session_id) {
+    if let Ok(initial_vol) = unsafe { simple_audio_volume.GetMasterVolume() } {
         if (target_vol - initial_vol).abs() < VOLUME_EASING_THRESHOLD {
-            let _ = crate::volume_control::set_volume_for_identifier(
-                &session_id,
-                Some(target_vol),
-                None,
-            );
+            let _ = unsafe {
+                simple_audio_volume.SetMasterVolume(target_vol, &windows_core::GUID::default())
+            };
+            if let Ok(final_mute) = unsafe { simple_audio_volume.GetMute() } {
+                let _ = connector_tx
+                    .send(InternalUpdate::AudioSessionVolumeChanged {
+                        session_id,
+                        volume: target_vol,
+                        is_muted: final_mute.as_bool(),
+                    })
+                    .await;
+            }
             return;
         }
 
-        log::trace!("[音量缓动任务][ID:{task_id}] 初始音量: {initial_vol:.2}");
         let animation_duration_ms = VOLUME_EASING_DURATION_MS;
         let steps = VOLUME_EASING_STEPS;
         let step_duration =
@@ -68,7 +77,6 @@ async fn volume_easing_task(
             tokio::select! {
                 biased;
                 () = cancel_token.cancelled() => {
-                    log::debug!("[音量缓动任务][ID:{task_id}] 任务被取消。");
                     break;
                 }
                 () = tokio::time::sleep(step_duration) => {
@@ -81,30 +89,37 @@ async fn volume_easing_task(
                         animation_duration_ms,
                     );
 
-                    if crate::volume_control::set_volume_for_identifier(&session_id, Some(current_vol), None)
+                    if unsafe { simple_audio_volume.SetMasterVolume(current_vol, &windows_core::GUID::default()) }
                         .is_err()
                     {
-                        log::warn!("[音量缓动任务][ID:{task_id}] 设置音量失败，任务中止。");
+                        log::warn!("[缓动任务][ID:{task_id}] 设置音量失败，任务中止。");
                         break;
                     }
                 }
             }
         }
 
-        if let Ok((final_vol, final_mute)) =
-            crate::volume_control::get_volume_for_identifier(&session_id)
-        {
-            log::debug!("[音量缓动任务][ID:{task_id}] 完成。最终音量: {final_vol:.2}");
+        let _ = unsafe {
+            simple_audio_volume
+                .SetMasterVolume(target_vol.clamp(0.0, 1.0), &windows_core::GUID::default())
+        };
+
+        if let (Ok(final_vol), Ok(final_mute)) = unsafe {
+            (
+                simple_audio_volume.GetMasterVolume(),
+                simple_audio_volume.GetMute(),
+            )
+        } {
             let _ = connector_tx
                 .send(InternalUpdate::AudioSessionVolumeChanged {
                     session_id,
                     volume: final_vol,
-                    is_muted: final_mute,
+                    is_muted: final_mute.as_bool(),
                 })
                 .await;
         }
     } else {
-        log::warn!("[音量缓动任务][ID:{task_id}] 无法获取初始音量，任务中止。");
+        log::warn!("[缓动任务][ID:{task_id}] 无法获取初始音量，任务中止。");
     }
 }
 
@@ -125,246 +140,93 @@ pub fn spawn_volume_easing_task(
     (handle, cancel_token)
 }
 
-/// 通过应用程序的标识符（AUMID 或可执行文件名）获取其音量和静音状态。
-///
-/// # 参数
-/// * `identifier`: 目标应用的标识符字符串。
-///   - 对于 UWP 应用，应为 AUMID (e.g., "`Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic`")。
-///   - 对于 Win32 应用，应为可执行文件名 (e.g., "Spotify.exe")。
-///
-/// # 返回
-/// - `Ok((volume, is_muted))`: 成功时返回一个元组，包含音量（0.0-1.0）和静音状态（布尔值）。
-/// - `Err(SmtcError)`: 如果找不到匹配的活动音频会话，或发生其他 Windows API 错误。
-pub fn get_volume_for_identifier(identifier: &str) -> Result<(f32, bool)> {
-    log::debug!("[音量控制] 尝试获取标识符 '{identifier}' 的音量。");
-    let session_control = find_session_control_for_identifier(identifier)?;
-    let simple_audio_volume: ISimpleAudioVolume = session_control.cast()?;
-    let volume = unsafe { simple_audio_volume.GetMasterVolume()? };
-    let muted = unsafe { simple_audio_volume.GetMute()?.as_bool() };
-    Ok((volume, muted))
-}
-
-/// 通过应用程序的标识符设置其音量和/或静音状态。
-///
-/// # 参数
-/// * `identifier`: 目标应用的标识符字符串。
-/// * `volume_level`: 可选的目标音量级别 (0.0 到 1.0)。如果为 `None`，则不改变音量。
-/// * `mute`: 可选的静音状态。如果为 `None`，则不改变静音状态。
-pub fn set_volume_for_identifier(
-    identifier: &str,
-    volume_level: Option<f32>,
-    mute: Option<bool>,
-) -> Result<()> {
-    // 如果没有提供任何操作，则直接返回。
-    if volume_level.is_none() && mute.is_none() {
-        return Ok(());
-    }
-
-    log::debug!(
-        "[音量控制] 尝试为标识符 '{identifier}' 设置音量: {volume_level:?}, 静音: {mute:?}"
-    );
-    let session_control = find_session_control_for_identifier(identifier)?;
-    let simple_audio_volume: ISimpleAudioVolume = session_control.cast()?;
-
-    // SAFETY: 所有 Set* 调用都是安全的 COM FFI 调用。
-    unsafe {
-        if let Some(vol) = volume_level {
-            // GUID::default() 表示此音量变化事件的上下文为通用，没有特定的事件源。
-            simple_audio_volume
-                .SetMasterVolume(vol.clamp(0.0, 1.0), &windows_core::GUID::default())?;
-        }
-        if let Some(m) = mute {
-            simple_audio_volume.SetMute(m, &windows_core::GUID::default())?;
-        }
-    }
-    Ok(())
-}
-
-/// 根据给定的应用标识符，在系统中查找匹配的、活动的音频会话控制器。
-fn find_session_control_for_identifier(identifier: &str) -> Result<IAudioSessionControl2> {
-    // 预先获取 PID，作为后备匹配策略使用。
+fn find_session_control(identifier: &str) -> Result<IAudioSessionControl2> {
     let target_pid = get_pid_from_identifier(identifier);
+    let uwp_parts = parse_uwp_identifier(identifier);
 
-    // 如果是 UWP 应用，预先分解出其“应用名”和“发行商ID”部分。
-    let uwp_name_and_publisher_id: Option<(&str, &str)> = if identifier.contains('!') {
+    find_audio_session_with(|session| {
+        if let Some(pid) = target_pid
+            && let Ok(session_pid) = unsafe { session.GetProcessId() }
+            && session_pid > 0
+            && session_pid == pid
+        {
+            return true;
+        }
+
+        if let Some((name_part, publisher_id)) = &uwp_parts {
+            if let Ok(hstring) = unsafe { session.GetSessionIdentifier() }
+                && let Ok(session_id_str) = unsafe { hstring.to_string() }
+            {
+                let session_id_lower = session_id_str.to_lowercase();
+                if session_id_lower.contains(name_part) && session_id_lower.contains(publisher_id) {
+                    return true;
+                }
+            }
+
+            if let Ok(pwstr) = unsafe { session.GetIconPath() }
+                && !pwstr.is_null()
+                && let Ok(icon_path_str) = unsafe { pwstr.to_string() }
+            {
+                let icon_path_lower = icon_path_str.to_lowercase();
+                if icon_path_lower.contains(name_part) && icon_path_lower.contains(publisher_id) {
+                    return true;
+                }
+            }
+        }
+
+        false
+    })
+    .map_err(|_| {
+        SmtcError::VolumeControl(format!(
+            "未能为标识符 '{identifier}' 找到匹配的活动音频会话。"
+        ))
+    })
+}
+
+fn parse_uwp_identifier(identifier: &str) -> Option<(String, String)> {
+    if identifier.contains('!') {
         identifier
             .split('!')
             .next()
             .and_then(|pfn| pfn.rsplit_once('_'))
+            .map(|(name, publisher)| (name.to_lowercase(), publisher.to_lowercase()))
     } else {
         None
-    };
-
-    unsafe {
-        let device_enumerator: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
-        let default_device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
-        let session_manager: IAudioSessionManager2 = default_device.Activate(CLSCTX_ALL, None)?;
-        let session_enumerator = session_manager.GetSessionEnumerator()?;
-        let count = session_enumerator.GetCount()?;
-
-        let mut all_sessions_for_debug = Vec::new();
-
-        // 遍历系统中所有的音频会话
-        for i in 0..count {
-            if let Ok(session_control) = session_enumerator.GetSession(i)
-                && let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>()
-            {
-                // --- UWP 应用匹配策略 ---
-                if let Some((name_part, publisher_id)) = uwp_name_and_publisher_id {
-                    let name_part_lower = name_part.to_lowercase();
-                    let publisher_id_lower = publisher_id.to_lowercase();
-
-                    // 策略 1A: 检查 SessionIdentifier (针对 Apple Music 等)
-                    if let Ok(hstring) = session_control2.GetSessionIdentifier()
-                        && let Ok(session_id_str) = hstring.to_string()
-                    {
-                        let session_id_lower = session_id_str.to_lowercase();
-                        if session_id_lower.contains(&name_part_lower)
-                            && session_id_lower.contains(&publisher_id_lower)
-                            && let Ok(state) = session_control2.GetState()
-                            && state == AudioSessionStateActive
-                        {
-                            log::info!(
-                                "[音量控制] 通过匹配 SessionIdentifier 中的组件找到UWP音频会话。"
-                            );
-                            return Ok(session_control2);
-                        }
-                    }
-
-                    // 策略 1B: 检查 IconPath (针对某些特殊UWP应用)
-                    if let Ok(pwstr) = session_control2.GetIconPath()
-                        && !pwstr.is_null()
-                        && let Ok(icon_path_str) = pwstr.to_string()
-                    {
-                        let icon_path_lower = icon_path_str.to_lowercase();
-                        if icon_path_lower.contains(&name_part_lower)
-                            && icon_path_lower.contains(&publisher_id_lower)
-                            && let Ok(state) = session_control2.GetState()
-                            && state == AudioSessionStateActive
-                        {
-                            log::info!("[音量控制] 通过匹配 IconPath 中的组件找到UWP音频会话。");
-                            return Ok(session_control2);
-                        }
-                    }
-                }
-
-                // --- 策略 2 (Win32 或后备): 按 PID 匹配 ---
-                if let Some(pid) = target_pid
-                    && let Ok(session_pid) = session_control2.GetProcessId()
-                    && session_pid > 0
-                    && session_pid == pid
-                    && let Ok(state) = session_control2.GetState()
-                    && state == AudioSessionStateActive
-                {
-                    log::info!("[音量控制] 通过 PID {pid} 找到匹配的音频会话。");
-                    return Ok(session_control2);
-                }
-
-                // --- 调试信息收集 ---
-                // 如果日志级别足够高，则收集所有会话信息，以便在最终失败时打印。
-                if log::max_level() >= log::LevelFilter::Error
-                    && let Ok(state) = session_control2.GetState()
-                {
-                    let pid = session_control2.GetProcessId().unwrap_or(0);
-                    let display_name = match session_control2.GetDisplayName() {
-                        Ok(s) if !s.is_null() => s
-                            .to_string()
-                            .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
-                        _ => String::new(),
-                    };
-                    let session_id = session_control2
-                        .GetSessionIdentifier()
-                        .map_or_else(|_| String::new(), |s| s.to_string().unwrap_or_default());
-                    let icon_path = match session_control2.GetIconPath() {
-                        Ok(s) if !s.is_null() => s
-                            .to_string()
-                            .unwrap_or_else(|_| "<Invalid UTF-16>".to_string()),
-                        _ => String::new(),
-                    };
-
-                    all_sessions_for_debug.push(format!(
-                                "  > [会话 {i}] 状态: {state:?}, PID: {pid}, 显示名称: '{display_name}', 图标路径: '{icon_path}', 会话ID: '{session_id}'"
-                            ));
-                }
-            }
-        }
-
-        // 如果循环结束仍未找到匹配的会话，则打印所有收集到的会话信息。
-        log::error!("[音量控制] 未能为标识符 '{identifier}' 找到匹配的活动音频会话。");
-        if !all_sessions_for_debug.is_empty() {
-            log::trace!("[音量控制] 以下是系统中所有（包括非活动）音频会话的快照:");
-            for session_info in all_sessions_for_debug {
-                log::trace!("{session_info}");
-            }
-        }
     }
-
-    Err(SmtcError::VolumeControl(format!(
-        "在所有会话中都未找到与标识符 '{identifier}' 匹配的活动项。"
-    )))
 }
 
-/// 从给定的标识符（可执行文件名或 AUMID）动态地获取进程ID (PID)。
-///
-/// 此函数同样采用多策略来提高成功率。
+/// 从给定的标识符（可执行文件名或 AUMID）获取 PID。
 pub fn get_pid_from_identifier(identifier: &str) -> Option<u32> {
-    log::debug!("[音量控制] 尝试从标识符 '{identifier}' 获取 PID。");
-
-    // 策略 1: 直接将标识符作为可执行文件名进行匹配。
     if let Some(pid) = get_pid_from_executable_name(identifier) {
         log::trace!("[音量控制] 通过可执行文件名 '{identifier}' 直接找到 PID: {pid}");
         return Some(pid);
     }
 
-    // 如果标识符包含 '!'，则认为它是一个 AUMID，并尝试UWP相关策略。
-    if identifier.contains('!') {
-        // 策略 2: 从 AUMID 启发式地推断出可能的可执行文件名并进行匹配。
-        if let Some(derived_exe_name) = derive_executable_name_from_aumid(identifier) {
-            log::debug!(
-                "[音量控制] 标识符是 AUMID，已推断出候选可执行文件名: '{}'",
-                &derived_exe_name
-            );
-            if let Some(pid) = get_pid_from_executable_name(&derived_exe_name) {
-                log::debug!(
-                    "[音量控制] 通过从 AUMID 推断出的可执行文件名 '{}' 找到 PID: {}",
-                    &derived_exe_name,
-                    pid
-                );
-                return Some(pid);
-            }
-        }
-
-        // 策略 3 (后备): 通过遍历所有音频会话的 IconPath 来匹配。
-        // 这是一种成本较高但有时很有效的方法。
-        log::debug!("[音量控制] 推断 .exe 名称失败，回退到通过音频会话查找。");
-        if let Some(pfn_from_aumid) = identifier.split('!').next() {
-            match find_pid_for_aumid_via_audio_sessions(pfn_from_aumid) {
-                Ok(Some(pid)) => {
-                    log::debug!("[音量控制] 通过音频会话为 AUMID '{identifier}' 找到 PID: {pid}");
-                    return Some(pid);
-                }
-                Ok(None) => {
-                    log::warn!(
-                        "[音量控制] 无法通过音频会话为 AUMID '{identifier}' 找到匹配的 PID。"
-                    );
-                }
-                Err(e) => {
-                    log::error!(
-                        "[音量控制] 通过音频会话查找 AUMID '{identifier}' 的 PID 时出错: {e}"
-                    );
-                }
-            }
+    if !identifier.to_lowercase().ends_with(".exe") {
+        let exe_name = format!("{identifier}.exe");
+        if let Some(pid) = get_pid_from_executable_name(&exe_name) {
+            log::trace!("[音量控制] 通过追加 .exe ('{exe_name}') 找到 PID: {pid}");
+            return Some(pid);
         }
     }
 
-    log::warn!("[音量控制] 无法从标识符 '{identifier}' 解析 PID。");
+    if identifier.contains('!')
+        && let Some(derived_exe_name) = derive_executable_name_from_aumid(identifier)
+        && let Some(pid) = get_pid_from_executable_name(&derived_exe_name)
+    {
+        log::debug!(
+            "[音量控制] 通过从 AUMID 推断出的可执行文件名 '{}' 找到 PID: {}",
+            &derived_exe_name,
+            pid
+        );
+        return Some(pid);
+    }
+
+    log::info!("[音量控制] 无法从标识符 '{identifier}' 解析 PID。");
     None
 }
 
 /// 从 AUMID 中启发式地推断出可能的可执行文件名。
-///
-/// 这种方法比依赖音频会话的 `IconPath` 更可靠，特别是对于安装在系统目录的应用。
 ///
 /// # 示例
 /// - `AppleInc.AppleMusicWin_nzyj5cx40ttqa!App` -> `AppleMusic.exe`
@@ -386,10 +248,7 @@ fn derive_executable_name_from_aumid(aumid: &str) -> Option<String> {
         })
 }
 
-/// 通过可执行文件名获取进程 ID (PID)。
-///
-/// 使用 Windows Tool Help Library (`CreateToolhelp32Snapshot`) 遍历系统中的所有进程，
-/// 不区分大小写地匹配其可执行文件名。
+/// 通过可执行文件名获取 PID。
 fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
     let snapshot_handle = match unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0) } {
         Ok(handle) if !handle.is_invalid() => handle,
@@ -416,21 +275,16 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
     }
 
     loop {
-        // 从宽字符数组转换为 Rust 的 OsString，然后是 &str。
-        let current_exe_name_wide = &process_entry.szExeFile;
-        let len = current_exe_name_wide
-            .iter()
-            .take_while(|&&c| c != 0)
-            .count();
-        let current_exe_name_os = OsString::from_wide(&current_exe_name_wide[..len]);
+        let current_exe_name_str = unsafe {
+            PCWSTR::from_raw(process_entry.szExeFile.as_ptr())
+                .to_string()
+                .unwrap_or_default()
+        };
 
-        if let Some(current_exe_name_str) = current_exe_name_os.to_str()
-            && current_exe_name_str.eq_ignore_ascii_case(executable_name)
-        {
+        if current_exe_name_str.eq_ignore_ascii_case(executable_name) {
             return Some(process_entry.th32ProcessID);
         }
 
-        // SAFETY: Process32NextW 用于移动到下一个进程。
         if unsafe { Process32NextW(snapshot_handle, &raw mut process_entry) }.is_err() {
             // 如果错误是 ERROR_NO_MORE_FILES，说明已遍历完所有进程，这是正常情况。
             if windows::core::Error::from_win32().code() == ERROR_NO_MORE_FILES.to_hresult() {
@@ -441,44 +295,43 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
     None
 }
 
-/// 尝试通过分析活动音频会话的元数据，为给定的 `PackageFamilyName` (源自 AUMID) 找到 PID。
-///
-/// 这是针对 UWP 应用等使用 AUMID 的场景。它会遍历所有音频会话，
-/// 检查其 `IconPath`，并尝试从中启发式地提取 PFN (Package Family Name) 进行匹配。
-fn find_pid_for_aumid_via_audio_sessions(target_pfn_from_aumid: &str) -> Result<Option<u32>> {
-    // SAFETY: COM 调用
+/// 遍历所有活动的音频会话，并返回第一个满足给定条件的会话。
+fn find_audio_session_with<F>(mut predicate: F) -> Result<IAudioSessionControl2>
+where
+    F: FnMut(&IAudioSessionControl2) -> bool,
+{
+    let sessions = unsafe { get_all_active_audio_sessions() }?;
+
+    for session in sessions {
+        if predicate(&session) {
+            return Ok(session);
+        }
+    }
+
+    Err(SmtcError::VolumeControl(
+        "在所有活动会话中均未找到匹配项。".to_string(),
+    ))
+}
+
+/// 获取系统上所有处于活动状态的音频会话控制器
+unsafe fn get_all_active_audio_sessions() -> Result<Vec<IAudioSessionControl2>> {
     unsafe {
         let device_enumerator: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL)?;
         let default_device = device_enumerator.GetDefaultAudioEndpoint(eRender, eConsole)?;
         let session_manager: IAudioSessionManager2 = default_device.Activate(CLSCTX_ALL, None)?;
-        let session_enumerator: IAudioSessionEnumerator = session_manager.GetSessionEnumerator()?;
+        let session_enumerator = session_manager.GetSessionEnumerator()?;
         let count = session_enumerator.GetCount()?;
+        let mut result_sessions = Vec::with_capacity(count as usize);
 
         for i in 0..count {
             if let Ok(session_control) = session_enumerator.GetSession(i)
                 && let Ok(session_control2) = session_control.cast::<IAudioSessionControl2>()
+                && session_control2.GetState() == Ok(AudioSessionStateActive)
             {
-                // 仅处理活动的音频会话
-                if let Ok(current_state) = session_control2.GetState()
-                    && current_state == AudioSessionStateActive
-                    && let Ok(pid) = session_control2.GetProcessId()
-                    && pid > 0
-                    && let Ok(icon_path_pwstr) = session_control2.GetIconPath()
-                    && !icon_path_pwstr.is_null()
-                    && let Ok(icon_path_str) = icon_path_pwstr.to_string()
-                {
-                    // 检查 IconPath 是否包含目标 PFN
-                    if icon_path_str
-                        .to_lowercase()
-                        .contains(&target_pfn_from_aumid.to_lowercase())
-                    {
-                        log::debug!("[音量控制] 通过 IconPath 找到匹配的 PID: {pid}");
-                        return Ok(Some(pid));
-                    }
-                }
+                result_sessions.push(session_control2);
             }
         }
+        Ok(result_sessions)
     }
-    Ok(None) // 未找到匹配的 PID
 }

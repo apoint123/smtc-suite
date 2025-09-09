@@ -41,7 +41,7 @@ pub enum SmtcError {
     #[error("音频捕获失败: {0}")]
     AudioCapture(#[from] AudioCaptureError),
 
-    /// 音量控制模块报告的特定逻辑错误。
+    /// 音量控制模块报告的特定错误。
     #[error("音量控制失败: {0}")]
     VolumeControl(String),
 
