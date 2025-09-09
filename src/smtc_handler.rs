@@ -18,7 +18,8 @@ use windows::{
             GlobalSystemMediaTransportControlsSession as MediaSession,
             GlobalSystemMediaTransportControlsSessionManager as MediaSessionManager,
             GlobalSystemMediaTransportControlsSessionMediaProperties,
-            GlobalSystemMediaTransportControlsSessionPlaybackStatus,
+            GlobalSystemMediaTransportControlsSessionPlaybackStatus, PlaybackInfoChangedEventArgs,
+            TimelinePropertiesChangedEventArgs,
         },
         MediaPlaybackAutoRepeatMode,
     },
@@ -63,19 +64,41 @@ impl MonitoredSessionGuard {
 
         let playback_token = {
             let id = session_id.clone();
-            session.PlaybackInfoChanged(&TypedEventHandler::new(move |_, _| {
-                let _ = tx_playback.try_send(SmtcEventSignal::PlaybackInfo(id.clone()));
+            session.PlaybackInfoChanged(&TypedEventHandler::<
+                MediaSession,
+                PlaybackInfoChangedEventArgs,
+            >::new(move |sender, _| {
+                if let Some(session) = &*sender
+                    && let Ok(update) = extract_playback_info_from_session(session)
+                {
+                    let _ = tx_playback.try_send(SmtcEventSignal::PlaybackInfoUpdated(Box::new((
+                        id.clone(),
+                        update,
+                    ))));
+                }
                 Ok(())
             }))?
         };
 
         let timeline_token = {
             let id = session_id;
-            session.TimelinePropertiesChanged(&TypedEventHandler::new(move |_, _| {
-                let _ = tx_timeline.try_send(SmtcEventSignal::TimelineProperties(id.clone()));
+            session.TimelinePropertiesChanged(&TypedEventHandler::<
+                MediaSession,
+                TimelinePropertiesChangedEventArgs,
+            >::new(move |sender, _| {
+                if let Some(session) = &*sender
+                    && let Ok(timeline_props) = session.GetTimelineProperties()
+                    && let Ok(position) = timeline_props.Position()
+                {
+                    let position_ms = (position.Duration / 10000) as u64;
+                    let _ = tx_timeline.try_send(SmtcEventSignal::TimelinePropertiesUpdated(
+                        Box::new((id.clone(), position_ms)),
+                    ));
+                }
                 Ok(())
             }))?
         };
+
         Ok(Self {
             session,
             tokens: (media_token, playback_token, timeline_token),
@@ -157,12 +180,12 @@ pub fn calculate_cover_hash(data: &[u8]) -> u64 {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum SmtcEventSignal {
     MediaProperties(String),
-    PlaybackInfo(String),
-    TimelineProperties(String),
     Sessions,
+    PlaybackInfoUpdated(Box<(String, PlaybackInfoUpdate)>),
+    TimelinePropertiesUpdated(Box<(String, u64)>),
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct PlaybackInfoUpdate {
     playback_status: PlaybackStatus,
     is_shuffle_active: bool,
@@ -377,6 +400,8 @@ impl SmtcRunner {
             tokio::time::interval(std::time::Duration::from_millis(250));
 
         loop {
+            pump_pending_messages();
+
             tokio::select! {
                 biased;
 
@@ -585,9 +610,11 @@ impl SmtcRunner {
                 self.handle_media_properties_signal(id, async_result_tx);
                 Ok(())
             }
-            SmtcEventSignal::PlaybackInfo(id) => self.handle_playback_info_signal(id).await,
-            SmtcEventSignal::TimelineProperties(id) => {
-                self.handle_timeline_properties_signal(id).await
+            SmtcEventSignal::PlaybackInfoUpdated(data) => {
+                self.handle_playback_info_update(*data).await
+            }
+            SmtcEventSignal::TimelinePropertiesUpdated(data) => {
+                self.handle_timeline_properties_update(*data).await
             }
         }
     }
@@ -632,146 +659,65 @@ impl SmtcRunner {
         }
     }
 
-    async fn handle_playback_info_signal(&self, event_session_id: String) -> WinResult<()> {
-        // FIXME:
-        // 这里存在一个竞态条件，PlaybackInfoChanged通知几乎是瞬时到达Tokio
-        // 通道的，但播放状态依赖于一个需要被pump_pending_messages所处理的底层消息。
-        // 我们可能在收到事件通知后、但在下一次pump_pending_messages调用前来执行此函数。
-        // 如果立刻调用GetPlaybackInfo，几乎肯定会查询到事件发生前的、已经过时的状态。
-        //
-        // TODO: 我觉得应该换到同步通道来解决这个问题。
-        tokio::time::sleep(TokioDuration::from_millis(20)).await;
+    async fn handle_playback_info_update(
+        &self,
+        (event_session_id, update): (String, PlaybackInfoUpdate),
+    ) -> WinResult<()> {
+        let mut state_guard = self.player_state_arc.lock().await;
 
-        let Some(manager_guard) = &self.state.manager_guard else {
+        if self
+            .state
+            .session_guard
+            .as_ref()
+            .and_then(|g| g.session.SourceAppUserModelId().ok())
+            .map(|h| h.to_string_lossy())
+            .as_deref()
+            != Some(event_session_id.as_str())
+        {
             return Ok(());
-        };
-
-        let manager = &manager_guard.manager;
-
-        let Ok(sessions) = manager.GetSessions() else {
-            return Ok(());
-        };
-
-        let Some(fresh_session) = sessions.into_iter().find(|s| {
-            s.SourceAppUserModelId()
-                .is_ok_and(|id| id.to_string_lossy() == event_session_id)
-        }) else {
-            return Ok(());
-        };
-
-        let unwind_result =
-            std::panic::catch_unwind(|| extract_playback_info_from_session(&fresh_session));
-
-        match unwind_result {
-            Ok(Ok(update)) => {
-                let mut state_guard = self.player_state_arc.lock().await;
-
-                if self
-                    .state
-                    .session_guard
-                    .as_ref()
-                    .and_then(|g| g.session.SourceAppUserModelId().ok())
-                    .map(|h| h.to_string_lossy())
-                    .as_deref()
-                    != Some(event_session_id.as_str())
-                {
-                    return Ok(());
-                }
-
-                state_guard.playback_status = update.playback_status;
-                state_guard.is_shuffle_active = update.is_shuffle_active;
-                state_guard.repeat_mode = update.repeat_mode;
-                state_guard.controls = update.controls;
-
-                send_now_playing_update(&state_guard, &self.connector_update_tx);
-                drop(state_guard);
-            }
-            Ok(Err(e)) => {
-                log::warn!("[SmtcRunner] 获取播放信息失败: {e:?}");
-            }
-            Err(e) => {
-                log::error!("[CRASH HANDLED] 为 '{event_session_id}' 调用 FFI 接口时 Panic: {e:?}");
-            }
         }
+
+        state_guard.playback_status = update.playback_status;
+        state_guard.is_shuffle_active = update.is_shuffle_active;
+        state_guard.repeat_mode = update.repeat_mode;
+        state_guard.controls = update.controls;
+
+        send_now_playing_update(&state_guard, &self.connector_update_tx);
+        drop(state_guard);
 
         Ok(())
     }
 
-    async fn handle_timeline_properties_signal(&self, event_session_id: String) -> WinResult<()> {
-        // FIXME: 见上面
-        tokio::time::sleep(TokioDuration::from_millis(20)).await;
+    async fn handle_timeline_properties_update(
+        &self,
+        (event_session_id, new_pos_ms): (String, u64),
+    ) -> WinResult<()> {
+        let mut state_guard = self.player_state_arc.lock().await;
 
-        #[derive(Debug)]
-        struct SafeTimelineProperties {
-            position_ms: u64,
-            end_time_ms: u64,
+        if self
+            .state
+            .session_guard
+            .as_ref()
+            .and_then(|g| g.session.SourceAppUserModelId().ok())
+            .map(|h| h.to_string_lossy())
+            .as_deref()
+            != Some(event_session_id.as_str())
+        {
+            return Ok(());
         }
 
-        let Some(manager_guard) = &self.state.manager_guard else {
-            return Ok(());
-        };
-        let manager = &manager_guard.manager;
+        let estimated_current_pos_ms = state_guard.get_estimated_current_position_ms();
+        let is_seek = (new_pos_ms as i64 - estimated_current_pos_ms as i64).abs()
+            > SEEK_DETECTION_THRESHOLD_MS as i64;
 
-        let Ok(sessions) = manager.GetSessions() else {
-            return Ok(());
-        };
-
-        let Some(fresh_session) = sessions.into_iter().find(|s| {
-            s.SourceAppUserModelId()
-                .is_ok_and(|id| id.to_string_lossy() == event_session_id)
-        }) else {
-            return Ok(());
-        };
-
-        let unwind_result = std::panic::catch_unwind(move || {
-            (|| -> WinResult<SafeTimelineProperties> {
-                let props = fresh_session.GetTimelineProperties()?;
-                let position_ms = props.Position()?.Duration / 10000;
-                let end_time_ms = props.EndTime()?.Duration / 10000;
-                Ok(SafeTimelineProperties {
-                    position_ms: position_ms as u64,
-                    end_time_ms: end_time_ms as u64,
-                })
-            })()
-        });
-
-        match unwind_result {
-            Ok(Ok(safe_props)) => {
-                let mut state_guard = self.player_state_arc.lock().await;
-
-                if self
-                    .state
-                    .session_guard
-                    .as_ref()
-                    .and_then(|g| g.session.SourceAppUserModelId().ok())
-                    .map(|h| h.to_string_lossy())
-                    .as_deref()
-                    != Some(event_session_id.as_str())
-                {
-                    return Ok(());
-                }
-
-                let new_pos_ms = safe_props.position_ms;
-                let dur_ms = safe_props.end_time_ms;
-                let estimated_current_pos_ms = state_guard.get_estimated_current_position_ms();
-                let is_seek = (new_pos_ms as i64 - estimated_current_pos_ms as i64).abs()
-                    > SEEK_DETECTION_THRESHOLD_MS as i64;
-
-                if is_seek || new_pos_ms > state_guard.last_known_position_ms {
-                    state_guard.last_known_position_ms = new_pos_ms;
-                    state_guard.last_known_position_report_time = Some(Instant::now());
-                    if dur_ms > 0 {
-                        state_guard.song_duration_ms = dur_ms;
-                    }
-                    if state_guard.is_waiting_for_initial_update {
-                        state_guard.is_waiting_for_initial_update = false;
-                    }
-                    send_now_playing_update(&state_guard, &self.connector_update_tx);
-                    drop(state_guard);
-                }
+        if is_seek || new_pos_ms > state_guard.last_known_position_ms {
+            state_guard.last_known_position_ms = new_pos_ms;
+            state_guard.last_known_position_report_time = Some(Instant::now());
+            if state_guard.is_waiting_for_initial_update {
+                state_guard.is_waiting_for_initial_update = false;
             }
-            Ok(_) => {}
-            Err(_) => log::error!("[CRASH HANDLED] 为 '{event_session_id}' 调用 FFI 接口时 Panic"),
+            send_now_playing_update(&state_guard, &self.connector_update_tx);
+            drop(state_guard);
         }
 
         Ok(())
@@ -1252,25 +1198,48 @@ impl SmtcRunner {
             let mut player_state = self.player_state_arc.lock().await;
             player_state.reset_to_empty();
         }
-        let player_state = self.player_state_arc.lock().await;
-        send_now_playing_update(&player_state, &self.connector_update_tx);
 
         if let Some(new_s) = new_session_to_monitor {
-            let new_guard = MonitoredSessionGuard::new(new_s, smtc_event_tx)?;
+            let new_guard = MonitoredSessionGuard::new(new_s.clone(), smtc_event_tx)?;
             self.state.session_guard = Some(new_guard);
 
             log::info!("[会话处理器] 会话切换完成，正在获取初始状态。");
             if let Some(id_hstr) = new_session_id_hstring {
-                let new_session_id_str = id_hstr.to_string_lossy();
                 let _ = smtc_event_tx
-                    .try_send(SmtcEventSignal::MediaProperties(new_session_id_str.clone()));
-                let _ = smtc_event_tx
-                    .try_send(SmtcEventSignal::PlaybackInfo(new_session_id_str.clone()));
-                let _ =
-                    smtc_event_tx.try_send(SmtcEventSignal::TimelineProperties(new_session_id_str));
+                    .try_send(SmtcEventSignal::MediaProperties(id_hstr.to_string_lossy()));
+            }
+
+            let initial_playback_info = extract_playback_info_from_session(&new_s).ok();
+            let initial_timeline_info = (|| -> WinResult<(u64, u64)> {
+                let props = new_s.GetTimelineProperties()?;
+                let pos = (props.Position()?.Duration / 10000) as u64;
+                let dur = (props.EndTime()?.Duration / 10000) as u64;
+                Ok((pos, dur))
+            })()
+            .ok();
+
+            {
+                let mut player_state = self.player_state_arc.lock().await;
+                if let Some(update) = initial_playback_info {
+                    player_state.playback_status = update.playback_status;
+                    player_state.is_shuffle_active = update.is_shuffle_active;
+                    player_state.repeat_mode = update.repeat_mode;
+                    player_state.controls = update.controls;
+                }
+                if let Some((pos_ms, dur_ms)) = initial_timeline_info {
+                    player_state.last_known_position_ms = pos_ms;
+                    player_state.last_known_position_report_time = Some(Instant::now());
+                    if dur_ms > 0 {
+                        player_state.song_duration_ms = dur_ms;
+                    }
+                }
+                send_now_playing_update(&player_state, &self.connector_update_tx);
+                drop(player_state);
             }
         } else {
             log::info!("[会话处理器] 没有可用的媒体会话，已重置状态。");
+            let player_state = self.player_state_arc.lock().await;
+            send_now_playing_update(&player_state, &self.connector_update_tx);
         }
 
         Ok(())
@@ -1376,13 +1345,6 @@ pub async fn run_smtc_listener(
     shutdown_rx: TokioReceiver<()>,
     diagnostics_tx: TokioSender<DiagnosticInfo>,
 ) -> Result<()> {
-    let message_pump_task = tokio::task::spawn_local(async {
-        loop {
-            pump_pending_messages();
-            tokio::task::yield_now().await;
-        }
-    });
-
     let mut runner = SmtcRunner {
         state: SmtcState::new(),
         connector_update_tx,
@@ -1395,8 +1357,6 @@ pub async fn run_smtc_listener(
     if let Err(e) = runner.run().await {
         log::error!("[SmtcRunner] 事件循环因错误退出: {e:?}");
     }
-
-    message_pump_task.abort();
 
     let state = runner.state;
     if let Some((task, token)) = state.active_volume_easing_task {
