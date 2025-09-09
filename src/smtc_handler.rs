@@ -125,7 +125,7 @@ impl Drop for MonitoredSessionGuard {
 
 struct ManagerEventGuard {
     manager: MediaSessionManager,
-    token: i64,
+    tokens: (i64, i64),
 }
 
 impl ManagerEventGuard {
@@ -133,19 +133,33 @@ impl ManagerEventGuard {
         manager: MediaSessionManager,
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
     ) -> WinResult<Self> {
-        let tx = smtc_event_tx.clone();
-        let token = manager.SessionsChanged(&TypedEventHandler::new(move |_, _| {
-            let _ = tx.try_send(SmtcEventSignal::Sessions);
+        let tx_sessions = smtc_event_tx.clone();
+        let sessions_token = manager.SessionsChanged(&TypedEventHandler::new(move |_, _| {
+            let _ = tx_sessions.try_send(SmtcEventSignal::Sessions);
             Ok(())
         }))?;
-        Ok(Self { manager, token })
+
+        let tx_current = smtc_event_tx.clone();
+        let current_session_token =
+            manager.CurrentSessionChanged(&TypedEventHandler::new(move |_, _| {
+                let _ = tx_current.try_send(SmtcEventSignal::Sessions);
+                Ok(())
+            }))?;
+
+        Ok(Self {
+            manager,
+            tokens: (sessions_token, current_session_token),
+        })
     }
 }
 
 impl Drop for ManagerEventGuard {
     fn drop(&mut self) {
-        if let Err(e) = self.manager.RemoveSessionsChanged(self.token) {
+        if let Err(e) = self.manager.RemoveSessionsChanged(self.tokens.0) {
             log::warn!("[ManagerEventGuard] 注销 SessionsChanged 事件失败: {e:?}");
+        }
+        if let Err(e) = self.manager.RemoveCurrentSessionChanged(self.tokens.1) {
+            log::warn!("[ManagerEventGuard] 注销 CurrentSessionChanged 事件失败: {e:?}");
         }
     }
 }
@@ -396,9 +410,6 @@ impl SmtcRunner {
             AsyncTaskResult::ManagerReady,
         );
 
-        let mut session_check_interval =
-            tokio::time::interval(std::time::Duration::from_millis(250));
-
         loop {
             pump_pending_messages();
 
@@ -420,10 +431,6 @@ impl SmtcRunner {
                         log::error!("[SmtcRunner] 处理内部命令时发生致命错误: {e:?}，循环将终止。");
                         return Err(crate::error::SmtcError::Windows(e));
                     }
-                },
-
-                _ = session_check_interval.tick() => {
-                    self.handle_session_check_tick(&smtc_event_tx);
                 },
 
                 Some(signal) = smtc_event_rx.recv() => {
@@ -973,72 +980,6 @@ impl SmtcRunner {
         if is_currently_playing || should_send_update {
             let player_state = self.player_state_arc.lock().await;
             send_now_playing_update(&player_state, &self.connector_update_tx);
-        }
-    }
-
-    fn handle_session_check_tick(&self, smtc_event_tx: &TokioSender<SmtcEventSignal>) {
-        if let Some(guard) = &self.state.manager_guard
-            && self.state.target_session_id.is_none()
-            && let Ok(current_session) = guard.manager.GetCurrentSession()
-        {
-            let new_session_id = current_session
-                .SourceAppUserModelId()
-                .ok()
-                .map(|h| h.to_string_lossy());
-
-            let monitored_session_id = self
-                .state
-                .session_guard
-                .as_ref()
-                .and_then(|g| g.session.SourceAppUserModelId().ok())
-                .map(|h| h.to_string_lossy());
-
-            if new_session_id != monitored_session_id {
-                log::debug!(
-                    "[会话轮询] 系统默认会话已更改 (从 {:?} 到 {:?})，正在刷新。",
-                    monitored_session_id.as_deref().unwrap_or("无"),
-                    new_session_id.as_deref().unwrap_or("无")
-                );
-
-                let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
-            }
-        }
-
-        if let Some(session_guard) = &self.state.session_guard {
-            let session_id_res = session_guard.session.SourceAppUserModelId();
-            if session_id_res.is_err() {
-                let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
-                return;
-            }
-
-            let player_state_clone = self.player_state_arc.clone();
-            let connector_tx_clone = self.connector_update_tx.clone();
-            let session_clone = session_guard.session.clone();
-
-            tokio::task::spawn_local(async move {
-                let unwind_result = std::panic::catch_unwind(move || {
-                    session_clone.GetPlaybackInfo().ok().and_then(|info| {
-                        info.PlaybackStatus().ok().map(|status| match status {
-                            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => {
-                                PlaybackStatus::Playing
-                            }
-                            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => {
-                                PlaybackStatus::Paused
-                            }
-                            _ => PlaybackStatus::Stopped,
-                        })
-                    })
-                });
-
-                if let Ok(Some(current_status)) = unwind_result {
-                    let mut player_state = player_state_clone.lock().await;
-                    if player_state.playback_status != current_status {
-                        player_state.playback_status = current_status;
-                        send_now_playing_update(&player_state, &connector_tx_clone);
-                        drop(player_state);
-                    }
-                }
-            });
         }
     }
 
