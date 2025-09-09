@@ -1261,7 +1261,7 @@ fn extract_playback_info_from_session(session: &MediaSession) -> WinResult<Playb
     })
 }
 
-fn pump_pending_messages() {
+pub fn pump_pending_messages() {
     unsafe {
         let mut msg = MSG::default();
         while windows::Win32::UI::WindowsAndMessaging::PeekMessageW(

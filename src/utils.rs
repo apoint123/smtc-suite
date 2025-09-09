@@ -1,3 +1,7 @@
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
 use ferrous_opencc::OpenCC;
 
 /// 使用指定的 `OpenCC` 实例转换文本。
@@ -67,6 +71,22 @@ pub fn get_display_name_from_smtc_id(id_str: &str) -> String {
 
     // 如果所有处理都成功，则返回处理后的名称，否则返回原始 ID。
     prettified_name.unwrap_or_else(|| id_str.to_string())
+}
+
+pub async fn await_in_sta<F: Future>(future: F) -> F::Output {
+    let mut future = Pin::from(Box::new(future));
+
+    loop {
+        let waker = futures::task::noop_waker();
+        let mut cx = Context::from_waker(&waker);
+        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
+            return output;
+        }
+
+        crate::smtc_handler::pump_pending_messages();
+
+        tokio::task::yield_now().await;
+    }
 }
 
 #[cfg(test)]
