@@ -124,7 +124,7 @@ impl SharedPlayerState {
         };
 
         // 叠加用户偏移和 Apple Music 的优化偏移
-        let total_offset = self.position_offset_ms + self.apple_music_optimization_offset_ms;
+        let total_offset = self.apple_music_optimization_offset_ms - self.position_offset_ms;
         let offset_pos = (base_pos as i64 + total_offset).max(0) as u64;
 
         // 确保估算的位置不超过歌曲总时长（如果时长有效）

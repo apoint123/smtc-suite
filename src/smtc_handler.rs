@@ -1347,7 +1347,7 @@ impl SmtcRunner {
             .is_some_and(|id| id.starts_with(APPLE_MUSIC_AUMID_PREFIX));
 
         let new_offset = if self.state.is_apple_music_optimization_enabled && is_apple_music {
-            500
+            -500
         } else {
             0
         };
