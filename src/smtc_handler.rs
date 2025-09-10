@@ -615,11 +615,15 @@ impl SmtcRunner {
 
     async fn on_set_progress_offset(&self, offset: i64) -> WinResult<()> {
         log::info!("[SmtcRunner] 设置进度偏移量: {offset}ms");
-        let payload = {
+        let mut payload = {
             let mut player_state = self.player_state_arc.lock().await;
             player_state.position_offset_ms = offset;
             NowPlayingInfo::from(&*player_state)
         };
+
+        payload.cover_data = None;
+        payload.cover_data_hash = None;
+
         send_now_playing_update(payload, &self.connector_update_tx);
         Ok(())
     }
@@ -700,7 +704,7 @@ impl SmtcRunner {
             return Ok(());
         }
 
-        let payload = {
+        let mut payload = {
             let mut state_guard = self.player_state_arc.lock().await;
             state_guard.playback_status = update.playback_status;
             state_guard.is_shuffle_active = update.is_shuffle_active;
@@ -708,6 +712,9 @@ impl SmtcRunner {
             state_guard.controls = update.controls;
             NowPlayingInfo::from(&*state_guard)
         };
+
+        payload.cover_data = None;
+        payload.cover_data_hash = None;
 
         send_now_playing_update(payload, &self.connector_update_tx);
 
@@ -719,7 +726,7 @@ impl SmtcRunner {
         (event_session_id, new_pos_ms): (String, u64),
     ) -> WinResult<()> {
         let mut should_send_update = false;
-        let payload = {
+        let mut payload = {
             let mut state_guard = self.player_state_arc.lock().await;
 
             if self.state.current_session_id().as_deref() != Some(event_session_id.as_str()) {
@@ -758,6 +765,8 @@ impl SmtcRunner {
         };
 
         if should_send_update {
+            payload.cover_data = None;
+            payload.cover_data_hash = None;
             send_now_playing_update(payload, &self.connector_update_tx);
         }
 
@@ -1113,10 +1122,12 @@ impl SmtcRunner {
         }
 
         if is_currently_playing || should_send_update {
-            let payload = {
+            let mut payload = {
                 let player_state = self.player_state_arc.lock().await;
                 NowPlayingInfo::from(&*player_state)
             };
+            payload.cover_data = None;
+            payload.cover_data_hash = None;
             send_now_playing_update(payload, &self.connector_update_tx);
         }
     }
