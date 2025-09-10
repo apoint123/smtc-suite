@@ -43,6 +43,8 @@ pub enum InternalCommand {
     SetProgressTimer(bool),
     /// 指示 `smtc_handler` 设置一个偏移量。
     SetProgressOffset(i64),
+    /// 指示 `smtc_handler` 启用或禁用 Apple Music 优化。
+    SetAppleMusicOptimization(bool),
 }
 
 /// 在 `MediaWorker` 内部使用的更新事件，由其子模块发出。
@@ -207,6 +209,9 @@ impl MediaWorker {
             }
             MediaCommand::SetProgressOffset(offset) => {
                 Some(InternalCommand::SetProgressOffset(offset))
+            }
+            MediaCommand::SetAppleMusicOptimization(enabled) => {
+                Some(InternalCommand::SetAppleMusicOptimization(enabled))
             }
             MediaCommand::StartAudioCapture => {
                 self.start_audio_capture_internal();

@@ -101,6 +101,7 @@ pub struct SharedPlayerState {
     /// 在此期间，应暂停进度计时器。
     pub is_waiting_for_initial_update: bool,
     pub position_offset_ms: i64,
+    pub apple_music_optimization_offset_ms: i64,
 }
 
 impl SharedPlayerState {
@@ -122,7 +123,9 @@ impl SharedPlayerState {
             self.last_known_position_ms
         };
 
-        let offset_pos = (base_pos as i64 + self.position_offset_ms).max(0) as u64;
+        // 叠加用户偏移和 Apple Music 的优化偏移
+        let total_offset = self.position_offset_ms + self.apple_music_optimization_offset_ms;
+        let offset_pos = (base_pos as i64 + total_offset).max(0) as u64;
 
         // 确保估算的位置不超过歌曲总时长（如果时长有效）
         if self.song_duration_ms > 0 {
@@ -374,6 +377,16 @@ pub enum MediaCommand {
     SetHighFrequencyProgressUpdates(bool),
     /// 为当前播放进度设置一个偏移量（毫秒）。
     SetProgressOffset(i64),
+    /// 启用或禁用针对 Apple Music 的特定优化。
+    /// 仅在当前的会话是 Apple Music 时才有效果。
+    ///
+    ///
+    /// 包括：
+    /// 1. 拆分合并在艺术家字段中的专辑名。(如果专辑信息为空)
+    /// 2. 为时间轴应用 -500ms 的偏移。
+    ///
+    /// 此优化默认启用。
+    SetAppleMusicOptimization(bool),
     /// 请求关闭整个媒体服务后台线程。
     Shutdown,
 }
