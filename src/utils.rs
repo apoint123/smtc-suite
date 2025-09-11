@@ -73,19 +73,29 @@ pub fn get_display_name_from_smtc_id(id_str: &str) -> String {
     prettified_name.unwrap_or_else(|| id_str.to_string())
 }
 
-pub async fn await_in_sta<F: Future>(future: F) -> F::Output {
-    let mut future = Pin::from(Box::new(future));
+pub struct StaFuture<F: Future> {
+    future: Pin<Box<F>>,
+}
 
-    loop {
-        let waker = futures::task::noop_waker();
-        let mut cx = Context::from_waker(&waker);
-        if let Poll::Ready(output) = future.as_mut().poll(&mut cx) {
-            return output;
+pub fn await_in_sta<F: Future>(future: F) -> StaFuture<F> {
+    StaFuture {
+        future: Box::pin(future),
+    }
+}
+
+impl<F: Future> Future for StaFuture<F> {
+    type Output = F::Output;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        if let Poll::Ready(output) = self.future.as_mut().poll(cx) {
+            return Poll::Ready(output);
         }
 
         crate::smtc_handler::pump_pending_messages();
 
-        tokio::task::yield_now().await;
+        cx.waker().wake_by_ref();
+
+        Poll::Pending
     }
 }
 

@@ -52,6 +52,26 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
     ) -> windows::core::Result<()> {
         Ok(())
     }
+    fn OnSimpleVolumeChanged(
+        &self,
+        fNewVolume: f32,
+        bNewMute: BOOL,
+        _EventContext: *const GUID,
+    ) -> windows::core::Result<()> {
+        if let Ok(guard) = self.tx.lock()
+            && let Some(tx) = guard.as_ref()
+        {
+            let update = InternalUpdate::AudioSessionVolumeChanged {
+                session_id: self.session_id.clone(),
+                volume: fNewVolume,
+                is_muted: bNewMute.as_bool(),
+            };
+            if let Err(e) = tx.try_send(update) {
+                log::warn!("[音量监听器] 发送音量更新失败: {e}");
+            }
+        }
+        Ok(())
+    }
     fn OnChannelVolumeChanged(
         &self,
         _: u32,
@@ -105,26 +125,6 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
         }
         Ok(())
     }
-    fn OnSimpleVolumeChanged(
-        &self,
-        fNewVolume: f32,
-        bNewMute: BOOL,
-        _EventContext: *const GUID,
-    ) -> windows::core::Result<()> {
-        if let Ok(guard) = self.tx.lock()
-            && let Some(tx) = guard.as_ref()
-        {
-            let update = InternalUpdate::AudioSessionVolumeChanged {
-                session_id: self.session_id.clone(),
-                volume: fNewVolume,
-                is_muted: bNewMute.as_bool(),
-            };
-            if let Err(e) = tx.try_send(update) {
-                log::warn!("[音量监听器] 发送音量更新失败: {e}");
-            }
-        }
-        Ok(())
-    }
 }
 
 pub struct AudioSessionMonitor {
@@ -147,6 +147,7 @@ impl AudioSessionMonitor {
         }
     }
 
+    #[allow(clippy::future_not_send)]
     pub async fn run(mut self, mut shutdown_rx: TokioReceiver<()>) {
         loop {
             tokio::select! {
@@ -157,7 +158,7 @@ impl AudioSessionMonitor {
                 },
 
                 Some(command) = self.command_rx.recv() => {
-                    if let Err(e) = self.handle_command(command).await {
+                    if let Err(e) = self.handle_command(&command) {
                         log::error!("[音量监听器] 处理命令失败: {e:?}");
                     }
                 },
@@ -172,7 +173,7 @@ impl AudioSessionMonitor {
         }
     }
 
-    async fn handle_command(&mut self, command: AudioMonitorCommand) -> WinResult<()> {
+    fn handle_command(&mut self, command: &AudioMonitorCommand) -> WinResult<()> {
         match command {
             AudioMonitorCommand::StartMonitoring(pid) => {
                 self.stop_monitoring_internal()?;
@@ -191,7 +192,7 @@ impl AudioSessionMonitor {
                             session_enumerator.GetSession(i)?;
                         let session_control2: IAudioSessionControl2 = session_control.cast()?;
 
-                        if session_control2.GetProcessId()? == pid {
+                        if session_control2.GetProcessId()? == *pid {
                             let simple_audio_volume: ISimpleAudioVolume = session_control.cast()?;
                             let initial_volume = simple_audio_volume.GetMasterVolume()?;
                             let is_muted = simple_audio_volume.GetMute()?.as_bool();
@@ -204,7 +205,7 @@ impl AudioSessionMonitor {
                                 is_muted,
                             };
 
-                            if self.update_tx.send(initial_update).await.is_err() {
+                            if self.update_tx.try_send(initial_update).is_err() {
                                 log::warn!("[音量监听器] 发送初始音量更新失败。");
                             }
 

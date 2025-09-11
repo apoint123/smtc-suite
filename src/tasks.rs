@@ -23,6 +23,7 @@ const E_ABORT_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x8000_40
 const MAX_COVER_SIZE_BYTES: usize = 20_971_520; // 20 MB
 
 /// 从 SMTC 会话中获取封面图片数据。
+#[allow(clippy::future_not_send)]
 pub async fn fetch_cover_data_task(
     thumb_ref: IRandomAccessStreamReference,
     cancel_token: CancellationToken,

@@ -34,6 +34,7 @@ const VOLUME_EASING_STEPS: u32 = 15;
 const VOLUME_EASING_THRESHOLD: f32 = 0.01;
 
 /// 一个独立的任务，用于平滑地调整指定进程的音量
+#[allow(clippy::future_not_send)]
 async fn volume_easing_task(
     task_id: u64,
     target_vol: f32,
@@ -266,7 +267,7 @@ fn get_pid_from_executable_name(executable_name: &str) -> Option<u32> {
     let _guard = HandleGuard(snapshot_handle);
 
     let mut process_entry = PROCESSENTRY32W {
-        dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+        dwSize: size_of::<PROCESSENTRY32W>() as u32,
         ..Default::default()
     };
 

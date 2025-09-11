@@ -523,7 +523,7 @@ impl SmtcRunner {
         };
 
         self.state.text_converter = if let Some(config) = config {
-            match ferrous_opencc::OpenCC::from_config(config) {
+            match OpenCC::from_config(config) {
                 Ok(converter) => Some(converter),
                 Err(e) => {
                     self.send_diagnostic(
