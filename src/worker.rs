@@ -1,8 +1,8 @@
-use std::{sync::Arc, thread};
+use std::{sync::Arc, thread, time::Duration};
 
-use tokio::task::JoinHandle as TokioJoinHandle;
 use tokio::{
     sync::mpsc::{Receiver as TokioReceiver, Sender as TokioSender, channel},
+    task::JoinHandle as TokioJoinHandle,
     task::LocalSet,
 };
 use windows::{
@@ -24,6 +24,8 @@ use crate::{
     error::{Result, SmtcError},
     smtc_handler::{self},
 };
+
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// 在 `MediaWorker` 内部使用的命令，用于控制其子模块。
 ///
@@ -334,26 +336,36 @@ impl MediaWorker {
         self.smtc_control_tx.take();
         self.audio_monitor_command_tx.take();
 
-        if let Some(tx) = self.audio_monitor_shutdown_tx.take() {
-            let _ = tx.send(()).await;
-        }
-        if let Some(handle) = self.audio_monitor_task_handle.take()
-            && tokio::time::timeout(std::time::Duration::from_secs(1), handle)
-                .await
-                .is_err()
-        {
-            log::warn!("[MediaWorker] 音频监视器退出超时，将强制中止。");
-        }
-        if let Some(tx) = self.smtc_shutdown_tx.take() {
-            let _ = tx.send(()).await;
-        }
-        if let Some(handle) = self.smtc_listener_task_handle.take()
-            && tokio::time::timeout(std::time::Duration::from_secs(1), handle)
-                .await
-                .is_err()
-        {
-            log::warn!("[MediaWorker] SMTC 监听器退出超时，将强制中止。");
-        }
+        let audio_monitor_shutdown = async {
+            if let Some(tx) = self.audio_monitor_shutdown_tx.take() {
+                let _ = tx.send(()).await;
+            }
+            if let Some(mut handle) = self.audio_monitor_task_handle.take()
+                && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut handle)
+                    .await
+                    .is_err()
+            {
+                log::warn!("[MediaWorker] 音频监视器退出超时，将强制中止。");
+                handle.abort();
+            }
+        };
+
+        let smtc_listener_shutdown = async {
+            if let Some(tx) = self.smtc_shutdown_tx.take() {
+                let _ = tx.send(()).await;
+            }
+            if let Some(mut handle) = self.smtc_listener_task_handle.take()
+                && tokio::time::timeout(SHUTDOWN_TIMEOUT, &mut handle)
+                    .await
+                    .is_err()
+            {
+                log::warn!("[MediaWorker] SMTC 监听器退出超时，将强制中止。");
+                handle.abort();
+            }
+        };
+
+        tokio::join!(audio_monitor_shutdown, smtc_listener_shutdown);
+
         self.stop_audio_capture_internal();
     }
 }
