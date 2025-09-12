@@ -108,7 +108,9 @@ impl SharedPlayerState {
     /// 将播放状态重置为空白/默认状态。
     /// 通常在没有活动媒体会话时调用。
     pub fn reset_to_empty(&mut self) {
+        let preserved_offset = self.position_offset_ms;
         *self = Self::default();
+        self.position_offset_ms = preserved_offset;
         self.is_waiting_for_initial_update = true;
     }
 
