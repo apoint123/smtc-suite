@@ -1,7 +1,7 @@
 // worker 已经保证这个模块运行在 LocalSet 中
 #![allow(clippy::future_not_send)]
 
-use std::{cell::RefCell, future::Future, rc::Rc, sync::Arc, time::Instant};
+use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
 
 use chrono::Utc;
 use ferrous_opencc::{OpenCC, config::BuiltinConfig};
@@ -276,6 +276,7 @@ struct TrackInfo {
     title: String,
     artist: String,
     album: String,
+    duration_ms: u64,
 }
 
 fn send_now_playing_update(
@@ -298,31 +299,6 @@ struct SmtcRunner {
     control_rx: TokioReceiver<InternalCommand>,
     shutdown_rx: TokioReceiver<()>,
     diagnostics_tx: TokioSender<DiagnosticInfo>,
-}
-
-async fn execute_with_state<S, F, O, P, H, FutH>(
-    state: &Rc<RefCell<S>>,
-    prepare: P,
-    handle_result_async: H,
-) where
-    F: Future<Output = O>,
-    P: FnOnce(&mut S) -> Option<F>,
-    FutH: Future<Output = ()>,
-    H: FnOnce(&mut S, O) -> FutH,
-{
-    let future_to_await = {
-        let mut state_guard = state.borrow_mut();
-        prepare(&mut state_guard)
-    };
-    let Some(future) = future_to_await else {
-        return;
-    };
-    let result = future.await;
-    let handler_future = {
-        let mut state_guard = state.borrow_mut();
-        handle_result_async(&mut state_guard, result)
-    };
-    handler_future.await;
 }
 
 impl SmtcRunner {
@@ -686,14 +662,6 @@ impl SmtcRunner {
                 return Ok(());
             }
 
-            if let Some(guard) = &self.context.state.borrow().session_guard
-                && let Ok(props) = guard.session.GetTimelineProperties()
-                && let Ok(end_time) = props.EndTime()
-            {
-                let new_dur_ms = (end_time.Duration / 10000) as u64;
-                state_guard.song_duration_ms = new_dur_ms;
-            }
-
             let raw_estimated_pos_ms = if state_guard.playback_status == PlaybackStatus::Playing
                 && let Some(report_time) = state_guard.last_known_position_report_time
             {
@@ -716,6 +684,7 @@ impl SmtcRunner {
             }
             NowPlayingInfo::from(&*state_guard)
         };
+        drop(payload.cover_data);
 
         if should_send_update {
             payload.cover_data = None;
@@ -760,52 +729,52 @@ impl SmtcRunner {
             return Ok(());
         }
 
-        execute_with_state(
-            &context.state,
-            |state| {
-                let Some(guard) = &state.session_guard else {
-                    log::warn!("[Command Executor] 收到命令 {cmd:?}，但无活动会话，已忽略。");
-                    return None;
-                };
+        let command_future = {
+            let state = context.state.borrow();
+            let Some(guard) = &state.session_guard else {
+                log::warn!("[Command Executor] 收到命令 {cmd:?}，但无活动会话，已忽略。");
+                return Ok(());
+            };
 
-                let async_op_result = match cmd {
-                    SmtcControlCommand::Play => guard.session.TryPlayAsync(),
-                    SmtcControlCommand::Pause => guard.session.TryPauseAsync(),
-                    SmtcControlCommand::SkipNext => guard.session.TrySkipNextAsync(),
-                    SmtcControlCommand::SkipPrevious => guard.session.TrySkipPreviousAsync(),
-                    SmtcControlCommand::SeekTo(pos) => guard
-                        .session
-                        .TryChangePlaybackPositionAsync(pos as i64 * 10000),
-                    SmtcControlCommand::SetShuffle(is_active) => {
-                        guard.session.TryChangeShuffleActiveAsync(is_active)
-                    }
-                    SmtcControlCommand::SetRepeatMode(repeat_mode) => {
-                        let win_repeat_mode = match repeat_mode {
-                            RepeatMode::Off => MediaPlaybackAutoRepeatMode::None,
-                            RepeatMode::One => MediaPlaybackAutoRepeatMode::Track,
-                            RepeatMode::All => MediaPlaybackAutoRepeatMode::List,
-                        };
-                        guard.session.TryChangeAutoRepeatModeAsync(win_repeat_mode)
-                    }
-                    SmtcControlCommand::SetVolume(_) => unreachable!(),
-                };
-
-                async_op_result
-                    .ok()
-                    .map(|op| async move { tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, op).await })
-            },
-            |_state, result| async move {
-                match result {
-                    Ok(Ok(true)) => log::debug!("[Command Executor] 指令 {cmd:?} 成功执行。"),
-                    Ok(Ok(false)) => {
-                        log::warn!("[Command Executor] 指令 {cmd:?} 执行失败 (返回 false)。");
-                    }
-                    Ok(Err(e)) => log::warn!("[Command Executor] 指令 {cmd:?} 调用失败: {e:?}"),
-                    Err(_) => log::warn!("[Command Executor] 指令 {cmd:?} 执行超时。"),
+            let async_op_result = match cmd {
+                SmtcControlCommand::Play => guard.session.TryPlayAsync(),
+                SmtcControlCommand::Pause => guard.session.TryPauseAsync(),
+                SmtcControlCommand::SkipNext => guard.session.TrySkipNextAsync(),
+                SmtcControlCommand::SkipPrevious => guard.session.TrySkipPreviousAsync(),
+                SmtcControlCommand::SeekTo(pos) => guard
+                    .session
+                    .TryChangePlaybackPositionAsync(pos as i64 * 10000),
+                SmtcControlCommand::SetShuffle(is_active) => {
+                    guard.session.TryChangeShuffleActiveAsync(is_active)
                 }
-            },
-        )
-        .await;
+                SmtcControlCommand::SetRepeatMode(repeat_mode) => {
+                    let win_repeat_mode = match repeat_mode {
+                        RepeatMode::Off => MediaPlaybackAutoRepeatMode::None,
+                        RepeatMode::One => MediaPlaybackAutoRepeatMode::Track,
+                        RepeatMode::All => MediaPlaybackAutoRepeatMode::List,
+                    };
+                    guard.session.TryChangeAutoRepeatModeAsync(win_repeat_mode)
+                }
+                SmtcControlCommand::SetVolume(_) => unreachable!(),
+            };
+
+            async_op_result.ok()
+        };
+
+        let Some(future) = command_future else {
+            return Ok(());
+        };
+
+        let result = tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, future).await;
+
+        match result {
+            Ok(Ok(true)) => log::debug!("[Command Executor] 指令 {cmd:?} 成功执行。"),
+            Ok(Ok(false)) => {
+                log::warn!("[Command Executor] 指令 {cmd:?} 执行失败 (返回 false)。");
+            }
+            Ok(Err(e)) => log::warn!("[Command Executor] 指令 {cmd:?} 调用失败: {e:?}"),
+            Err(_) => log::warn!("[Command Executor] 指令 {cmd:?} 执行超时。"),
+        }
 
         Ok(())
     }
@@ -873,63 +842,67 @@ impl SmtcRunner {
         context: AppContext,
         session_id: String,
     ) -> Result<()> {
-        type PropsResult = WinResult<GlobalSystemMediaTransportControlsSessionMediaProperties>;
+        let props_future = {
+            let state = context.state.borrow();
+            let Some(guard) = &state.session_guard else {
+                return Ok(());
+            };
 
-        execute_with_state(
-            &context.state.clone(),
-            |state| {
-                let Some(guard) = &state.session_guard else {
-                    return None;
-                };
+            let current_id = match guard.session.SourceAppUserModelId().ok() {
+                Some(id) => id.to_string_lossy(),
+                None => return Ok(()),
+            };
+            if current_id != session_id {
+                return Ok(());
+            }
 
-                let current_id = match guard.session.SourceAppUserModelId().ok() {
-                    Some(id) => id.to_string_lossy(),
-                    None => return None,
-                };
-                if current_id != session_id {
-                    return None;
-                }
+            guard.session.TryGetMediaPropertiesAsync()?
+        };
 
-                let async_op = guard.session.TryGetMediaPropertiesAsync().ok()?;
-                Some(async move {
-                    (tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, async_op).await).unwrap_or_else(
-                        |_| {
-                            log::warn!("[Media Properties Task] 获取媒体属性超时。");
-                            Err(WinError::from(E_ABORT_HRESULT))
-                        },
-                    )
-                })
-            },
-            |_state, props_result: PropsResult| async move {
-                let Ok(props) = props_result else {
-                    log::warn!(
-                        "[Media Properties Task] 获取媒体属性失败: {:?}",
-                        props_result.err()
-                    );
-                    return;
-                };
+        let props_result = (tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, props_future).await)
+            .unwrap_or_else(|_| {
+                log::warn!("[Media Properties Task] 获取媒体属性超时。");
+                Err(WinError::from(E_ABORT_HRESULT))
+            });
 
-                let Some(track_info) = parse_and_convert_properties(&context, &props) else {
-                    return;
-                };
+        let Ok(props) = props_result else {
+            log::warn!(
+                "[Media Properties Task] 获取媒体属性失败: {:?}",
+                props_result.err()
+            );
+            return Ok(());
+        };
 
-                let (is_new_track, update_payload) =
-                    update_track_state(&context, &track_info).await;
+        let session = {
+            let state = context.state.borrow();
+            let Some(guard) = &state.session_guard else {
+                return Ok(());
+            };
+            guard.session.clone()
+        };
 
-                if context
-                    .connector_update_tx
-                    .try_send(InternalUpdate::TrackChanged(update_payload))
-                    .is_err()
-                {
-                    log::warn!("[SMTC] 状态广播失败，所有接收者可能已关闭");
-                }
+        let Some(track_info) = parse_and_convert_properties(&context, &props, &session) else {
+            return Ok(());
+        };
 
-                if is_new_track {
-                    spawn_cover_fetch_task(&context, &props);
-                }
-            },
-        )
-        .await;
+        let (is_new_track, update_payload) = update_track_state(&context, &track_info).await;
+
+        if context
+            .connector_update_tx
+            .try_send(InternalUpdate::TrackChanged(update_payload))
+            .is_err()
+        {
+            log::warn!("[SMTC] 状态广播失败，所有接收者可能已关闭");
+        }
+
+        let should_fetch_cover = {
+            let player_state = context.player_state_arc.lock().await;
+            is_new_track || player_state.cover_data_hash.is_none()
+        };
+
+        if should_fetch_cover {
+            spawn_cover_fetch_task(&context, &props);
+        }
 
         Ok(())
     }
@@ -938,15 +911,13 @@ impl SmtcRunner {
         match result {
             Ok(Some(bytes)) => {
                 let new_hash = calculate_cover_hash(&bytes);
-                let mut should_update = false;
+                let should_update;
                 let payload = {
                     let mut player_state = context.player_state_arc.lock().await;
-                    if player_state.cover_data_hash != Some(new_hash) {
-                        log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
-                        player_state.cover_data = Some(bytes);
-                        player_state.cover_data_hash = Some(new_hash);
-                        should_update = true;
-                    }
+                    log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
+                    player_state.cover_data = Some(bytes);
+                    player_state.cover_data_hash = Some(new_hash);
+                    should_update = true;
                     NowPlayingInfo::from(&*player_state)
                 };
                 if should_update {
@@ -995,49 +966,16 @@ impl SmtcRunner {
     }
 
     async fn handle_progress_update_signal(&self) {
-        let mut should_send_update = false;
-        let mut is_currently_playing = false;
-
-        let current_status_from_smtc = {
-            let state = self.context.state.borrow();
-            state
-                .session_guard
-                .as_ref()
-                .map_or(Some(PlaybackStatus::Stopped), |guard| {
-                    std::panic::catch_unwind(|| {
-                        guard.session.GetPlaybackInfo().ok().and_then(|info| {
-                            info.PlaybackStatus().ok().map(|status| {
-                                match status {
-                            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing => {
-                                PlaybackStatus::Playing
-                            }
-                            GlobalSystemMediaTransportControlsSessionPlaybackStatus::Paused => {
-                                PlaybackStatus::Paused
-                            }
-                            _ => PlaybackStatus::Stopped,
-                        }
-                            })
-                        })
-                    })
-                    .ok()
-                    .flatten()
-                })
+        let payload_to_send = {
+            let player_state = self.context.player_state_arc.lock().await;
+            if player_state.playback_status == PlaybackStatus::Playing {
+                Some(NowPlayingInfo::from(&*player_state))
+            } else {
+                None
+            }
         };
 
-        if let Some(current_status) = current_status_from_smtc {
-            let mut player_state = self.context.player_state_arc.lock().await;
-            if player_state.playback_status != current_status {
-                player_state.playback_status = current_status;
-                should_send_update = true;
-            }
-            is_currently_playing = player_state.playback_status == PlaybackStatus::Playing;
-        }
-
-        if is_currently_playing || should_send_update {
-            let mut payload = {
-                let player_state = self.context.player_state_arc.lock().await;
-                NowPlayingInfo::from(&*player_state)
-            };
+        if let Some(mut payload) = payload_to_send {
             payload.cover_data = None;
             payload.cover_data_hash = None;
             send_now_playing_update(payload, &self.context.connector_update_tx);
@@ -1344,6 +1282,7 @@ impl SmtcRunner {
 fn parse_and_convert_properties(
     context: &AppContext,
     props: &GlobalSystemMediaTransportControlsSessionMediaProperties,
+    session: &MediaSession,
 ) -> Option<TrackInfo> {
     let state = context.state.borrow();
     let get_prop_string = |prop_res: WinResult<HSTRING>, name: &str| {
@@ -1372,10 +1311,17 @@ fn parse_and_convert_properties(
         title,
         artist,
         album,
+        duration_ms: 0,
     };
 
     if state.is_apple_music_optimization_enabled && track_info.album.is_empty() {
         track_info = SmtcRunner::try_parse_apple_music_format(track_info);
+    }
+
+    if let Ok(timeline_props) = session.GetTimelineProperties()
+        && let Ok(end_time) = timeline_props.EndTime()
+    {
+        track_info.duration_ms = (end_time.Duration / 10000) as u64;
     }
 
     Some(track_info)
@@ -1411,6 +1357,7 @@ async fn update_track_state(
     player_state.title.clone_from(&track_info.title);
     player_state.artist.clone_from(&track_info.artist);
     player_state.album.clone_from(&track_info.album);
+    player_state.song_duration_ms = track_info.duration_ms;
 
     let update_payload = NowPlayingInfo::from(&*player_state);
 
