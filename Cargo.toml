@@ -63,7 +63,7 @@ opt-level = 3
 debug = false
 lto = true
 codegen-units = 1
-panic = "unwind"
+panic = "abort"
 
 [lints.clippy]
 pedantic = { level = "warn", priority = -1 }
