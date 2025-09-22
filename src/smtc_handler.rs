@@ -90,10 +90,12 @@ impl MonitoredSessionGuard {
                 if let Some(session) = &*sender
                     && let Ok(timeline_props) = session.GetTimelineProperties()
                     && let Ok(position) = timeline_props.Position()
+                    && let Ok(end_time) = timeline_props.EndTime()
                 {
                     let position_ms = (position.Duration / 10000) as u64;
+                    let duration_ms = (end_time.Duration / 10000) as u64;
                     let _ = tx_timeline.try_send(SmtcEventSignal::TimelinePropertiesUpdated(
-                        Box::new((id.clone(), position_ms)),
+                        Box::new((id.clone(), position_ms, duration_ms)),
                     ));
                 }
                 Ok(())
@@ -197,7 +199,7 @@ enum SmtcEventSignal {
     MediaProperties(String),
     Sessions,
     PlaybackInfoUpdated(Box<(String, PlaybackInfoUpdate)>),
-    TimelinePropertiesUpdated(Box<(String, u64)>),
+    TimelinePropertiesUpdated(Box<(String, u64, u64)>), // (id, position_ms, duration_ms)
 }
 
 #[derive(Debug)]
@@ -650,7 +652,7 @@ impl SmtcRunner {
 
     async fn handle_timeline_properties_update(
         &self,
-        (event_session_id, new_pos_ms): (String, u64),
+        (event_session_id, new_pos_ms, new_dur_ms): (String, u64, u64),
     ) -> WinResult<()> {
         let mut should_send_update = false;
         let mut payload = {
@@ -660,6 +662,16 @@ impl SmtcRunner {
                 != Some(event_session_id.as_str())
             {
                 return Ok(());
+            }
+
+            if new_dur_ms > 0 && state_guard.song_duration_ms != new_dur_ms {
+                log::trace!(
+                    "[Timeline Update] 时长从 {}ms 更新为 {}ms",
+                    state_guard.song_duration_ms,
+                    new_dur_ms
+                );
+                state_guard.song_duration_ms = new_dur_ms;
+                should_send_update = true;
             }
 
             let raw_estimated_pos_ms = if state_guard.playback_status == PlaybackStatus::Playing
@@ -1334,7 +1346,11 @@ async fn update_track_state(
     let mut player_state = context.player_state_arc.lock().await;
     let mut state = context.state.borrow_mut();
 
-    let is_new = player_state.title != track_info.title || player_state.artist != track_info.artist;
+    let is_initial_load = player_state.title.is_empty() && !track_info.title.is_empty();
+    let is_actual_track_change = !player_state.title.is_empty()
+        && (player_state.title != track_info.title || player_state.artist != track_info.artist);
+
+    let is_new = is_initial_load || is_actual_track_change;
 
     if is_new {
         log::info!(
@@ -1357,7 +1373,16 @@ async fn update_track_state(
     player_state.title.clone_from(&track_info.title);
     player_state.artist.clone_from(&track_info.artist);
     player_state.album.clone_from(&track_info.album);
-    player_state.song_duration_ms = track_info.duration_ms;
+
+    if is_initial_load {
+        if track_info.duration_ms > 0 {
+            player_state.song_duration_ms = track_info.duration_ms;
+        }
+    } else if is_actual_track_change {
+        player_state.last_known_position_ms = 0;
+        player_state.last_known_position_report_time = None;
+        player_state.song_duration_ms = 0;
+    }
 
     let update_payload = NowPlayingInfo::from(&*player_state);
 
