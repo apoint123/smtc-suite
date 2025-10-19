@@ -24,7 +24,7 @@ use windows::{
             GlobalSystemMediaTransportControlsSessionPlaybackStatus, PlaybackInfoChangedEventArgs,
             TimelinePropertiesChangedEventArgs,
         },
-        MediaPlaybackAutoRepeatMode,
+        MediaPlaybackAutoRepeatMode, MediaPlaybackType,
     },
     Win32::UI::WindowsAndMessaging::{DispatchMessageW, MSG, TranslateMessage},
     core::{Error as WinError, HSTRING, Result as WinResult},
@@ -33,7 +33,7 @@ use windows::{
 use crate::{
     Controls,
     api::{
-        DiagnosticInfo, DiagnosticLevel, NowPlayingInfo, PlaybackStatus, RepeatMode,
+        DiagnosticInfo, DiagnosticLevel, MediaType, NowPlayingInfo, PlaybackStatus, RepeatMode,
         SharedPlayerState, SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
     },
     error::Result,
@@ -291,10 +291,15 @@ impl SmtcState {
 }
 
 struct TrackInfo {
-    title: String,
-    artist: String,
-    album: String,
-    duration_ms: u64,
+    media_type: Option<MediaType>,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    album_artist: Option<String>,
+    genres: Option<Vec<String>>,
+    track_number: Option<u32>,
+    album_track_count: Option<u32>,
+    duration_ms: Option<u64>,
 }
 
 fn send_now_playing_update(
@@ -302,7 +307,7 @@ fn send_now_playing_update(
     connector_update_tx: &TokioSender<InternalUpdate>,
 ) {
     if connector_update_tx
-        .try_send(InternalUpdate::TrackChanged(info))
+        .try_send(InternalUpdate::TrackChanged(Box::new(info)))
         .is_err()
     {
         log::warn!("[Handler] Failed to broadcast state, all receivers may have been closed");
@@ -830,40 +835,22 @@ impl SmtcRunner {
         }
     }
 
-    fn try_parse_apple_music_format(info: TrackInfo) -> TrackInfo {
-        const SEPARATOR: &str = "—";
-        if !info.artist.contains(SEPARATOR) {
-            return info;
+    fn try_parse_apple_music_format(track_info: &mut TrackInfo) {
+        if track_info.album.is_some() || track_info.artist.is_none() {
+            return;
         }
 
-        let parts: Vec<&str> = info.artist.split(SEPARATOR).map(str::trim).collect();
+        if let Some(artist_str) = track_info.artist.as_deref() {
+            const SEPARATOR: &str = "—";
+            if artist_str.contains(SEPARATOR) {
+                let parts: Vec<&str> = artist_str.split(SEPARATOR).map(str::trim).collect();
 
-        match parts.len() {
-            // Pattern: "Artist — Album"
-            2 => {
-                log::debug!(
-                    "Detected Apple Music-specific format (Artist — Album): '{}', splitting",
-                    &info.artist
-                );
-                TrackInfo {
-                    artist: parts[0].to_string(),
-                    album: parts[1].to_string(),
-                    ..info
+                // Pattern: "Artist — Album" OR "Artist — Album — Artist"
+                if parts.len() == 2 || (parts.len() == 3 && parts[0] == parts[2]) {
+                    track_info.album = Some(parts[1].to_string());
+                    track_info.artist = Some(parts[0].to_string());
                 }
             }
-            // Pattern: "Artist — Album — Artist"
-            3 if parts[0] == parts[2] => {
-                log::debug!(
-                    "Detected Apple Music-specific format (Artist — Album — Artist): '{}', splitting",
-                    &info.artist
-                );
-                TrackInfo {
-                    artist: parts[0].to_string(),
-                    album: parts[1].to_string(),
-                    ..info
-                }
-            }
-            _ => info,
         }
     }
 
@@ -918,7 +905,7 @@ impl SmtcRunner {
 
         if context
             .connector_update_tx
-            .try_send(InternalUpdate::TrackChanged(update_payload))
+            .try_send(InternalUpdate::TrackChanged(Box::new(update_payload)))
             .is_err()
         {
             log::warn!("[SMTC] Failed to broadcast state, all receivers may have been closed");
@@ -1306,43 +1293,95 @@ fn parse_and_convert_properties(
     session: &MediaSession,
 ) -> Option<TrackInfo> {
     let state = context.state.borrow();
-    let get_prop_string = |prop_res: WinResult<HSTRING>, name: &str| {
-        prop_res.map_or_else(
-            |e| {
-                log::warn!("[SmtcRunner] Failed to get media property '{name}': {e:?}");
-                String::new()
-            },
-            |hstr| {
-                crate::utils::convert_text(&hstring_to_string(&hstr), state.text_converter.as_ref())
-            },
-        )
+
+    let get_optional_prop_string = |prop_res: WinResult<HSTRING>, name: &str| match prop_res {
+        Ok(hstr) if !hstr.is_empty() => {
+            let text = hstring_to_string(&hstr);
+            Some(crate::utils::convert_text(
+                &text,
+                state.text_converter.as_ref(),
+            ))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            log::warn!("[SmtcRunner] Failed to get media property '{name}': {e:?}");
+            None
+        }
     };
 
-    let title = get_prop_string(props.Title(), "Title");
+    let title = get_optional_prop_string(props.Title(), "Title");
 
-    if IGNORED_TITLES.iter().any(|&ignored| title == ignored) {
+    if title
+        .as_deref()
+        .is_some_and(|t| IGNORED_TITLES.contains(&t))
+    {
         return None;
     }
 
-    let artist = get_prop_string(props.Artist(), "Artist");
-    let album = get_prop_string(props.AlbumTitle(), "AlbumTitle");
+    let media_type = props
+        .PlaybackType()
+        .ok()
+        .and_then(|iref| iref.Value().ok())
+        .map(|t| match t {
+            MediaPlaybackType::Music => MediaType::Music,
+            MediaPlaybackType::Video => MediaType::Video,
+            MediaPlaybackType::Image => MediaType::Image,
+            _ => MediaType::Unknown,
+        });
+
+    let artist = get_optional_prop_string(props.Artist(), "Artist");
+    let album = get_optional_prop_string(props.AlbumTitle(), "AlbumTitle");
+    let album_artist = get_optional_prop_string(props.AlbumArtist(), "AlbumArtist");
+
+    let genres = props.Genres().map_or(None, |genres_view| {
+        let genres: Vec<String> = genres_view
+            .into_iter()
+            .map(|hstr| {
+                let genre_str = hstring_to_string(&hstr);
+                crate::utils::convert_text(&genre_str, state.text_converter.as_ref())
+            })
+            .collect();
+
+        if genres.is_empty() {
+            None
+        } else {
+            Some(genres)
+        }
+    });
+
+    let track_number = props
+        .TrackNumber()
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0);
+    let album_track_count = props
+        .AlbumTrackCount()
+        .ok()
+        .and_then(|n| u32::try_from(n).ok())
+        .filter(|&n| n > 0);
 
     let mut track_info = TrackInfo {
+        media_type,
         title,
         artist,
         album,
-        duration_ms: 0,
+        album_artist,
+        genres,
+        track_number,
+        album_track_count,
+        duration_ms: None,
     };
 
-    if state.is_apple_music_optimization_enabled && track_info.album.is_empty() {
-        track_info = SmtcRunner::try_parse_apple_music_format(track_info);
+    if state.is_apple_music_optimization_enabled {
+        SmtcRunner::try_parse_apple_music_format(&mut track_info);
     }
 
-    if let Ok(timeline_props) = session.GetTimelineProperties()
-        && let Ok(end_time) = timeline_props.EndTime()
-    {
-        track_info.duration_ms = (end_time.Duration / 10000) as u64;
-    }
+    track_info.duration_ms = session
+        .GetTimelineProperties()
+        .and_then(|timeline_props| timeline_props.EndTime())
+        .ok()
+        .map(|end_time| (end_time.Duration / 10000) as u64)
+        .filter(|&d| d > 0);
 
     Some(track_info)
 }
@@ -1354,21 +1393,20 @@ async fn update_track_state(
     let mut player_state = context.player_state_arc.lock().await;
     let mut state = context.state.borrow_mut();
 
-    let is_initial_load = player_state.title.is_empty() && !track_info.title.is_empty();
+    let new_title = track_info.title.as_deref().unwrap_or_default();
+    let new_artist = track_info.artist.as_deref().unwrap_or_default();
+
+    let is_initial_load = player_state.title.is_empty() && !new_title.is_empty();
     let is_actual_track_change = !player_state.title.is_empty()
-        && (player_state.title != track_info.title || player_state.artist != track_info.artist);
+        && (player_state.title != new_title || player_state.artist != new_artist);
 
     let is_new = is_initial_load || is_actual_track_change;
 
     if is_new {
-        log::info!(
-            "[SmtcRunner] New track: '{}' - '{}'",
-            &track_info.artist,
-            &track_info.title
-        );
+        log::info!("[SmtcRunner] New track: '{new_artist}' - '{new_title}'");
 
         if state.last_failed_cover_track.as_ref()
-            != Some(&(track_info.artist.clone(), track_info.title.clone()))
+            != Some(&(new_artist.to_string(), new_title.to_string()))
         {
             state.last_failed_cover_track = None;
         }
@@ -1378,18 +1416,26 @@ async fn update_track_state(
         player_state.is_waiting_for_initial_update = true;
     }
 
-    player_state.title.clone_from(&track_info.title);
-    player_state.artist.clone_from(&track_info.artist);
-    player_state.album.clone_from(&track_info.album);
+    player_state.media_type = track_info.media_type.unwrap_or_default();
+    player_state.title = track_info.title.clone().unwrap_or_default();
+    player_state.artist = track_info.artist.clone().unwrap_or_default();
+    player_state.album = track_info.album.clone().unwrap_or_default();
+    player_state.album_artist = track_info.album_artist.clone().unwrap_or_default();
+    player_state.genres = track_info.genres.clone().unwrap_or_default();
 
-    if is_initial_load {
-        if track_info.duration_ms > 0 {
-            player_state.song_duration_ms = track_info.duration_ms;
-        }
-    } else if is_actual_track_change {
+    player_state.track_number = track_info.track_number;
+    player_state.album_track_count = track_info.album_track_count;
+
+    if let Some(duration) = track_info.duration_ms {
+        player_state.song_duration_ms = duration;
+    }
+
+    if is_actual_track_change {
         player_state.last_known_position_ms = 0;
         player_state.last_known_position_report_time = None;
-        player_state.song_duration_ms = 0;
+        if track_info.duration_ms.is_none() {
+            player_state.song_duration_ms = 0;
+        }
     }
 
     let update_payload = NowPlayingInfo::from(&*player_state);

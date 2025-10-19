@@ -72,23 +72,33 @@ pub enum TextConversionMode {
     HongKongToSimplified,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum MediaType {
+    #[default]
+    Unknown,
+    Music,
+    Video,
+    Image,
+}
+
 /// A mutable structure used internally by the SMTC handler to
 /// aggregate and manage the current player state.
 #[derive(Debug, Clone, Default)]
 pub struct SharedPlayerState {
-    /// The song title.
+    pub media_type: MediaType,
     pub title: String,
-    /// The artist's name.
     pub artist: String,
-    /// The album title.
     pub album: String,
-    /// Total duration of the song in milliseconds.
+    pub album_artist: String,
+    pub genres: Vec<String>,
+    pub track_number: Option<u32>,
+    pub album_track_count: Option<u32>,
     pub song_duration_ms: u64,
+
     /// The last known playback position in milliseconds, as reported by SMTC.
     pub last_known_position_ms: u64,
     /// The `Instant` when `last_known_position_ms` was updated.
     pub last_known_position_report_time: Option<Instant>,
-    /// The current playback status.
     pub playback_status: PlaybackStatus,
     /// The control options supported by the current media source.
     pub controls: Controls,
@@ -146,9 +156,14 @@ impl SharedPlayerState {
 impl From<&SharedPlayerState> for NowPlayingInfo {
     fn from(state: &SharedPlayerState) -> Self {
         Self {
+            media_type: Some(state.media_type),
             title: Some(state.title.clone()),
             artist: Some(state.artist.clone()),
             album_title: Some(state.album.clone()),
+            album_artist: Some(state.album_artist.clone()),
+            genres: Some(state.genres.clone()),
+            track_number: state.track_number,
+            album_track_count: state.album_track_count,
             duration_ms: Some(state.song_duration_ms),
             position_ms: Some(state.get_estimated_current_position_ms()),
             smtc_position_ms: Some(state.last_known_position_ms),
@@ -166,12 +181,22 @@ impl From<&SharedPlayerState> for NowPlayingInfo {
 /// A snapshot of all information about the currently playing track.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct NowPlayingInfo {
+    /// The type of the media content.
+    pub media_type: Option<MediaType>,
     /// The track title.
     pub title: Option<String>,
     /// The artist's name.
     pub artist: Option<String>,
     /// The album title.
     pub album_title: Option<String>,
+    /// The album artist's name.
+    pub album_artist: Option<String>,
+    /// The genre names.
+    pub genres: Option<Vec<String>>,
+    /// The track number.
+    pub track_number: Option<u32>,
+    /// The album track count.
+    pub album_track_count: Option<u32>,
 
     /// Total duration of the track in milliseconds.
     pub duration_ms: Option<u64>,
@@ -411,7 +436,7 @@ pub enum MediaUpdate {
     /// The payload is a `NowPlayingInfo` struct, containing all the latest
     /// media information, including metadata, playback status, progress,
     /// and cover art data.
-    TrackChanged(NowPlayingInfo),
+    TrackChanged(Box<NowPlayingInfo>),
     /// The list of available media sessions has been updated.
     SessionsChanged(Vec<SmtcSessionInfo>),
     /// An audio data packet has been received (if audio capture is enabled).

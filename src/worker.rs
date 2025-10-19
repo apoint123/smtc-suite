@@ -54,7 +54,7 @@ pub enum InternalCommand {
 pub enum InternalUpdate {
     /// Emitted by `smtc_handler`, indicating that the current track information
     /// has been updated.
-    TrackChanged(NowPlayingInfo),
+    TrackChanged(Box<NowPlayingInfo>),
     /// Emitted by `smtc_handler`, indicating that the active SMTC session has
     /// changed.
     ActiveSmtcSessionChanged { pid: Option<u32> },
