@@ -19,95 +19,93 @@ use tokio::runtime::Runtime as TokioRuntime;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
-// ================================================================================================
-// C-ABI 兼容的公共枚举和数据结构
-// ================================================================================================
-
-/// FFI 函数的通用返回码。
 #[repr(C)]
 #[derive(Debug, PartialEq, Eq)]
 pub enum SmtcResult {
-    /// 操作成功。
     Success,
-    /// 传入的句柄是 NULL 或无效（例如已销毁）。
     InvalidHandle,
-    /// 创建 SMTCS 实例失败。
     CreationFailed,
-    /// 内部发生错误，通常伴有日志输出。
     InternalError,
-    /// 命令因通道已满而发送失败。
     ChannelFull,
 }
 
-/// 一个包装器，用于安全地在线程间传递裸指针 `*mut c_void`。
+/// A wrapper for safely passing a raw pointer `*mut c_void` between threads.
 ///
-/// # 安全性
-/// 我们手动（`unsafe`）地为它实现 `Send` 和 `Sync` trait。
-/// 这是因为我们向 Rust 编译器作出承诺：C 端的调用者有责任确保
-/// 这个指针（`userdata`）在所有可能的回调执行期间（即句柄的整个生命周期内）
-/// 都是有效的，并且其指向的数据的访问是线程安全的。
-/// 本库仅仅是原样传递此指针，不会对其进行解引用或修改。
+/// # Safety
+/// The C caller is responsible to ensure that this pointer (`userdata`) is
+/// valid during all possible callback executions (i.e., the lifetime of the
+/// handle) and that access to the data it points to is thread-safe. We simply
+/// passes this pointer around without dereferencing or modifying it.
 #[derive(Copy, Clone)]
 struct SendableVoidPtr(*mut c_void);
 
-// 安全性: 见 `SendableVoidPtr` 的文档。C 调用方负责维护安全契约。
 unsafe impl Send for SendableVoidPtr {}
 unsafe impl Sync for SendableVoidPtr {}
 
-/// C-ABI 兼容的“正在播放”信息结构体。
+/// C-ABI compatible "now playing" information struct.
 ///
-/// # 数据生命周期
-/// **此结构体及其指向的所有数据（包括字符串和封面数据）仅在回调函数作用域内有效。**
-/// 如果需要在回调函数返回后继续使用这些数据，必须在回调函数内部进行深拷贝。
-/// **调用者不应也无需手动释放任何指针。**
+/// # Data Lifetime
+/// This struct and all the data it points to (including strings) are only
+/// valid within the scope of the callback function.
+/// If you need to use this data after the callback function returns, you must
+/// perform a deep copy inside the callback.
+/// The caller should not and does not need to manually free any pointers.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CNowPlayingInfo {
-    /// 曲目标题 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// Track title (UTF-8 encoded, Null-terminated). Only valid within the
+    /// callback.
     pub title: *const c_char,
-    /// 艺术家 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// Artist (UTF-8 encoded, Null-terminated). Only valid within the callback.
     pub artist: *const c_char,
-    /// 专辑标题 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// Album title (UTF-8 encoded, Null-terminated). Only valid within the
+    /// callback.
     pub album_title: *const c_char,
-    /// 歌曲总时长（毫秒）。
+    /// Total duration of the song in milliseconds.
     pub duration_ms: u64,
-    /// 当前播放位置（毫秒）。
+    /// Current playback position in milliseconds.
     pub position_ms: u64,
-    /// 当前是否正在播放。
+    /// Whether it is currently playing.
     pub is_playing: bool,
 }
 
-/// C-ABI 兼容的 SMTC 会话信息结构体。
+/// C-ABI compatible SMTC session information struct.
 ///
-/// # 数据生命周期
-/// **此结构体及其指向的所有字符串数据仅在回调函数作用域内有效。**
-/// 如果需要保留，必须在回调函数内部进行深拷贝。
-/// **调用者不应也无需手动释放任何指针。**
+/// # Data Lifetime
+/// This struct and all the string data it points to are only valid within the
+/// scope of the callback function.
+/// If you need to retain it, you must perform a deep copy inside the callback.
+/// The caller should not and does not need to manually free any pointers.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CSessionInfo {
-    /// 会话的唯一 ID (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// The unique ID of the session (UTF-8 encoded, Null-terminated). Only
+    /// valid within the callback.
     pub session_id: *const c_char,
-    /// 来源应用的 AUMID (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// The AUMID of the source application (UTF-8 encoded, Null-terminated).
+    /// Only valid within the callback.
     pub source_app_user_model_id: *const c_char,
-    /// 用于 UI 显示的名称 (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// The display name for UI purposes (UTF-8 encoded, Null-terminated). Only
+    /// valid within the callback.
     pub display_name: *const c_char,
 }
 
-/// C-ABI 兼容的会话列表结构体，用于在回调中传递会话数组。
+/// C-ABI compatible session list struct, used for passing an array of sessions
+/// in a callback.
 ///
-/// # 数据生命周期
-/// **此结构体及其指向的 `sessions` 数组和数组内所有数据仅在回调函数作用域内有效。**
+/// # Data Lifetime
+/// This struct, the `sessions` array it points to, and all data within that
+/// array are only valid within the scope of the callback function.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CSessionList {
-    /// 指向 `CSessionInfo` 数组头部的指针。
+    /// Pointer to the head of the `CSessionInfo` array.
     pub sessions: *const CSessionInfo,
-    /// 数组中的元素数量。
+    /// The number of elements in the array.
     pub count: usize,
 }
 
-/// C-ABI 兼容的诊断级别枚举。
+/// C-ABI compatible diagnostic level enum.
 #[repr(C)]
 #[derive(Debug)]
 pub enum CDiagnosticLevel {
@@ -115,81 +113,91 @@ pub enum CDiagnosticLevel {
     Error,
 }
 
-/// C-ABI 兼容的诊断信息结构体。
+/// C-ABI compatible diagnostic information struct.
 ///
-/// # 数据生命周期
-/// **此结构体及其指向的所有字符串数据仅在回调函数作用域内有效。**
-/// 如果需要保留，必须在回调函数内部进行深拷贝。
-/// **调用者不应也无需手动释放任何指针。**
+/// # Data Lifetime
+/// This struct and all the string data it points to are only valid within the
+/// scope of the callback function.
+/// If you need to retain it, you must perform a deep copy inside the callback.
+/// The caller should not and does not need to manually free any pointers.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CDiagnosticInfo {
-    /// 诊断事件的级别。
+    /// The level of the diagnostic event.
     pub level: CDiagnosticLevel,
-    /// 诊断信息的具体内容。仅在回调内有效。
+    /// The specific content of the diagnostic message. Only valid within the
+    /// callback.
     pub message: *const c_char,
-    /// 事件发生的时间戳，仅在回调内有效。
+    /// The timestamp of when the event occurred. Only valid within the
+    /// callback.
     pub timestamp_str: *const c_char,
 }
 
-/// C-ABI 兼容的音频数据包结构体。
+/// C-ABI compatible audio data packet struct.
 ///
-/// # 数据生命周期
-/// **此结构体及其指向的 `data` 数组仅在回调函数作用域内有效。**
+/// # Data Lifetime
+/// This struct and the `data` array it points to are only valid within the
+/// scope of the callback function.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CAudioDataPacket {
-    /// 指向音频 PCM 数据的指针。
+    /// Pointer to the audio PCM data.
     pub data: *const u8,
-    /// 数据长度（字节）。
+    /// The length of the data in bytes.
     pub len: usize,
 }
 
-/// C-ABI 兼容的音量变化事件结构体。
+/// C-ABI compatible volume changed event struct.
 ///
-/// # 数据生命周期
-/// **此结构体及其指向的 `session_id` 字符串仅在回调函数作用域内有效。**
-/// **调用者不应也无需手动释放任何指针。**
+/// # Data Lifetime
+/// This struct and the `session_id` string it points to are only valid within
+/// the scope of the callback function.
+/// The caller should not and does not need to manually free any pointers.
 #[repr(C)]
 #[derive(Debug)]
 pub struct CVolumeChangedEvent {
-    /// 发生音量变化的会话 ID (UTF-8 编码, Null 结尾)。仅在回调内有效。
+    /// The ID of the session where the volume changed (UTF-8 encoded,
+    /// Null-terminated). Only valid within the callback.
     pub session_id: *const c_char,
-    /// 新的音量级别 (0.0 到 1.0)。
+    /// The new volume level (from 0.0 to 1.0).
     pub volume: f32,
-    /// 新的静音状态。
+    /// The new mute state.
     pub is_muted: bool,
 }
 
-/// 定义从 Rust 发送到 C 的更新事件类型。
+/// Defines the update event types sent from Rust to C.
 #[repr(C)]
 pub enum CUpdateType {
-    /// data 指针类型: `*const CNowPlayingInfo` (常规更新)
+    /// data pointer type: `*const CNowPlayingInfo` (regular update)
     TrackChanged,
-    /// data 指针类型: `*const CSessionList`
+    /// data pointer type: `*const CSessionList`
     SessionsChanged,
-    /// data 指针类型: `*const CAudioDataPacket`
+    /// data pointer type: `*const CAudioDataPacket`
     AudioData,
-    /// data 指针类型: `*const c_char` (错误信息字符串)
+    /// data pointer type: `*const c_char` (error message string)
     Error,
-    /// data 指针类型: `*const CVolumeChangedEvent`
+    /// data pointer type: `*const CVolumeChangedEvent`
     VolumeChanged,
-    /// data 指针类型: `*const c_char` (已消失会话的 ID)
+    /// data pointer type: `*const c_char` (ID of the vanished session)
     SelectedSessionVanished,
-    /// data 指针类型: `*const CDiagnosticInfo`
+    /// data pointer type: `*const CDiagnosticInfo`
     Diagnostic,
 }
 
-/// 定义从 C 端接收更新的回调函数指针类型。
+/// Defines the callback function pointer type for receiving updates from the C
+/// side.
 ///
-/// # 参数
-/// - `update_type`: 事件的类型，用于决定如何转换 `data` 指针。
-/// - `data`: 一个 `const void*` 指针，指向与事件类型对应的 C 结构体。
-/// - `userdata`: 调用者在注册时传入的自定义上下文指针。
+/// # Arguments
+/// - `update_type`: The type of the event, used to determine how to cast the
+///   `data` pointer.
+/// - `data`: A `const void*` pointer to a C struct corresponding to the event
+///   type.
+/// - `userdata`: The custom context pointer passed by the caller during
+///   registration.
 pub type UpdateCallback =
     extern "C" fn(update_type: CUpdateType, data: *const c_void, userdata: *mut c_void);
 
-/// C-ABI 兼容的日志级别枚举。
+/// C-ABI compatible log level enum.
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 pub enum CLogLevel {
@@ -224,13 +232,14 @@ impl From<Level> for CLogLevel {
     }
 }
 
-/// 定义 C 端日志回调函数的指针类型。
+/// Defines the pointer type for the C side log callback function.
 ///
-/// # 参数
-/// - `level`: 日志消息的级别。
-/// - `target`: 日志来源的模块路径 (例如 "`my_lib::my_module`")。
-/// - `message`: UTF-8 编码、Null 结尾的日志消息。
-/// - `userdata`: 调用者在注册时传入的自定义上下文指针。
+/// # Arguments
+/// - `level`: The level of the log message.
+/// - `target`: The module path of the log source (e.g., "`my_lib::my_module`").
+/// - `message`: The UTF-8 encoded, Null-terminated log message.
+/// - `userdata`: The custom context pointer passed by the caller during
+///   registration.
 pub type LogCallback = extern "C" fn(
     level: CLogLevel,
     target: *const c_char,
@@ -238,7 +247,7 @@ pub type LogCallback = extern "C" fn(
     userdata: *mut c_void,
 );
 
-/// FFI 日志记录器的状态，用于存储 C 回调和用户数据。
+/// State for the FFI logger, used to store the C callback and user data.
 struct FfiLoggerState {
     callback: LogCallback,
     userdata: SendableVoidPtr,
@@ -279,10 +288,10 @@ impl log::Log for FfiLogger {
 }
 
 // ================================================================================================
-// 句柄生命周期管理
+// Handle Lifetime Management
 // ================================================================================================
 
-/// Rust 端的核心控制器句柄。
+/// The core controller handle on the Rust side.
 pub struct SmtcHandle {
     controller: Option<MediaController>,
     update_rx: Option<mpsc::Receiver<MediaUpdate>>,
@@ -294,7 +303,7 @@ pub struct SmtcHandle {
     listener_creation_mutex: Mutex<()>,
 }
 
-/// 宏，用于在 FFI 函数开始时验证句柄的有效性。
+/// Macro to validate the handle at the beginning of an FFI function.
 macro_rules! validate_handle {
     ($handle_ptr:expr) => {
         if $handle_ptr.is_null() {
@@ -302,7 +311,7 @@ macro_rules! validate_handle {
         }
         let handle = unsafe { &*$handle_ptr };
         if handle.is_destroyed.load(Ordering::SeqCst) {
-            log::warn!("[FFI] 尝试对一个已销毁的句柄进行操作。");
+            log::warn!("[FFI] Attempted to operate on a destroyed handle.");
             return SmtcResult::InvalidHandle;
         }
     };
@@ -312,41 +321,46 @@ macro_rules! validate_handle {
         }
         let handle = unsafe { &mut *$handle_ptr };
         if handle.is_destroyed.load(Ordering::SeqCst) {
-            log::warn!("[FFI] 尝试对一个已销毁的句柄进行操作。");
+            log::warn!("[FFI] Attempted to operate on a destroyed handle.");
             return SmtcResult::InvalidHandle;
         }
     };
 }
 
-/// 创建一个新的 SMTC 控制器实例。
+/// Creates a new SMTC controller instance.
 ///
-/// # 参数
-/// - `out_handle`: 一个指向 `*mut SmtcHandle` 的指针，用于接收成功创建的句柄。
+/// # Arguments
+/// - `out_handle`: A pointer to `*mut SmtcHandle` to receive the successfully
+///   created handle.
 ///
-/// # 返回
-/// - `SmtcResult::Success` 表示成功，`out_handle` 将被设置为有效的句柄。
-/// - `SmtcResult::CreationFailed` 表示失败，`out_handle` 将被设置为 `NULL`。
+/// # Returns
+/// - `SmtcResult::Success` on success, `out_handle` will be set to a valid
+///   handle.
+/// - `SmtcResult::CreationFailed` on failure, `out_handle` will be set to
+///   `NULL`.
 ///
-/// # 安全性
-/// 调用者有责任确保 `out_handle` 指向一个有效的 `*mut SmtcHandle` 内存位置。
-/// 返回的句柄必须在不再需要时通过 `smtc_suite_destroy` 释放，以避免资源泄漏。
-/// 导出此函数是安全的，因为它不依赖于任何不安全的前置条件，并且其操作是独立的。
+/// # Safety
+/// The caller is responsible for ensuring `out_handle` points to a valid memory
+/// location for a `*mut SmtcHandle`. The returned handle must be freed via
+/// `smtc_suite_destroy` when no longer needed to avoid resource leaks.
+/// Exporting this function is safe as it has no unsafe preconditions and its
+/// operation is self-contained.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_create(out_handle: *mut *mut SmtcHandle) -> SmtcResult {
     if out_handle.is_null() {
         return SmtcResult::InternalError;
     }
-    // 预先设置为 NULL，这是安全默认值。
+    // Pre-emptively set to NULL as a safe default.
     unsafe { *out_handle = std::ptr::null_mut() };
 
-    log::info!("[FFI] 正在调用 smtc_suite_create...");
+    log::info!("[FFI] Calling smtc_suite_create...");
 
     match crate::MediaManager::start() {
         Ok((controller, update_rx)) => {
             let runtime = match TokioRuntime::new() {
                 Ok(rt) => rt,
                 Err(e) => {
-                    log::error!("[FFI] 创建 Tokio 运行时失败: {e}");
+                    log::error!("[FFI] Failed to create Tokio runtime: {e}");
                     return SmtcResult::CreationFailed;
                 }
             };
@@ -365,23 +379,28 @@ pub unsafe extern "C" fn smtc_suite_create(out_handle: *mut *mut SmtcHandle) -> 
             SmtcResult::Success
         }
         Err(e) => {
-            log::error!("[FFI] 创建 SmtcHandle 失败: {e}");
+            log::error!("[FFI] Failed to create SmtcHandle: {e}");
             SmtcResult::CreationFailed
         }
     }
 }
 
-/// 销毁 SMTC 控制器实例，并释放所有相关资源。
+/// Destroys the SMTC controller instance and releases all associated resources.
 ///
-/// 这是一个安全的操作，即使传入 `NULL` 指针也不会导致问题。
-/// 此函数会优雅地关闭后台线程。它会同步阻塞，等待回调线程退出，
-/// 但最多等待 5 秒。如果回调线程在此时间内未退出（例如被 C 端回调阻塞），
-/// 函数将记录警告并返回，这可能导致线程资源泄漏。
+/// This is a safe operation, even if a `NULL` pointer is passed.
+/// This function gracefully shuts down the background thread. It will block
+/// synchronously to wait for the callback thread to exit, but for a maximum of
+/// 5 seconds. If the callback thread does not exit within this time (e.g.,
+/// blocked by a C-side callback), the function will log a warning and return,
+/// which may lead to a thread resource leak.
 ///
-/// # 安全性
-/// - `handle_ptr` 必须是一个由 `smtc_suite_create` 返回且尚未被销毁的有效指针。
-/// - 在调用此函数后，`handle_ptr` 将变为无效（悬垂）指针，不应再次使用。
-///   导出此函数是安全的，因为它正确处理了 `NULL` 输入并管理其拥有的资源的生命周期。
+/// # Safety
+/// - `handle_ptr` must be a valid pointer returned by `smtc_suite_create` that
+///   has not yet been destroyed.
+/// - After calling this function, `handle_ptr` becomes an invalid (dangling)
+///   pointer and should not be used again. Exporting this function is safe as
+///   it correctly handles `NULL` input and manages the lifecycle of the
+///   resources it owns.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_destroy(handle_ptr: *mut SmtcHandle) {
     if handle_ptr.is_null() {
@@ -399,22 +418,20 @@ pub unsafe extern "C" fn smtc_suite_destroy(handle_ptr: *mut SmtcHandle) {
             return;
         }
 
-        log::info!("[FFI] 正在销毁 SmtcHandle...");
+        log::info!("[FFI] Destroying SmtcHandle...");
         handle.shutdown_token.cancel();
 
-        // 使用存储的 runtime 来同步执行异步的 shutdown
         if let (Some(controller), Some(runtime)) = (handle.controller.take(), handle.runtime.take())
         {
-            log::debug!("[FFI] 正在同步执行异步的 shutdown...");
             runtime.block_on(async {
                 if let Err(e) = controller.shutdown().await {
-                    log::error!("[FFI] 发送关闭命令失败: {e}");
+                    log::error!("[FFI] Failed to send shutdown command: {e}");
                 }
             });
         }
 
         if let Some(join_handle) = handle.update_listener_handle.take() {
-            log::debug!("[FFI] 等待回调监听线程退出...");
+            log::debug!("[FFI] Waiting for callback listener thread to exit...");
             const TIMEOUT: Duration = Duration::from_secs(5);
             let start = Instant::now();
 
@@ -424,51 +441,62 @@ pub unsafe extern "C" fn smtc_suite_destroy(handle_ptr: *mut SmtcHandle) {
 
             if join_handle.is_finished() {
                 if let Err(e) = join_handle.join() {
-                    log::error!("[FFI] 等待回调监听线程退出时发生错误: {e:?}");
+                    log::error!(
+                        "[FFI] Error occurred while waiting for callback listener thread to exit: {e:?}"
+                    );
                 } else {
-                    log::debug!("[FFI] 回调监听线程已成功退出。");
+                    log::debug!("[FFI] Callback listener thread has exited successfully.");
                 }
             } else {
                 log::warn!(
-                    "[FFI] 监听线程在 {} 秒内未退出，可能因回调阻塞。句柄将被销毁，但线程可能泄漏。",
+                    "[FFI] Listener thread did not exit within {} seconds, possibly due to a blocking callback. The handle will be destroyed, but the thread may leak.",
                     TIMEOUT.as_secs()
                 );
             }
         }
 
         drop(unsafe { Box::from_raw(handle_ptr) });
-        log::info!("[FFI] SmtcHandle 已成功销毁。");
+        log::info!("[FFI] SmtcHandle has been successfully destroyed.");
     }));
 
     if result.is_err() {
-        log::error!("[FFI] smtc_suite_destroy 内部发生 Panic！");
+        log::error!("[FFI] Panic occurred inside smtc_suite_destroy!");
     }
 }
 
 // ================================================================================================
-// 回调注册与版本信息
+// Callback Registration & Version Info
 // ================================================================================================
 
-/// 为给定的句柄注册一个回调函数，以接收所有媒体更新。
+/// Registers a callback function for the given handle to receive all media
+/// updates.
 ///
-/// 每次调用都会替换掉之前的回调。要注销回调，请传入一个 `NULL` 函数指针。
+/// Each call will replace the previous callback. To unregister, pass a `NULL`
+/// function pointer.
 ///
-/// # 注意
-/// - **线程模型**: 回调函数将在一个由本库管理的**独立后台线程**上被调用。
-///   调用者需要确保在回调函数中的所有操作都是线程安全的。
-/// - **数据生命周期**: 传递给回调函数的 `data` 指针（例如 `CNowPlayingInfo*`）
-///   **仅在回调函数的执行期间有效**。如果需要保留这些数据，必须在回调内部进行深拷贝。
-/// - **阻塞警告**: 回调函数不应长时间阻塞，否则可能导致 `smtc_suite_destroy` 调用超时。
+/// # Notes
+/// - Threading Model: The callback function will be invoked on a separate
+///   background thread managed by this library. The caller must ensure that all
+///   operations within the callback are thread-safe.
+/// - Data Lifetime: The `data` pointer passed to the callback (e.g.,
+///   `CNowPlayingInfo*`) is only valid for the duration of the callback's
+///   execution. If you need to retain this data, you must perform a deep copy
+///   inside the callback.
+/// - Blocking Warning: The callback function should not block for long periods,
+///   as this could cause the `smtc_suite_destroy` call to time out.
 ///
-/// # 参数
-/// - `handle_ptr`: 一个由 `smtc_suite_create` 返回的有效句柄。
-/// - `callback`: 用于接收更新的函数指针。传入 `NULL` 以注销当前的回调。
-/// - `userdata`: 一个用户自定义的上下文指针，它将被原样传递给回调函数。
+/// # Arguments
+/// - `handle_ptr`: A valid handle returned by `smtc_suite_create`.
+/// - `callback`: A function pointer to receive updates. Pass `NULL` to
+///   unregister the current callback.
+/// - `userdata`: A user-defined context pointer that will be passed back to the
+///   callback as-is.
 ///
-/// # 安全性
-/// - `handle_ptr` 必须是一个有效的、尚未被销毁的 `SmtcHandle` 指针。
-/// - 调用者必须保证 `userdata` 指针在所有回调的生命周期内都保持有效。
-///   导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+/// # Safety
+/// - `handle_ptr` must be a valid, non-destroyed `SmtcHandle` pointer.
+/// - The caller must guarantee that the `userdata` pointer remains valid for
+///   the entire lifetime of any callback. Exporting this function is safe as it
+///   interacts with internal state via the handle and validates its inputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_register_update_callback(
     handle_ptr: *mut SmtcHandle,
@@ -487,22 +515,26 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                 *cb_info_guard = None;
             }
         } else {
-            log::error!("[FFI] 回调信息锁已被毒化，无法更新回调。");
+            log::error!("[FFI] Callback info lock is poisoned, cannot update callback.");
             return SmtcResult::InternalError;
         }
 
         let is_callback_present = (callback as usize) != 0;
         if is_callback_present {
             let Ok(_creation_guard) = handle.listener_creation_mutex.lock() else {
-                log::error!("[FFI] 监听器创建锁已被毒化，操作中止。");
+                log::error!("[FFI] Listener creation lock is poisoned, aborting operation.");
                 return SmtcResult::InternalError;
             };
 
             if handle.update_listener_handle.is_none() {
-                log::info!("[FFI] 首次注册回调，正在启动回调监听线程...");
+                log::info!(
+                    "[FFI] First time registering a callback, starting the callback listener thread..."
+                );
 
                 let Some(mut update_rx) = handle.update_rx.take() else {
-                    log::error!("[FFI] update_rx 已被移走，无法重复创建监听线程。");
+                    log::error!(
+                        "[FFI] update_rx has already been moved, cannot create listener thread again."
+                    );
                     return SmtcResult::InternalError;
                 };
 
@@ -511,14 +543,16 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
 
                 let join_handle = std::thread::spawn(move || {
                     log::debug!(
-                        "[FFI 回调线程] 线程已启动 (ID: {:?})。",
+                        "[FFI Callback Thread] Thread started (ID: {:?}).",
                         std::thread::current().id()
                     );
 
                     let rt = match TokioRuntime::new() {
                         Ok(rt) => rt,
                         Err(e) => {
-                            log::error!("[FFI 回调线程] 创建 Tokio 运行时失败: {e}");
+                            log::error!(
+                                "[FFI Callback Thread] Failed to create Tokio runtime: {e}"
+                            );
                             return;
                         }
                     };
@@ -542,25 +576,25 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                                             });
                                             if res.is_err() {
                                                 log::error!(
-                                                    "[FFI 回调线程] C 端回调函数发生 Panic！"
+                                                    "[FFI Callback Thread] Panic occurred in C-side callback function!"
                                                 );
                                             }
                                         }
                                     } else {
-                                        log::warn!("[FFI 回调线程] 更新通道已断开，线程退出。");
+                                        log::warn!("[FFI Callback Thread] Update channel disconnected, thread exiting.");
                                         break;
                                     }
                                 },
 
                                 () = shutdown_token.cancelled() => {
-                                     log::debug!("[FFI 回调线程] 收到关闭信号，准备退出。");
+                                     log::debug!("[FFI Callback Thread] Shutdown signal received, preparing to exit.");
                                      break;
                                 }
                             }
                         }
                     });
                     log::debug!(
-                        "[FFI 回调线程] 线程已结束 (ID: {:?})。",
+                        "[FFI Callback Thread] Thread finished (ID: {:?}).",
                         std::thread::current().id()
                     );
                 });
@@ -568,26 +602,27 @@ pub unsafe extern "C" fn smtc_suite_register_update_callback(
                 handle.update_listener_handle = Some(join_handle);
             }
         } else {
-            log::info!("[FFI] 传入 NULL 回调，回调功能已禁用。");
+            log::info!("[FFI] NULL callback passed, callback functionality is now disabled.");
         }
 
         SmtcResult::Success
     }));
 
     result.unwrap_or_else(|_| {
-        log::error!("[FFI] `smtc_suite_register_update_callback` 内部发生 Panic！");
+        log::error!("[FFI] Panic occurred inside `smtc_suite_register_update_callback`!");
         SmtcResult::InternalError
     })
 }
 
-/// 获取当前库的版本字符串。
+/// Gets the current library version string.
 ///
-/// # 返回
-/// 一个指向静态 UTF-8 字符串的指针，表示库的版本（例如 "0.1.0"）。
-/// 该指针永久有效，调用者无需释放。
+/// # Returns
+/// A pointer to a static UTF-8 string literal representing the library version
+/// (e.g., "0.1.0"). The caller does not need to free it.
 ///
-/// # 安全性
-/// 导出此函数是安全的，因为它不接受任何输入并返回一个静态的、常量的数据。
+/// # Safety
+/// Exporting this function is safe as it takes no input and returns static,
+/// constant data.
 #[unsafe(no_mangle)]
 pub const unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
     concat!(env!("CARGO_PKG_VERSION"), "\0")
@@ -596,28 +631,28 @@ pub const unsafe extern "C" fn smtc_suite_get_version() -> *const c_char {
 }
 
 // ================================================================================================
-// 命令函数
+// Command Functions
 // ================================================================================================
 
-/// (内部辅助函数) 将 `try_send` 的结果转换为 `SmtcResult`
+/// (Internal) Converts the result of `try_send` to `SmtcResult`.
 fn handle_try_send_result<T>(result: Result<(), mpsc::error::TrySendError<T>>) -> SmtcResult {
     match result {
         Ok(()) => SmtcResult::Success,
         Err(e) => match e {
             mpsc::error::TrySendError::Full(_) => {
-                log::warn!("[FFI] 发送命令失败: 通道已满，请重试。");
+                log::warn!("[FFI] Failed to send command: channel is full, please retry.");
                 SmtcResult::ChannelFull
             }
             mpsc::error::TrySendError::Closed(_) => {
-                log::error!("[FFI] 发送命令失败: 通道已关闭。");
+                log::error!("[FFI] Failed to send command: channel is closed.");
                 SmtcResult::InternalError
             }
         },
     }
 }
 
-/// 请求一次全面的状态刷新。
-/// 此函数会触发 `SessionsChanged` 和 `TrackChangedForced` 事件。
+/// Requests a comprehensive status refresh.
+/// This will trigger `SessionsChanged` event.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_request_update(handle_ptr: *mut SmtcHandle) -> SmtcResult {
     validate_handle!(handle_ptr);
@@ -631,11 +666,12 @@ pub unsafe extern "C" fn smtc_suite_request_update(handle_ptr: *mut SmtcHandle) 
         })
 }
 
-/// 向 SMTC 套件发送一个媒体控制命令。
+/// Sends a media control command to the smtc-suite.
 ///
-/// # 安全性
-/// `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
-/// 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+/// # Safety
+/// `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+/// Exporting this function is safe as it interacts with internal state via the
+/// handle and validates its inputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_control_command(
     handle_ptr: *mut SmtcHandle,
@@ -677,24 +713,27 @@ pub unsafe extern "C" fn smtc_suite_control_command(
     res.unwrap_or(SmtcResult::InternalError)
 }
 
-/// 启用或禁用高频进度更新。
+/// Enables or disables high-frequency progress updates.
 ///
-/// 当启用时，库会以 100ms 的固定间隔主动发送 `TrackChanged` 更新事件，
-/// 以便实现平滑的进度条。禁用后，`TrackChanged` 事件仅在 SMTC
-/// 报告真实变化时才发送。
+/// When enabled, the library will proactively send `TrackChanged` update events
+/// at a fixed interval of 100ms to allow for smooth progress bars. When
+/// disabled, `TrackChanged` events are only sent when SMTC reports a genuine
+/// change.
 ///
-/// # 参数
-/// - `handle_ptr`: 一个由 `smtc_suite_create` 返回的有效句柄。
-/// - `enabled`: `true` 表示启用高频更新，`false` 表示禁用。
+/// # Arguments
+/// - `handle_ptr`: A valid handle returned by `smtc_suite_create`.
+/// - `enabled`: `true` to enable high-frequency updates, `false` to disable.
 ///
-/// # 返回
-/// - `SmtcResult::Success` 表示命令已成功发送。
-/// - `SmtcResult::InvalidHandle` 如果句柄无效。
-/// - `SmtcResult::InternalError` 如果命令发送失败（例如后台线程已关闭）。
+/// # Returns
+/// - `SmtcResult::Success` if the command was sent successfully.
+/// - `SmtcResult::InvalidHandle` if the handle is invalid.
+/// - `SmtcResult::InternalError` if the command fails to send (e.g., background
+///   thread is down).
 ///
-/// # 安全性
-/// `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
-/// 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+/// # Safety
+/// `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+/// Exporting this function is safe as it interacts with internal state via the
+/// handle and validates its inputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_set_high_frequency_progress_updates(
     handle_ptr: *mut SmtcHandle,
@@ -715,14 +754,17 @@ pub unsafe extern "C" fn smtc_suite_set_high_frequency_progress_updates(
         })
 }
 
-/// 选择一个 SMTC 会话进行监控。
+/// Selects an SMTC session for monitoring.
 ///
-/// # 参数
-/// - `session_id`: 目标会话的 ID (UTF-8 编码, Null 结尾)。传入空字符串或 `NULL` 以切换到自动选择模式。
+/// # Arguments
+/// - `session_id`: The ID of the target session (UTF-8 encoded,
+///   Null-terminated). Pass an empty string or `NULL` to switch to
+///   auto-selection mode.
 ///
-/// # 安全性
-/// `handle_ptr` 必须有效。如果 `session_id` 非 `NULL`，它必须指向一个有效的 C 字符串。
-/// 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+/// # Safety
+/// `handle_ptr` must be valid. If `session_id` is not `NULL`, it must point to
+/// a valid C string. Exporting this function is safe as it interacts with
+/// internal state via the handle and validates its inputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_select_session(
     handle_ptr: *mut SmtcHandle,
@@ -751,14 +793,16 @@ pub unsafe extern "C" fn smtc_suite_select_session(
     res.unwrap_or(SmtcResult::InternalError)
 }
 
-/// 设置 SMTC 元数据的文本转换模式。
+/// Sets the text conversion mode for SMTC metadata.
 ///
-/// 这是从 C 语言调用以控制简繁转换行为的函数。
+/// This is the function called from C to control the Simplified/Traditional
+/// Chinese conversion behavior.
 ///
-/// # 安全性
+/// # Safety
 ///
-/// 调用者必须确保 `controller_ptr` 是一个由 `smtc_start` 返回的有效指针，
-/// 并且在调用此函数时没有被释放。
+/// The caller must ensure that `handle_ptr` is a valid pointer returned by
+/// `smtc_suite_create` and has not been freed at the time this function is
+/// called.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_set_text_conversion_mode(
     handle_ptr: *mut SmtcHandle,
@@ -777,11 +821,12 @@ pub unsafe extern "C" fn smtc_suite_set_text_conversion_mode(
         })
 }
 
-/// 请求开始音频捕获。
+/// Requests to start audio capture.
 ///
-/// # 安全性
-/// `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
-/// 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+/// # Safety
+/// `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+/// Exporting this function is safe as it interacts with internal state via the
+/// handle and validates its inputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_start_audio_capture(handle_ptr: *mut SmtcHandle) -> SmtcResult {
     validate_handle!(handle_ptr);
@@ -799,11 +844,12 @@ pub unsafe extern "C" fn smtc_suite_start_audio_capture(handle_ptr: *mut SmtcHan
         })
 }
 
-/// 请求停止音频捕获。
+/// Requests to stop audio capture.
 ///
-/// # 安全性
-/// `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
-/// 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+/// # Safety
+/// `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+/// Exporting this function is safe as it interacts with internal state via the
+/// handle and validates its inputs.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_stop_audio_capture(handle_ptr: *mut SmtcHandle) -> SmtcResult {
     validate_handle!(handle_ptr);
@@ -821,21 +867,25 @@ pub unsafe extern "C" fn smtc_suite_stop_audio_capture(handle_ptr: *mut SmtcHand
         })
 }
 
-/// 初始化日志系统，并将所有日志消息重定向到指定的 C 回调函数。
+/// Initializes the logging system and redirects all log messages to the
+/// specified C callback function.
 ///
-/// 这个函数在整个程序的生命周期中只应被调用一次。
+/// This function should only be called once during the entire program's
+/// lifetime.
 ///
-/// # 参数
-/// - `callback`: 用于接收日志消息的函数指针。不能为 NULL。
-/// - `userdata`: 将被原样传递给回调函数的用户自定义指针。
-/// - `max_level`: 要捕获的最高日志级别。
+/// # Arguments
+/// - `callback`: A function pointer to receive log messages. Cannot be NULL.
+/// - `userdata`: A user-defined pointer that will be passed back to the
+///   callback as-is.
+/// - `max_level`: The highest log level to capture.
 ///
-/// # 返回
-/// - `SmtcResult::Success`: 如果成功初始化。
-/// - `SmtcResult::InternalError`: 如果日志系统已经被初始化过，或者发生其他内部错误。
+/// # Returns
+/// - `SmtcResult::Success`: If initialization is successful.
+/// - `SmtcResult::InternalError`: If the logging system has already been
+///   initialized, or another internal error occurs.
 ///
-/// # 安全性
-/// 必须保证 `callback` 是一个有效的指针。
+/// # Safety
+/// `callback` must be a valid function pointer.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn smtc_suite_init_logging(
     callback: LogCallback,
@@ -850,17 +900,19 @@ pub unsafe extern "C" fn smtc_suite_init_logging(
     };
 
     if FFI_LOGGER.set(logger).is_err() {
-        log::error!("[FFI] 日志系统已初始化，无法重复设置。");
+        log::error!("[FFI] Logging system has already been initialized, cannot set it again.");
         return SmtcResult::InternalError;
     }
 
     if let Ok(logger_ref) = FFI_LOGGER.get().ok_or(SmtcResult::InternalError) {
         if log::set_logger(logger_ref).is_err() {
-            log::error!("[FFI] 设置全局 Logger 失败，可能已被其他库占用。");
+            log::error!(
+                "[FFI] Failed to set global logger, it may have been occupied by another library."
+            );
             return SmtcResult::InternalError;
         }
         log::set_max_level(max_level.into());
-        log::info!("[FFI] 成功初始化日志系统。");
+        log::info!("[FFI] Logging system initialized successfully.");
         SmtcResult::Success
     } else {
         SmtcResult::InternalError
@@ -868,14 +920,14 @@ pub unsafe extern "C" fn smtc_suite_init_logging(
 }
 
 // ================================================================================================
-// 内存管理 (仅限内部使用)
+// Memory Management (Internal Use Only)
 // ================================================================================================
 
-/// 释放由本库 FFI 函数返回的字符串 (`*mut c_char`)。
+/// Frees a string (`*mut c_char`) returned by this library's FFI functions.
 ///
-/// # 安全性
-/// `s` 必须是一个由本库的 FFI 函数返回、且尚未被释放的有效指针。
-/// 传入 `NULL` 是安全的。
+/// # Safety
+/// `s` must be a valid pointer returned by one of this library's FFI functions
+/// and must not have been freed yet. Passing `NULL` is safe.
 fn free_string(s: *mut c_char) {
     if s.is_null() {
         return;
@@ -886,10 +938,11 @@ fn free_string(s: *mut c_char) {
 }
 
 // ================================================================================================
-// 内部辅助函数与 RAII 守卫
+// Internal Helper Functions & RAII Guards
 // ================================================================================================
 
-// RAII 守卫，确保 CString 在作用域结束时（包括 panic）被正确释放。
+/// RAII guard to ensure `CString` is properly freed at the end of the scope
+/// (including panics).
 struct StringGuard(*mut c_char);
 impl Drop for StringGuard {
     fn drop(&mut self) {
@@ -897,7 +950,7 @@ impl Drop for StringGuard {
     }
 }
 
-// RAII 守卫，确保 CNowPlayingInfo 的所有字符串成员都被释放。
+/// RAII guard to ensure all string members of `CNowPlayingInfo` are freed.
 struct NowPlayingInfoGuard(CNowPlayingInfo);
 impl Drop for NowPlayingInfoGuard {
     fn drop(&mut self) {
@@ -907,7 +960,8 @@ impl Drop for NowPlayingInfoGuard {
     }
 }
 
-// RAII 守卫，确保 CSessionList 中所有 CSessionInfo 的字符串成员都被释放。
+/// RAII guard to ensure all string members in all `CSessionInfo` within
+/// `CSessionList` are freed.
 struct SessionListGuard(Vec<CSessionInfo>);
 impl Drop for SessionListGuard {
     fn drop(&mut self) {
@@ -919,7 +973,7 @@ impl Drop for SessionListGuard {
     }
 }
 
-// RAII 守卫，确保 CVolumeChangedEvent 的字符串成员被释放。
+/// RAII guard to ensure the string member of `CVolumeChangedEvent` is freed.
 struct VolumeChangedEventGuard(CVolumeChangedEvent);
 impl Drop for VolumeChangedEventGuard {
     fn drop(&mut self) {
@@ -927,7 +981,7 @@ impl Drop for VolumeChangedEventGuard {
     }
 }
 
-// RAII 守卫，确保 CDiagnosticInfo 的所有字符串成员都被释放。
+/// RAII guard to ensure all string members of `CDiagnosticInfo` are freed.
 struct DiagnosticInfoGuard(CDiagnosticInfo);
 impl Drop for DiagnosticInfoGuard {
     fn drop(&mut self) {
@@ -936,11 +990,11 @@ impl Drop for DiagnosticInfoGuard {
     }
 }
 
-/// (内部) 将 Rust 的 `MediaUpdate` 转换为 C 兼容结构，并调用回调函数。
+/// (Internal) Converts `MediaUpdate` to a C struct and invokes the callback.
 ///
-/// # 安全性
-/// `callback` 必须是一个有效的函数指针, `userdata` 必须是有效的指针。
-/// 此函数通过 RAII 守卫管理传递给回调的数据的生命周期，确保资源安全。
+/// # Safety
+/// `callback` must be a valid function pointer, and `userdata` must be a valid
+/// pointer.
 unsafe fn process_and_invoke_callback(
     update: MediaUpdate,
     callback: UpdateCallback,
@@ -1024,13 +1078,14 @@ unsafe fn process_and_invoke_callback(
     }
 }
 
-/// (内部) 将 Rust 的字符串切片安全地转换为 C 的 `*mut c_char`。
-/// 如果输入字符串包含内部 NUL 字节，它会被截断。
+/// (Internal) Converts string slice to C `*mut c_char`.
+/// If the input string contains internal NUL bytes, it will result in an empty
+/// string.
 fn to_c_char<S: AsRef<str>>(s: S) -> *mut c_char {
     CString::new(s.as_ref()).unwrap_or_default().into_raw()
 }
 
-/// (内部) 将 Rust 的 `NowPlayingInfo` 转换为 C 的 `CNowPlayingInfo`。
+/// (Internal) Converts `NowPlayingInfo` to `CNowPlayingInfo`.
 fn convert_to_c_now_playing_info(info: &NowPlayingInfo) -> CNowPlayingInfo {
     CNowPlayingInfo {
         title: to_c_char(info.title.as_deref().unwrap_or("")),
@@ -1042,7 +1097,7 @@ fn convert_to_c_now_playing_info(info: &NowPlayingInfo) -> CNowPlayingInfo {
     }
 }
 
-/// (内部) 将 Rust 的 `SmtcSessionInfo` 转换为 C 的 `CSessionInfo`。
+/// (Internal) Converts `SmtcSessionInfo` to `CSessionInfo`.
 fn convert_to_c_session_info(info: &SmtcSessionInfo) -> CSessionInfo {
     CSessionInfo {
         session_id: to_c_char(&info.session_id),
@@ -1051,7 +1106,7 @@ fn convert_to_c_session_info(info: &SmtcSessionInfo) -> CSessionInfo {
     }
 }
 
-/// (内部) 将 Rust 的 `DiagnosticInfo` 转换为 C 的 `CDiagnosticInfo`。
+/// (Internal) Converts `DiagnosticInfo` to `CDiagnosticInfo`.
 fn convert_to_c_diagnostic_info(info: &crate::api::DiagnosticInfo) -> CDiagnosticInfo {
     let c_level = match info.level {
         crate::api::DiagnosticLevel::Warning => CDiagnosticLevel::Warning,

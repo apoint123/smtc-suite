@@ -3,104 +3,86 @@
 [![Crates.io](https://img.shields.io/crates/v/smtc-suite.svg)](https://crates.io/crates/smtc-suite)
 [![Docs.rs](https://docs.rs/smtc-suite/badge.svg)](https://docs.rs/smtc-suite)
 
-一个用于与 Windows 系统媒体传输控件 (SMTC) 和系统音频进行交互的 Rust 库。
+A Rust library for interacting with Windows System Media Transport Controls (SMTC) and system audio.
 
-`smtc-suite` 提供了一套安全、高效的 API，用于监听和控制 Windows 上的媒体播放、捕获系统音频输出，以及管理单个应用的音量。
+`smtc-suite` provides a safe and efficient API for listening to and controlling media playback on Windows, capturing system audio output, and managing individual application volumes.
 
----
+## Core Features
 
-## 核心功能
+  * **Media Session Monitoring**: Automatically discovers all SMTC-enabled media sources in the system (like Spotify, Groove Music, etc.) and retrieves currently playing track information (title, artist, album, thumbnail).
+  * **Media Playback Control**: Sends playback commands such as play, pause, skip, and seek to the currently active media session.
+  * **System Audio Capture**: Captures the system's currently playing audio stream in loopback mode and provides functionality to resample it to a unified format.
+  * **Independent Volume Control**: Finds the audio session for a specific application and independently gets or sets its volume.
+  * **Asynchronous & Event-Driven**: All background operations are handled in a separate, efficient asynchronous worker thread, communicating with the main application via channels without blocking your app's main thread.
 
-* **会话监控**: 自动发现系统中所有支持 SMTC 的媒体源（如 Spotify, QQ 音乐等），并获取当前播放的曲目信息（标题、艺术家、专辑、封面）。
-* **播放控制**: 对当前活动的媒体会话发送播放、暂停、切歌、跳转等控制命令。
-* **音频捕获**: 捕获系统正在播放的音频流，并重采样到统一格式。
-* **音量控制**: 查找特定应用的音频会话，并获取或设置其音量。
-* **异步驱动**: 所有后台操作都在一个独立的、高效的异步工作线程中进行，通过通道与主应用通信，不会阻塞你的应用主线程。
+## Usage
 
-## 安装
+The sole entry point for interacting with this library is the `MediaManager::start()` function.
 
-将 `smtc-suite` 添加到你的 `Cargo.toml` 文件中：
+1.  Calling `MediaManager::start()` launches all necessary background services and returns a tuple: `(MediaController, mpsc::Receiver<MediaUpdate>)`.
+2.  The `MediaController` struct is your handle for sending commands to the background service. It contains a `command_tx` field for sending `MediaCommand`s.
+3.  The `mpsc::Receiver<MediaUpdate>` is the channel through which you receive all status updates and events from the background.
+4.  You can loop on this `Receiver` in a separate task to receive real-time updates.
+5.  When your application exits, be sure to call `MediaController::shutdown()` or send a `MediaCommand::Shutdown` to gracefully shut down the background thread.
 
-```toml
-[dependencies]
-smtc-suite = "*"
-```
-
-## 使用方法
-
-与本库交互的唯一入口是 `MediaManager::start()` 函数。
-
-1.  调用 `MediaManager::start()` 会启动所有必需的后台服务，并返回一个 `Result<MediaController>`。
-2.  `MediaController` 结构体是你与后台服务交互的句柄。它包含两个字段：
-    * `command_tx`: 一个 `Sender<MediaCommand>`，用于向后台发送指令。
-    * `update_rx`: 一个 `Receiver<MediaUpdate>`，用于接收来自后台的状态更新和事件。
-3.  你可以在一个独立的线程中循环监听 `update_rx` 以接收实时更新。
-4.  通过 `command_tx` 发送 `MediaCommand` 枚举中的指令来控制后台服务。
-5.  当你的应用退出时，务必调用 `controller.shutdown()` 或发送一个 `MediaCommand::Shutdown` 来优雅地关闭后台线程。
-
-## 示例
-
-下面是一个简单的示例，演示如何启动服务、监听事件并最终关闭它。
+## Example
 
 ```rust
-use smtc_suite::{MediaManager, MediaCommand, MediaUpdate, SmtcError};
-use std::thread;
+use smtc_suite::{MediaManager, MediaCommand, MediaUpdate};
 use std::time::Duration;
 
-fn main() -> Result<(), SmtcError> {
-    // 1. 启动媒体服务并获取控制器
-    let controller = MediaManager::start()?;
-    println!("SMTC Suite 服务已启动。");
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 1. Start the media service and get the controller and update receiver.
+    let (controller, mut update_rx) = MediaManager::start()?;
 
-    // 2. 在一个单独的线程中处理来自后台的更新事件
-    let update_receiver = controller.update_rx;
-    let update_thread = thread::spawn(move || {
-        // 循环接收更新，直到通道关闭
-        while let Ok(update) = update_receiver.recv() {
+    // It is recommended to handle update events from the background in a separate Tokio task.
+    let update_task = tokio::spawn(async move {
+        // Loop to receive updates until the channel is closed.
+        while let Some(update) = update_rx.recv().await {
             match update {
                 MediaUpdate::TrackChanged(info) => {
                     println!(
-                        "曲目变更: {} - {}",
-                        info.artist.as_deref().unwrap_or("未知艺术家"),
-                        info.title.as_deref().unwrap_or("未知标题")
+                        "Track Changed: {} - {}",
+                        info.artist.unwrap_or_default(),
+                        info.title.unwrap_or_default()
                     );
                 }
                 MediaUpdate::SessionsChanged(sessions) => {
-                    println!("可用媒体会话列表已更新，共 {} 个。", sessions.len());
-                    // 打印所有会话的显示名称
-                    for session in sessions {
-                        println!("  - {}", session.display_name);
-                    }
+                    println!("Available media session list updated, total: {}.", sessions.len());
                 }
-                _ => { /* 可以处理其他更新，如 音频数据、音量变化等 */ }
+                MediaUpdate::AudioData(data) => {
+                    println!("Received {} bytes of audio data.", data.len());
+                }
+                _ => { /* Handle other updates */ }
             }
         }
-        println!("更新通道已关闭，事件监听线程退出。");
+        println!("Update channel closed, event listener task exiting.");
     });
 
-    // 3. 在主线程中，你可以发送命令
-    // 例如，等待5秒后尝试播放（如果当前是暂停状态）
-    println!("将在5秒后发送“播放”命令...");
-    thread::sleep(Duration::from_secs(5));
-    controller.command_tx.send(MediaCommand::Control(smtc_suite::SmtcControlCommand::Play))?;
+    // In the main task, we can send commands.
+    // For example, wait for 5 seconds then start audio capture.
+    println!("Starting audio capture in 5 seconds...");
+    tokio::time::sleep(Duration::from_secs(5)).await;
+    controller.command_tx.send(MediaCommand::StartAudioCapture).await?;
 
-    // 再等待10秒
-    println!("将在10秒后关闭服务...");
-    thread::sleep(Duration::from_secs(10));
+    // Wait for another 10 seconds.
+    println!("Audio capture started, shutting down the service in 10 seconds...");
+    tokio::time::sleep(Duration::from_secs(10)).await;
 
-    // 4. 在程序退出前，发送关闭命令
-    println!("正在发送关闭命令...");
-    controller.shutdown()?;
+    // 3. Before the program exits, send the shutdown command.
+    println!("Sending shutdown command...");
+    controller.shutdown().await?;
 
-    // 5. 等待更新线程结束，确保所有消息都被处理
-    update_thread.join().expect("更新线程 join 失败");
+    // Wait for the update task to finish.
+    update_task.await?;
 
-    println!("程序已优雅退出。");
+    println!("Program has exited gracefully.");
 
     Ok(())
 }
 ```
 
-## 许可证
+## LICENSE
 
-本项目采用 **MIT** 许可证。你可以随意使用本项目的任何代码。
+[MIT](LICENSE)

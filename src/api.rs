@@ -7,106 +7,110 @@ use tokio::sync::mpsc;
 use crate::error::{Result, SmtcError};
 
 bitflags! {
-    /// 当前可用的控制操作
+    /// Available control operations.
     #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
     #[serde(transparent)]
     pub struct Controls: u8 {
-        /// 是否可以播放
+        /// Playback can be started.
         const CAN_PLAY            = 1 << 0;
-        /// 是否可以暂停
+        /// Playback can be paused.
         const CAN_PAUSE           = 1 << 1;
-        /// 是否可以跳到下一首
+        /// Can skip to the next track.
         const CAN_SKIP_NEXT       = 1 << 2;
-        /// 是否可以跳到上一首
+        /// Can skip to the previous track.
         const CAN_SKIP_PREVIOUS   = 1 << 3;
-        /// 是否可以跳转进度
+        /// The playback position can be changed (seek).
         const CAN_SEEK            = 1 << 4;
-        /// 是否可以改变随机播放模式
+        /// The shuffle mode can be changed.
         const CAN_CHANGE_SHUFFLE  = 1 << 5;
-        /// 是否可以改变重复播放模式
+        /// The repeat mode can be changed.
         const CAN_CHANGE_REPEAT   = 1 << 6;
     }
 }
 
-/// 播放状态
+/// The playback status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum PlaybackStatus {
     #[default]
-    /// 已停止
+    /// Playback is stopped.
     Stopped,
-    /// 播放中
+    /// Currently playing.
     Playing,
-    /// 已暂停
+    /// Playback is paused.
     Paused,
 }
 
-/// 定义重复播放模式的枚举。
+/// Repeat mode for playback.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 pub enum RepeatMode {
     #[default]
-    /// 不重复播放。
+    /// Do not repeat.
     Off,
-    /// 单曲循环。
+    /// Repeat the current track.
     One,
-    /// 歌单循环。
+    /// Repeat the entire list.
     All,
 }
 
-/// 定义文本转换模式的枚举。
+/// Text conversion mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
 pub enum TextConversionMode {
     #[default]
-    /// 关闭转换功能。
+    /// No conversion.
     Off,
-    /// 繁体转简体 (t2s.json)。
+    /// Traditional to Simplified (t2s.json).
     TraditionalToSimplified,
-    /// 简体转繁体 (s2t.json)。
+    /// Simplified to Traditional (s2t.json).
     SimplifiedToTraditional,
-    /// 简体转台湾正体 (s2tw.json)。
+    /// Simplified to Taiwan Standard (s2tw.json).
     SimplifiedToTaiwan,
-    /// 台湾正体转简体 (tw2s.json)。
+    /// Taiwan Standard to Simplified (tw2s.json).
     TaiwanToSimplified,
-    /// 简体转香港繁体 (s2hk.json)。
+    /// Simplified to Hong Kong Traditional (s2hk.json).
     SimplifiedToHongKong,
-    /// 香港繁体转简体 (hk2s.json)。
+    /// Hong Kong Traditional to Simplified (hk2s.json).
     HongKongToSimplified,
 }
 
-/// SMTC Handler 内部用于聚合和管理当前播放状态的可变结构。
+/// A mutable structure used internally by the SMTC handler to
+/// aggregate and manage the current player state.
 #[derive(Debug, Clone, Default)]
 pub struct SharedPlayerState {
-    /// 歌曲标题。
+    /// The song title.
     pub title: String,
-    /// 艺术家。
+    /// The artist's name.
     pub artist: String,
-    /// 专辑。
+    /// The album title.
     pub album: String,
-    /// 歌曲总时长（毫秒）。
+    /// Total duration of the song in milliseconds.
     pub song_duration_ms: u64,
-    /// 上次从 SMTC 获取到的播放位置（毫秒）。
+    /// The last known playback position in milliseconds, as reported by SMTC.
     pub last_known_position_ms: u64,
-    /// `last_known_position_ms` 被更新时的时间点。
+    /// The `Instant` when `last_known_position_ms` was updated.
     pub last_known_position_report_time: Option<Instant>,
-    /// 当前的播放状态。
+    /// The current playback status.
     pub playback_status: PlaybackStatus,
-    /// 当前媒体源支持的控制选项。
+    /// The control options supported by the current media source.
     pub controls: Controls,
-    /// 当前是否处于随机播放模式。
+    /// Whether shuffle mode is currently active.
     pub is_shuffle_active: bool,
-    /// 当前的重复播放模式。
+    /// The current repeat mode.
     pub repeat_mode: RepeatMode,
+    /// Raw cover art data.
     pub cover_data: Option<Vec<u8>>,
+    /// Hash of the cover art data.
     pub cover_data_hash: Option<u64>,
-    /// 一个标志，表示正在等待来自SMTC的第一次更新。
-    /// 在此期间，应暂停进度计时器。
+    /// A flag indicating that we are waiting for the first update from SMTC.
+    /// During this time, the position timer is paused.
     pub is_waiting_for_initial_update: bool,
+    /// User-defined position offset in milliseconds.
     pub position_offset_ms: i64,
+    /// Optimization offset for Apple Music in milliseconds.
     pub apple_music_optimization_offset_ms: i64,
 }
 
 impl SharedPlayerState {
-    /// 将播放状态重置为空白/默认状态。
-    /// 通常在没有活动媒体会话时调用。
+    /// Resets the player state to a blank/default state.
     pub fn reset_to_empty(&mut self) {
         let preserved_offset = self.position_offset_ms;
         *self = Self::default();
@@ -114,7 +118,8 @@ impl SharedPlayerState {
         self.is_waiting_for_initial_update = true;
     }
 
-    /// 根据上次报告的播放位置和当前时间，估算实时的播放进度。
+    /// Estimates the real-time playback position based on
+    /// the last reported position and the current time.
     pub fn get_estimated_current_position_ms(&self) -> u64 {
         let base_pos = if self.playback_status == PlaybackStatus::Playing
             && let Some(report_time) = self.last_known_position_report_time
@@ -125,11 +130,12 @@ impl SharedPlayerState {
             self.last_known_position_ms
         };
 
-        // 叠加用户偏移和 Apple Music 的优化偏移
+        // Apply the user offset and the Apple Music optimization offset.
         let total_offset = self.apple_music_optimization_offset_ms - self.position_offset_ms;
         let offset_pos = (base_pos as i64 + total_offset).max(0) as u64;
 
-        // 确保估算的位置不超过歌曲总时长（如果时长有效）
+        // Ensure the estimated position does not
+        // exceed the total song duration (if available).
         if self.song_duration_ms > 0 {
             return offset_pos.min(self.song_duration_ms);
         }
@@ -137,7 +143,6 @@ impl SharedPlayerState {
     }
 }
 
-/// 实现从内部共享状态到公共 `NowPlayingInfo` 的转换。
 impl From<&SharedPlayerState> for NowPlayingInfo {
     fn from(state: &SharedPlayerState) -> Self {
         Self {
@@ -158,45 +163,47 @@ impl From<&SharedPlayerState> for NowPlayingInfo {
     }
 }
 
-/// 包含当前正在播放曲目所有信息的、唯一的、完整的状态快照。
+/// A snapshot of all information about the currently playing track.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct NowPlayingInfo {
-    /// 曲目标题。
+    /// The track title.
     pub title: Option<String>,
-    /// 艺术家名称。
+    /// The artist's name.
     pub artist: Option<String>,
-    /// 专辑标题。
+    /// The album title.
     pub album_title: Option<String>,
 
-    /// 曲目总时长（毫秒）。
+    /// Total duration of the track in milliseconds.
     pub duration_ms: Option<u64>,
-    /// 当前播放位置（毫秒）。如果启用了高频更新，这将是一个估算值。
+    /// Current playback position in milliseconds. This will be an estimated
+    /// value if high-frequency updates are enabled.
     pub position_ms: Option<u64>,
-    /// SMTC 系统报告的原始播放位置（毫秒），未经插值。
+    /// The raw playback position in milliseconds as reported by the SMTC
+    /// system, without interpolation.
     pub smtc_position_ms: Option<u64>,
 
-    /// 当前的播放状态。
+    /// The current playback status.
     pub playback_status: Option<PlaybackStatus>,
-    /// 当前是否处于随机播放模式。
+    /// Whether shuffle mode is currently active.
     pub is_shuffle_active: Option<bool>,
-    /// 当前的重复播放模式。
+    /// The current repeat mode.
     pub repeat_mode: Option<RepeatMode>,
-    /// 当前媒体源支持的控制选项。
+    /// The control options supported by the current media source.
     pub controls: Option<Controls>,
-    /// 封面图片的原始字节数据 (`Vec<u8>`)。
+    /// The raw byte data of the cover art.
     #[serde(skip)]
     pub cover_data: Option<Vec<u8>>,
-    /// 封面数据的哈希值。
+    /// A hash of the cover art data.
     #[serde(skip)]
     pub cover_data_hash: Option<u64>,
 
-    /// SMTC 上次报告播放位置的时间点。
+    /// The `Instant` when the SMTC last reported the playback position.
     #[serde(skip)]
     pub position_report_time: Option<Instant>,
 }
 
 impl NowPlayingInfo {
-    /// 用另一份 `NowPlayingInfo` 的非 None 字段更新自身
+    /// Updates self with the non-None fields from another `NowPlayingInfo`.
     pub fn update_with(&mut self, other: &Self) {
         if let Some(pos) = other.position_ms {
             self.position_ms = Some(pos);
@@ -226,41 +233,41 @@ impl NowPlayingInfo {
     }
 }
 
-/// 表示一个可用的系统媒体传输控件 (SMTC) 会话。
-///
-/// 每个支持媒体控制的应用（如 Spotify, Windows Media Player）都会创建一个会话。
+/// Represents an available SMTC session.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 pub struct SmtcSessionInfo {
-    /// 会话的唯一标识符，通常与其 AUMID (Application User Model ID) 相同。
+    /// A unique identifier for the session, often the same as its AUMID
+    /// (Application User Model ID).
     pub session_id: String,
-    /// 会话来源应用的 AUMID。
+    /// The AUMID of the source application for the session.
     pub source_app_user_model_id: String,
-    /// 用于在 UI 中显示的名称，通常是应用的可执行文件名或简称。
+    /// The name to be displayed in the UI, usually the application's
+    /// executable name or a short name.
     pub display_name: String,
 }
 
-/// 定义了可以对媒体会话执行的控制操作。
+/// The control actions that can be performed on a media session.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SmtcControlCommand {
-    /// 暂停播放。
+    /// Pauses playback.
     Pause,
-    /// 开始或恢复播放。
+    /// Starts or resumes playback.
     Play,
-    /// 跳到下一首。
+    /// Skips to the next track.
     SkipNext,
-    /// 跳到上一首。
+    /// Skips to the previous track.
     SkipPrevious,
-    /// 跳转到指定的时间点（毫秒）。
+    /// Seeks to a specific time point (in milliseconds).
     SeekTo(u64),
-    /// 设置音量（0.0 到 1.0）。
+    /// Sets the volume (from 0.0 to 1.0).
     SetVolume(f32),
-    /// 设置随机播放模式。
+    /// Sets the shuffle mode.
     SetShuffle(bool),
-    /// 设置重复播放模式。
+    /// Sets the repeat mode.
     SetRepeatMode(RepeatMode),
 }
 
-/// C-ABI 兼容的命令类型标签。
+/// C-ABI compatible command type tag.
 #[repr(C)]
 #[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -275,7 +282,7 @@ pub enum CControlCommandType {
     SetRepeatMode,
 }
 
-// C-ABI 兼容的重复模式枚举。
+/// C-ABI compatible repeat mode enum.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CRepeatMode {
@@ -284,7 +291,7 @@ pub enum CRepeatMode {
     All = 2,
 }
 
-/// C-ABI 兼容的联合体，用于存放不同命令的数据。
+/// C-ABI compatible union to hold data for different commands.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub union ControlCommandData {
@@ -294,37 +301,33 @@ pub union ControlCommandData {
     pub repeat_mode: CRepeatMode,
 }
 
-/// C-ABI 兼容的、完整的控制命令结构体。
-///
-/// 这个结构体可以安全地在 C 和 Rust 之间传递。
+/// C-ABI compatible control command struct.
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct CSmtcControlCommand {
-    /// 命令的类型
+    /// The type of the command.
     pub command_type: CControlCommandType,
-    /// 命令关联的数据
+    /// The data associated with the command.
     pub data: ControlCommandData,
 }
 
-/// C-ABI 兼容的文本转换模式枚举。
-///
-/// 这个枚举可以安全地在 C 和 Rust 之间传递。
+/// C-ABI compatible text conversion mode enum.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CTextConversionMode {
-    /// 关闭转换功能。
+    /// No conversion.
     Off = 0,
-    /// 繁体转简体 (t2s.json)。
+    /// Traditional to Simplified (t2s.json).
     TraditionalToSimplified = 1,
-    /// 简体转繁体 (s2t.json)。
+    /// Simplified to Traditional (s2t.json).
     SimplifiedToTraditional = 2,
-    /// 简体转台湾正体 (s2tw.json)。
+    /// Simplified to Taiwan Standard (s2tw.json).
     SimplifiedToTaiwan = 3,
-    /// 台湾正体转简体 (tw2s.json)。
+    /// Taiwan Standard to Simplified (tw2s.json).
     TaiwanToSimplified = 4,
-    /// 简体转香港繁体 (s2hk.json)。
+    /// Simplified to Hong Kong Traditional (s2hk.json).
     SimplifiedToHongKong = 5,
-    /// 香港繁体转简体 (hk2s.json)。
+    /// Hong Kong Traditional to Simplified (hk2s.json).
     HongKongToSimplified = 6,
 }
 
@@ -352,87 +355,94 @@ impl From<CTextConversionMode> for TextConversionMode {
     }
 }
 
-/// 发送给媒体库后台服务的命令。
+/// Commands sent to the media library background service.
 ///
-/// 这是与媒体库交互的主要方式，由 `MediaController` 发送。
+/// This is the primary way to interact with the media library, which is sent
+/// via the `MediaController`.
 #[derive(Debug, Clone)]
 pub enum MediaCommand {
-    /// 选择并开始监听指定的媒体会话。
+    /// Selects and starts listening to a specific media session.
     ///
-    /// 参数是目标会话的 `session_id`。
+    /// The parameter is the `session_id` of the target session.
     SelectSession(String),
-    /// 对当前监听的会话执行一个媒体控制操作。
+    /// Executes a media control action on the currently monitored session.
     Control(SmtcControlCommand),
-    /// 开始捕获系统音频输出。
+    /// Starts capturing system audio output.
     StartAudioCapture,
-    /// 停止捕获系统音频输出。
+    /// Stops capturing system audio output.
     StopAudioCapture,
-    /// 设置 SMTC 数据的文本转换模式。
+    /// Sets the text conversion mode for SMTC data.
     SetTextConversion(TextConversionMode),
-    /// 请求后台服务立即发送一次所有关键状态的更新（例如会话列表和当前曲目）。
+    /// Requests the background service to immediately send a update of
+    /// all key states (e.g., session list and current track).
     ///
-    /// 后台服务将异步地发送 `SessionsChanged` 和 `TrackChanged` 事件作为响应。
+    /// Will send `SessionsChanged` and `TrackChanged` events in response.
     RequestUpdate,
-    /// 启用或禁用高频进度更新。
+    /// Enables or disables high-frequency progress updates.
     ///
-    /// 当启用时，smtc-suite 会以 100ms 的频率主动发送 `TrackChanged` 事件来模拟平滑进度。
+    /// When enabled, smtc-suite will actively send `TrackChanged` events at a
+    /// 100ms interval to simulate a smooth progress bar.
     SetHighFrequencyProgressUpdates(bool),
-    /// 为当前播放进度设置一个偏移量（毫秒）。
+    /// Sets an offset for the current playback position in milliseconds.
     SetProgressOffset(i64),
-    /// 启用或禁用针对 Apple Music 的特定优化。
-    /// 仅在当前的会话是 Apple Music 时才有效果。
+    /// Enables or disables specific optimizations for Apple Music.
+    /// This only takes effect if the current session is Apple Music.
     ///
+    /// Includes:
+    /// 1. Splitting the album name that is sometimes merged into the artist
+    ///    field (if album info is empty).
+    /// 2. Applying a -500ms offset to the timeline.
     ///
-    /// 包括：
-    /// 1. 拆分合并在艺术家字段中的专辑名。(如果专辑信息为空)
-    /// 2. 为时间轴应用 -500ms 的偏移。
-    ///
-    /// 此优化默认启用。
+    /// This optimization is enabled by default.
     SetAppleMusicOptimization(bool),
-    /// 请求关闭整个媒体服务后台线程。
+    /// Requests to shut down the entire thread.
     Shutdown,
 }
 
-/// 从媒体库后台服务接收的事件和状态更新。
+/// Events and state updates received from smtc-suite.
 ///
-/// 使用者通过 `MediaController` 的 `update_rx` 通道接收这些更新。
+/// You need to receive these updates through the `update_rx` channel of the
+/// `MediaController`.
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum MediaUpdate {
-    /// 当媒体状态发生有意义的变化时发送。
+    /// Sent when a significant change in the media state occurs.
     ///
-    /// 负载是一个 `NowPlayingInfo` 结构体，包含了所有最新的媒体信息，
-    /// 包括元数据、播放状态、进度和封面数据。
+    /// The payload is a `NowPlayingInfo` struct, containing all the latest
+    /// media information, including metadata, playback status, progress,
+    /// and cover art data.
     TrackChanged(NowPlayingInfo),
-    /// 可用的媒体会话列表已更新。
+    /// The list of available media sessions has been updated.
     SessionsChanged(Vec<SmtcSessionInfo>),
-    /// 接收到一个音频数据包（如果音频捕获已启动）。
+    /// An audio data packet has been received (if audio capture is enabled).
     AudioData(Vec<u8>),
-    /// 报告一个非致命的运行时错误。
+    /// Reports a non-fatal runtime error.
     Error(String),
-    /// 报告一个非致命的运行时诊断信息。
+    /// Reports a non-fatal runtime diagnostic message.
     Diagnostic(DiagnosticInfo),
-    /// 指定会话的音量或静音状态已发生变化。
+    /// The volume or mute state of a specific session has changed.
     VolumeChanged {
-        /// 发生变化的会话 ID。
+        /// The ID of the session that changed.
         session_id: String,
-        /// 新的音量级别 (0.0 - 1.0)。
+        /// The new volume level (0.0 - 1.0).
         volume: f32,
-        /// 新的静音状态。
+        /// The new mute state.
         is_muted: bool,
     },
-    /// 指示之前用户选中的会话已经消失（例如，应用已关闭）。
+    /// The previously selected session has disappeared.
+    /// Often happens when the application was closed.
     SelectedSessionVanished(String),
 }
 
-/// 与后台服务交互的控制器。
+/// A controller for interacting with the smtc-suite.
 pub struct MediaController {
-    /// 用于向后台服务发送 `MediaCommand` 的通道发送端。
+    /// The sending end of the channel for sending `MediaCommand`s to the
+    /// background service.
     pub command_tx: mpsc::Sender<MediaCommand>,
 }
 
 impl MediaController {
-    /// 终止后台线程。
+    /// Terminates the background thread.
     pub async fn shutdown(&self) -> Result<()> {
         self.command_tx
             .send(MediaCommand::Shutdown)
@@ -441,14 +451,14 @@ impl MediaController {
     }
 }
 
-/// 诊断信息的严重级别
+/// The severity level of a diagnostic message.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DiagnosticLevel {
     Warning,
     Error,
 }
 
-/// 封装一条诊断信息
+/// Encapsulates a diagnostic message.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DiagnosticInfo {
     pub level: DiagnosticLevel,

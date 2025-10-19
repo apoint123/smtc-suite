@@ -1,4 +1,4 @@
-// worker 已经保证这个模块运行在 LocalSet 中
+// The worker ensures that this module runs within a LocalSet
 #![allow(clippy::future_not_send)]
 
 use std::{cell::RefCell, rc::Rc, sync::Arc, time::Instant};
@@ -114,15 +114,15 @@ impl Drop for MonitoredSessionGuard {
         let _ = self
             .session
             .RemoveMediaPropertiesChanged(self.tokens.0)
-            .map_err(|e| log::warn!("注销 MediaPropertiesChanged 失败: {e}"));
+            .map_err(|e| log::warn!("Failed to unregister MediaPropertiesChanged: {e}"));
         let _ = self
             .session
             .RemovePlaybackInfoChanged(self.tokens.1)
-            .map_err(|e| log::warn!("注销 PlaybackInfoChanged 失败: {e}"));
+            .map_err(|e| log::warn!("Failed to unregister PlaybackInfoChanged: {e}"));
         let _ = self
             .session
             .RemoveTimelinePropertiesChanged(self.tokens.2)
-            .map_err(|e| log::warn!("注销 TimelinePropertiesChanged 失败: {e}"));
+            .map_err(|e| log::warn!("Failed to unregister TimelinePropertiesChanged: {e}"));
     }
 }
 
@@ -159,24 +159,26 @@ impl ManagerEventGuard {
 impl Drop for ManagerEventGuard {
     fn drop(&mut self) {
         if let Err(e) = self.manager.RemoveSessionsChanged(self.tokens.0) {
-            log::warn!("[ManagerEventGuard] 注销 SessionsChanged 事件失败: {e:?}");
+            log::warn!("[ManagerEventGuard] Failed to unregister SessionsChanged event: {e:?}");
         }
         if let Err(e) = self.manager.RemoveCurrentSessionChanged(self.tokens.1) {
-            log::warn!("[ManagerEventGuard] 注销 CurrentSessionChanged 事件失败: {e:?}");
+            log::warn!(
+                "[ManagerEventGuard] Failed to unregister CurrentSessionChanged event: {e:?}"
+            );
         }
     }
 }
 
-/// SMTC 异步操作的通用超时时长。
-/// 用于防止 `WinRT` 的异步调用无限期阻塞。
+/// Common timeout for SMTC asynchronous operations.
+/// Used to prevent `WinRT` asynchronous calls from blocking indefinitely.
 const SMTC_ASYNC_OPERATION_TIMEOUT: TokioDuration = TokioDuration::from_secs(5);
 
-/// Windows API 操作被中止时返回的 HRESULT 错误码 (`E_ABORT`)。
-/// 用于在超时发生时手动构造一个错误。
+/// The HRESULT error code (`E_ABORT`) returned when a Windows API operation is
+/// aborted. Used to manually construct an error when a timeout occurs.
 const E_ABORT_HRESULT: windows::core::HRESULT = windows::core::HRESULT(0x8000_4004_u32 as i32);
 
-/// 将 Windows HSTRING 转换为 Rust String。
-/// 如果 HSTRING 为空或无效，则返回空 String。
+/// Converts a Windows HSTRING to a Rust String.
+/// Returns an empty String if the HSTRING is empty or invalid.
 fn hstring_to_string(hstr: &HSTRING) -> String {
     if hstr.is_empty() {
         String::new()
@@ -185,7 +187,8 @@ fn hstring_to_string(hstr: &HSTRING) -> String {
     }
 }
 
-/// 计算封面图片数据的哈希值 (u64)，用于高效地检测封面图片是否发生变化。
+/// Calculates a u64 hash for cover art data, used to efficiently detect
+/// changes.
 pub fn calculate_cover_hash(data: &[u8]) -> u64 {
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
@@ -199,7 +202,7 @@ enum SmtcEventSignal {
     MediaProperties(String),
     Sessions,
     PlaybackInfoUpdated(Box<(String, PlaybackInfoUpdate)>),
-    TimelinePropertiesUpdated(Box<(String, u64, u64)>), // (id, position_ms, duration_ms)
+    TimelinePropertiesUpdated(Box<(String, u64, u64)>), /* (id, position_ms, duration_ms) */
 }
 
 #[derive(Debug)]
@@ -223,19 +226,20 @@ struct PlaybackInfoUpdate {
     controls: Controls,
 }
 
-/// 封装了 `run_smtc_listener` 主事件循环中所有可变的状态。
+/// Encapsulates all mutable state for the `run_smtc_listener` main event loop.
 struct SmtcState {
-    /// RAII Guard，管理当前被监听的会话及其事件处理器。
+    /// RAII guard for the currently monitored session and its event handlers.
     session_guard: Option<MonitoredSessionGuard>,
-    /// RAII Guard, 用于管理 SMTC 会话管理器及其 `SessionsChanged` 事件。
+    /// RAII guard for the SMTC session manager and its `SessionsChanged` event.
     manager_guard: Option<ManagerEventGuard>,
-    /// 用户通过 `SelectSession` 命令指定的目标会话 ID。
+    /// The target session ID specified by the user via the `SelectSession`
+    /// command.
     target_session_id: Option<String>,
-    /// 当前的文本转换模式。
+    /// The current text conversion mode.
     text_conversion_mode: TextConversionMode,
-    /// 根据当前模式创建的 `OpenCC` 转换器实例。
+    /// The `OpenCC` converter instance created based on the current mode.
     text_converter: Option<OpenCC>,
-    /// 当前活动的音量缓动任务的句柄和取消令牌。
+    /// The handle and cancellation token for the active volume easing task.
     active_volume_easing_task: Option<(JoinHandle<()>, CancellationToken)>,
     active_media_properties_task: Option<JoinHandle<()>>,
     active_cover_fetch_task: Option<JoinHandle<()>>,
@@ -247,7 +251,6 @@ struct SmtcState {
 }
 
 impl SmtcState {
-    /// 创建一个新的 `SmtcState` 实例，并初始化所有字段。
     fn new() -> Self {
         Self {
             session_guard: None,
@@ -289,11 +292,11 @@ fn send_now_playing_update(
         .try_send(InternalUpdate::TrackChanged(info))
         .is_err()
     {
-        log::warn!("[SMTC] 状态广播失败，所有接收者可能已关闭");
+        log::warn!("[Handler] Failed to broadcast state, all receivers may have been closed");
     }
 }
 
-/// `SmtcRunner` 封装了 SMTC 事件循环的所有状态和逻辑。
+/// Encapsulates all state and logic for the SMTC event loop.
 struct SmtcRunner {
     context: AppContext,
     command_executor_handle: Option<JoinHandle<()>>,
@@ -319,20 +322,20 @@ impl SmtcRunner {
                 if let Err(e) =
                     Self::process_media_control_command(context_clone.clone(), cmd).await
                 {
-                    log::error!("[Command Executor] 执行指令失败: {e:?}");
+                    log::error!("[Command Executor] Failed to execute command: {e:?}");
                 }
             }
         });
         self.command_executor_handle = Some(cmd_handle);
 
-        log::debug!("[SmtcRunner] 正在请求 SMTC 管理器...");
+        log::debug!("[SmtcRunner] Starting SMTC manager...");
         let state_clone = self.context.state.clone();
         let smtc_event_tx_clone = smtc_event_tx.clone();
         tokio::task::spawn_local(async move {
             let async_op = match MediaSessionManager::RequestAsync() {
                 Ok(op) => op,
                 Err(e) => {
-                    log::error!("[SmtcRunner] 启动 SMTC 管理器请求失败: {e:?}");
+                    log::error!("[SmtcRunner] Failed to start SMTC manager: {e:?}");
                     let mut state = state_clone.borrow_mut();
                     Self::on_manager_ready(&mut state, Err(e), &smtc_event_tx_clone);
                     return;
@@ -342,7 +345,7 @@ impl SmtcRunner {
             let final_result = (tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, async_op).await)
                 .unwrap_or_else(|_| {
                     log::warn!(
-                        "[异步操作] WinRT 异步操作超时 (>{SMTC_ASYNC_OPERATION_TIMEOUT:?})。"
+                        "[Async Operation] WinRT async operation timed out (>{SMTC_ASYNC_OPERATION_TIMEOUT:?})."
                     );
                     Err(WinError::from(E_ABORT_HRESULT))
                 });
@@ -358,21 +361,18 @@ impl SmtcRunner {
                 biased;
 
                 maybe_shutdown = self.shutdown_rx.recv() => {
-                    if maybe_shutdown.is_some() {
-                        log::info!("[SmtcRunner] 收到关闭信号，准备退出...");
-                    } else {
-                        log::warn!("[SmtcRunner] 关闭通道已断开，准备退出...");
+                    if maybe_shutdown.is_none() {
+                        log::warn!("[SmtcRunner] Shutdown channel disconnected, exiting...");
                     }
                     self.command_executor_tx.take();
                     break Ok(());
                 },
 
-
                 Some(control_signal) = task_control_rx.recv() => {
                     match control_signal {
                         TaskControlSignal::ResetSessions => {
                             if smtc_event_tx.try_send(SmtcEventSignal::Sessions).is_err() {
-                                log::warn!("[SmtcRunner] 发送会话重置信号失败，事件通道可能已满或关闭。");
+                                log::warn!("[SmtcRunner] Failed to send session reset signal, event channel may be full or closed.");
                             }
                         }
                     }
@@ -380,16 +380,15 @@ impl SmtcRunner {
 
                 Some(command) = self.control_rx.recv() => {
                     if let Err(e) = self.handle_internal_command(command, &smtc_event_tx, &progress_signal_tx).await {
-                        log::error!("[SmtcRunner] 处理内部命令时发生错误: {e:?}");
+                        log::error!("[SmtcRunner] Error handling internal command: {e:?}");
                     }
                 },
 
                 Some(signal) = smtc_event_rx.recv() => {
                     if let Err(e) = self.handle_smtc_event(signal, &smtc_event_tx).await {
-                        log::error!("[SmtcRunner] 处理 SMTC 事件时发生错误: {e:?}");
+                        log::error!("[SmtcRunner] Error handling SMTC event: {e:?}");
                     }
                 },
-
 
                 Some(()) = progress_signal_rx.recv() => {
                     self.handle_progress_update_signal().await;
@@ -404,7 +403,6 @@ impl SmtcRunner {
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
         progress_signal_tx: &TokioSender<()>,
     ) -> WinResult<()> {
-        log::debug!("[SmtcRunner] 收到命令: {command:?}");
         match command {
             InternalCommand::SetTextConversion(mode) => {
                 self.on_set_text_conversion(mode, smtc_event_tx).await
@@ -417,7 +415,7 @@ impl SmtcRunner {
                 if let Some(tx) = &self.command_executor_tx
                     && let Err(e) = tx.try_send(media_cmd)
                 {
-                    log::error!("[SmtcRunner] 发送指令到执行器失败: {e}");
+                    log::error!("[SmtcRunner] Failed to send command to executor: {e}");
                 }
                 Ok(())
             }
@@ -449,7 +447,7 @@ impl SmtcRunner {
                 return Ok(());
             }
 
-            log::info!("[SmtcRunner] 切换文本转换模式 -> {mode:?}");
+            log::info!("[SmtcRunner] Switching text conversion mode -> {mode:?}");
             state.text_conversion_mode = mode;
 
             let config = match mode {
@@ -467,7 +465,7 @@ impl SmtcRunner {
                     Ok(converter) => text_converter = Some(converter),
                     Err(e) => {
                         should_send_diagnostic =
-                            Some(format!("加载 OpenCC 配置 '{c:?}' 失败: {e}"));
+                            Some(format!("Failed to load OpenCC config '{c:?}': {e}"));
                     }
                 }
             }
@@ -495,7 +493,7 @@ impl SmtcRunner {
 
     fn on_select_session(&self, id: String, smtc_event_tx: &TokioSender<SmtcEventSignal>) {
         let new_target = if id.is_empty() { None } else { Some(id) };
-        log::info!("[SmtcRunner] 切换目标会话 -> {new_target:?}");
+        log::info!("[SmtcRunner] Switching target session -> {new_target:?}");
         self.context.state.borrow_mut().target_session_id = new_target;
         let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
     }
@@ -507,10 +505,12 @@ impl SmtcRunner {
         {
             let mut state = self.context.state.borrow_mut();
             if !state.is_manager_ready {
-                log::warn!("[SmtcRunner] 收到状态更新请求，但 SMTC 管理器尚未就绪，已忽略。");
+                log::warn!(
+                    "[SmtcRunner] Received state update request, but SMTC manager is not ready. Ignoring."
+                );
                 return Ok(());
             }
-            log::info!("[SmtcRunner] 正在重新获取所有状态...");
+            log::debug!("[SmtcRunner] Re-fetching all states...");
             state.session_guard = None;
         }
 
@@ -521,7 +521,7 @@ impl SmtcRunner {
         let mut state = self.context.state.borrow_mut();
         if enabled {
             if state.active_progress_timer_task.is_none() {
-                log::info!("[SmtcRunner] 启用进度计时器。");
+                log::debug!("[SmtcRunner] Enabling progress timer.");
                 let cancel_token = CancellationToken::new();
                 let handle = tokio::task::spawn_local(tasks::progress_timer_task(
                     self.context.player_state_arc.clone(),
@@ -531,7 +531,7 @@ impl SmtcRunner {
                 state.active_progress_timer_task = Some((handle, cancel_token));
             }
         } else if let Some((task, token)) = state.active_progress_timer_task.take() {
-            log::info!("[SmtcRunner] 禁用进度计时器。");
+            log::debug!("[SmtcRunner] Disabling progress timer.");
             token.cancel();
             tokio::task::spawn_local(async move {
                 let _ = task.await;
@@ -540,7 +540,7 @@ impl SmtcRunner {
     }
 
     async fn on_set_progress_offset(&self, offset: i64) -> WinResult<()> {
-        log::info!("[SmtcRunner] 设置进度偏移量: {offset}ms");
+        log::debug!("[SmtcRunner] Setting progress offset: {offset}ms");
         let mut payload = {
             let mut player_state = self.context.player_state_arc.lock().await;
             player_state.position_offset_ms = offset;
@@ -559,7 +559,7 @@ impl SmtcRunner {
         enabled: bool,
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
     ) -> WinResult<()> {
-        log::info!("[SmtcRunner] 设置 Apple Music 优化: {enabled}");
+        log::debug!("[SmtcRunner] Setting Apple Music optimization: {enabled}");
         self.context
             .state
             .borrow_mut()
@@ -573,7 +573,7 @@ impl SmtcRunner {
         signal: SmtcEventSignal,
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
     ) -> WinResult<()> {
-        log::trace!("[SmtcRunner] 收到内部事件信号: {signal:?}");
+        log::trace!("[SmtcRunner] Received event signal: {signal:?}");
         match signal {
             SmtcEventSignal::Sessions => self.handle_sessions_signal(smtc_event_tx).await,
             SmtcEventSignal::MediaProperties(id) => {
@@ -616,7 +616,7 @@ impl SmtcRunner {
             if let Err(e) =
                 Self::process_media_properties_update(context_clone, event_session_id).await
             {
-                log::error!("[Media Properties Task] 执行失败: {e:?}");
+                log::error!("[Media Properties Task] Execution failed: {e:?}");
             }
         });
 
@@ -665,8 +665,8 @@ impl SmtcRunner {
             }
 
             if new_dur_ms > 0 && state_guard.song_duration_ms != new_dur_ms {
-                log::trace!(
-                    "[Timeline Update] 时长从 {}ms 更新为 {}ms",
+                log::debug!(
+                    "[Timeline Update] Duration updated from {}ms to {}ms",
                     state_guard.song_duration_ms,
                     new_dur_ms
                 );
@@ -711,7 +711,7 @@ impl SmtcRunner {
         context: AppContext,
         cmd: SmtcControlCommand,
     ) -> Result<()> {
-        log::debug!("[Command Executor] 正在执行命令: {cmd:?}");
+        log::debug!("[Command Executor] Executing command: {cmd:?}");
 
         if let SmtcControlCommand::SetVolume(level) = cmd {
             let mut state = context.state.borrow_mut();
@@ -744,7 +744,9 @@ impl SmtcRunner {
         let command_future = {
             let state = context.state.borrow();
             let Some(guard) = &state.session_guard else {
-                log::warn!("[Command Executor] 收到命令 {cmd:?}，但无活动会话，已忽略。");
+                log::warn!(
+                    "[Command Executor] Received command {cmd:?} with no active session. Ignoring."
+                );
                 return Ok(());
             };
 
@@ -780,12 +782,16 @@ impl SmtcRunner {
         let result = tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, future).await;
 
         match result {
-            Ok(Ok(true)) => log::debug!("[Command Executor] 指令 {cmd:?} 成功执行。"),
-            Ok(Ok(false)) => {
-                log::warn!("[Command Executor] 指令 {cmd:?} 执行失败 (返回 false)。");
+            Ok(Ok(true)) => {
+                log::debug!("[Command Executor] Command {cmd:?} executed successfully.");
             }
-            Ok(Err(e)) => log::warn!("[Command Executor] 指令 {cmd:?} 调用失败: {e:?}"),
-            Err(_) => log::warn!("[Command Executor] 指令 {cmd:?} 执行超时。"),
+            Ok(Ok(false)) => {
+                log::warn!(
+                    "[Command Executor] Command {cmd:?} failed to execute (returned false)."
+                );
+            }
+            Ok(Err(e)) => log::warn!("[Command Executor] Command {cmd:?} call failed: {e:?}"),
+            Err(_) => log::warn!("[Command Executor] Command {cmd:?} timed out."),
         }
 
         Ok(())
@@ -798,17 +804,17 @@ impl SmtcRunner {
     ) {
         match result {
             Ok(mgr) => {
-                log::trace!("[SmtcRunner] SMTC 管理器已就绪。");
+                log::trace!("[SmtcRunner] SMTC manager is ready.");
                 state.is_manager_ready = true;
                 if let Ok(guard) = ManagerEventGuard::new(mgr, smtc_event_tx) {
                     state.manager_guard = Some(guard);
                     let _ = smtc_event_tx.try_send(SmtcEventSignal::Sessions);
                 } else {
-                    log::error!("[SmtcRunner] 创建 ManagerEventGuard 失败。");
+                    log::error!("[SmtcRunner] Failed to create ManagerEventGuard.");
                 }
             }
             Err(e) => {
-                log::error!("[SmtcRunner] 初始化 SMTC 管理器失败: {e:?}。");
+                log::error!("[SmtcRunner] Failed to initialize SMTC manager: {e:?}.");
             }
         }
     }
@@ -822,10 +828,10 @@ impl SmtcRunner {
         let parts: Vec<&str> = info.artist.split(SEPARATOR).map(str::trim).collect();
 
         match parts.len() {
-            // 模式: "艺术家 — 专辑"
+            // Pattern: "Artist — Album"
             2 => {
                 log::debug!(
-                    "检测到 Apple Music 特有的格式(艺术家 — 专辑): '{}', 已拆分",
+                    "Detected Apple Music-specific format (Artist — Album): '{}', splitting",
                     &info.artist
                 );
                 TrackInfo {
@@ -834,10 +840,10 @@ impl SmtcRunner {
                     ..info
                 }
             }
-            // 模式: "艺术家 — 专辑 — 艺术家"
+            // Pattern: "Artist — Album — Artist"
             3 if parts[0] == parts[2] => {
                 log::debug!(
-                    "检测到 Apple Music 特有的格式(艺术家 — 专辑 — 艺术家): '{}', 已拆分",
+                    "Detected Apple Music-specific format (Artist — Album — Artist): '{}', splitting",
                     &info.artist
                 );
                 TrackInfo {
@@ -873,13 +879,13 @@ impl SmtcRunner {
 
         let props_result = (tokio_timeout(SMTC_ASYNC_OPERATION_TIMEOUT, props_future).await)
             .unwrap_or_else(|_| {
-                log::warn!("[Media Properties Task] 获取媒体属性超时。");
+                log::warn!("[Media Properties Task] Timed out getting media properties.");
                 Err(WinError::from(E_ABORT_HRESULT))
             });
 
         let Ok(props) = props_result else {
             log::warn!(
-                "[Media Properties Task] 获取媒体属性失败: {:?}",
+                "[Media Properties Task] Failed to get media properties: {:?}",
                 props_result.err()
             );
             return Ok(());
@@ -904,7 +910,7 @@ impl SmtcRunner {
             .try_send(InternalUpdate::TrackChanged(update_payload))
             .is_err()
         {
-            log::warn!("[SMTC] 状态广播失败，所有接收者可能已关闭");
+            log::warn!("[SMTC] Failed to broadcast state, all receivers may have been closed");
         }
 
         let should_fetch_cover = {
@@ -926,7 +932,10 @@ impl SmtcRunner {
                 let should_update;
                 let payload = {
                     let mut player_state = context.player_state_arc.lock().await;
-                    log::debug!("[State Update] 封面已更新 (大小: {} 字节)。", bytes.len());
+                    log::debug!(
+                        "[State Update] Cover art updated (size: {} bytes).",
+                        bytes.len()
+                    );
                     player_state.cover_data = Some(bytes);
                     player_state.cover_data_hash = Some(new_hash);
                     should_update = true;
@@ -941,7 +950,7 @@ impl SmtcRunner {
                 let payload = {
                     let mut player_state = context.player_state_arc.lock().await;
                     if player_state.cover_data.is_some() {
-                        log::debug!("[State Update] 清空封面数据。");
+                        log::debug!("[State Update] Clearing cover art data.");
                         player_state.cover_data = None;
                         player_state.cover_data_hash = None;
                         should_update = true;
@@ -953,7 +962,7 @@ impl SmtcRunner {
                 }
             }
             Err(e) => {
-                log::warn!("[Cover Task] 获取封面失败: {e:?}，重置会话。");
+                log::warn!("[Cover Task] Failed to fetch cover art: {e:?}, resetting session.");
                 let payload = {
                     let mut player_state = context.player_state_arc.lock().await;
                     let mut state = context.state.borrow_mut();
@@ -971,7 +980,7 @@ impl SmtcRunner {
                     .task_control_tx
                     .try_send(TaskControlSignal::ResetSessions)
                 {
-                    log::error!("[Cover Task] 发送会话重置信号失败: {send_err}");
+                    log::error!("[Cover Task] Failed to send session reset signal: {send_err}");
                 }
             }
         }
@@ -998,7 +1007,7 @@ impl SmtcRunner {
         &self,
         smtc_event_tx: &TokioSender<SmtcEventSignal>,
     ) -> WinResult<()> {
-        log::debug!("[会话处理器] 开始处理会话变更...");
+        log::debug!("[Session Handler] Starting to process session changes...");
 
         let session_candidates = self.get_sessions().await?;
 
@@ -1051,7 +1060,7 @@ impl SmtcRunner {
             .await
             .is_err()
         {
-            log::warn!("[会话处理器] 无法发送会话列表更新");
+            log::warn!("[Session Handler] Failed to send session list update");
         }
 
         Ok(session_candidates)
@@ -1080,7 +1089,7 @@ impl SmtcRunner {
             if let Some((_, session)) = candidates.into_iter().find(|(id, _)| id == target_id) {
                 Ok(Some(session))
             } else {
-                log::warn!("[会话处理器] 目标会话 '{target_id}' 已消失。");
+                log::warn!("[Session Handler] Target session '{target_id}' has vanished.");
                 let _ = self
                     .context
                     .connector_update_tx
@@ -1123,7 +1132,7 @@ impl SmtcRunner {
             .await
             .is_err()
         {
-            log::warn!("[会话处理器] 发送 ActiveSmtcSessionChanged 更新失败。");
+            log::warn!("[Session Handler] Failed to send ActiveSmtcSessionChanged update.");
         }
     }
 
@@ -1143,7 +1152,7 @@ impl SmtcRunner {
         let new_guard = MonitoredSessionGuard::new(new_session.clone(), smtc_event_tx)?;
         self.context.state.borrow_mut().session_guard = Some(new_guard);
 
-        log::info!("[会话处理器] 会话切换完成，获取初始状态...");
+        log::info!("[Session Handler] Session switch complete, fetching initial state...");
 
         if let Ok(id_hstr) = new_session.SourceAppUserModelId() {
             let _ =
@@ -1181,7 +1190,7 @@ impl SmtcRunner {
     }
 
     async fn handle_no_active_session(&self) {
-        log::info!("[会话处理器] 无可用会话，重置状态。");
+        log::info!("[Session Handler] No active session available, resetting state.");
         let payload = {
             let player_state = self.context.player_state_arc.lock().await;
             NowPlayingInfo::from(&*player_state)
@@ -1209,9 +1218,9 @@ impl SmtcRunner {
 
         let current_session_id = self.context.state.borrow().current_session_id();
         log::info!(
-            "[会话处理器] 会话切换: {:?} -> {:?}",
-            current_session_id.as_deref().unwrap_or("无"),
-            new_session_id.as_deref().unwrap_or("无")
+            "[Session Handler] Session switched: {:?} -> {:?}",
+            current_session_id.as_deref().unwrap_or("None"),
+            new_session_id.as_deref().unwrap_or("None")
         );
 
         self.reset_for_session_change().await;
@@ -1256,7 +1265,7 @@ impl SmtcRunner {
         let payload = {
             let mut player_state = self.context.player_state_arc.lock().await;
             if player_state.apple_music_optimization_offset_ms != new_offset {
-                log::info!("已优化 Apple Music 偏移量 -> {new_offset}ms");
+                log::info!("Applied Apple Music optimization offset -> {new_offset}ms");
                 player_state.apple_music_optimization_offset_ms = new_offset;
                 should_force_refresh = true;
             }
@@ -1271,12 +1280,12 @@ impl SmtcRunner {
         }
     }
 
-    /// 发送一条诊断信息，并同时在控制台打印日志。
+    /// Sends a diagnostic message and logs it to the console.
     async fn send_diagnostic(&self, level: DiagnosticLevel, message: impl Into<String>) {
         let message = message.into();
         match level {
-            DiagnosticLevel::Warning => log::warn!("[诊断信息] {}", &message),
-            DiagnosticLevel::Error => log::error!("[诊断信息] {}", &message),
+            DiagnosticLevel::Warning => log::warn!("[Diagnostic] {}", &message),
+            DiagnosticLevel::Error => log::error!("[Diagnostic] {}", &message),
         }
 
         let info = DiagnosticInfo {
@@ -1286,7 +1295,7 @@ impl SmtcRunner {
         };
 
         if self.diagnostics_tx.send(info).await.is_err() {
-            log::warn!("[诊断信息] 诊断通道已关闭，无法发送信息。");
+            log::warn!("[Diagnostic] Diagnostic channel is closed, failed to send message.");
         }
     }
 }
@@ -1300,7 +1309,7 @@ fn parse_and_convert_properties(
     let get_prop_string = |prop_res: WinResult<HSTRING>, name: &str| {
         prop_res.map_or_else(
             |e| {
-                log::warn!("[SmtcRunner] 获取媒体属性 '{name}' 失败: {e:?}");
+                log::warn!("[SmtcRunner] Failed to get media property '{name}': {e:?}");
                 String::new()
             },
             |hstr| {
@@ -1354,7 +1363,7 @@ async fn update_track_state(
 
     if is_new {
         log::info!(
-            "[SmtcRunner] 新曲目信息: '{}' - '{}'",
+            "[SmtcRunner] New track: '{}' - '{}'",
             &track_info.artist,
             &track_info.title
         );
@@ -1505,13 +1514,13 @@ pub async fn run_smtc_listener(
     };
 
     if let Err(e) = runner.run().await {
-        log::error!("[SmtcRunner] 事件循环因错误退出: {e:?}");
+        log::error!("[SmtcRunner] Event loop exited with an error: {e:?}");
     }
 
     if let Some(handle) = runner.command_executor_handle
         && let Err(e) = handle.await
     {
-        log::warn!("[SMTC Handler] 等待命令执行器任务时发生错误: {e:?}");
+        log::warn!("[SMTC Handler] Error while waiting for command executor task: {e:?}");
     }
 
     let tasks_to_clean = {
@@ -1543,6 +1552,6 @@ pub async fn run_smtc_listener(
         let _ = task.await;
     }
 
-    log::info!("[SMTC Handler] 监听器任务已完全退出。");
+    log::debug!("[SMTC Handler] Listener task has fully exited.");
     Ok(())
 }

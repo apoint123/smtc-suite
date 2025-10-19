@@ -27,52 +27,55 @@ use crate::{
 
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 
-/// 在 `MediaWorker` 内部使用的命令，用于控制其子模块。
-///
-/// 这个枚举定义了 `MediaWorker` 与其管理的后台任务（如 `smtc_handler`）之间的通信协议。
-/// 它将来自外部公共 API (`MediaCommand`) 的意图，转换为内部模块可以理解的具体指令。
+/// Internal commands used within the `MediaWorker` to control its sub-modules.
 #[derive(Debug, Clone)]
 pub enum InternalCommand {
-    /// 指示 `smtc_handler` 切换到指定的媒体会话。
+    /// Instructs `smtc_handler` to switch to the specified media session.
     SelectSmtcSession(String),
-    /// 向 `smtc_handler` 转发一个媒体控制指令（如播放、暂停等）。
+    /// Send a control command (e.g., play, pause) to `smtc_handler`.
     MediaControl(SmtcControlCommand),
-    /// 请求 `smtc_handler` 重新获取并广播其当前状态。
+    /// Requests `smtc_handler` to re-fetch and broadcast its current state.
     RequestStateUpdate,
-    /// 设置 SMTC 元数据的文本转换模式。
+    /// Sets the text conversion mode.
     SetTextConversion(TextConversionMode),
-    /// 指示 `smtc_handler` 启动或停止其内部的进度模拟计时器。
+    /// Instructs `smtc_handler` to start or stop its progress timer.
     SetProgressTimer(bool),
-    /// 指示 `smtc_handler` 设置一个偏移量。
+    /// Instructs `smtc_handler` to set a progress offset.
     SetProgressOffset(i64),
-    /// 指示 `smtc_handler` 启用或禁用 Apple Music 优化。
+    /// Instructs `smtc_handler` to enable or disable Apple Music optimizations.
     SetAppleMusicOptimization(bool),
 }
 
-/// 在 `MediaWorker` 内部使用的更新事件，由其子模块发出。
+/// Internal update events emitted by sub-modules within the `MediaWorker`.
 ///
-/// 这个枚举代表了所有子模块可能产生的事件，`MediaWorker` 的主事件循环会监听这些事件，
-/// 然后将它们转换为外部可见的 `MediaUpdate`。
+/// `MediaWorker` listens for these events and translates them into externally
+/// `MediaUpdate`s.
 #[derive(Debug, Clone)]
 pub enum InternalUpdate {
-    /// 由 `smtc_handler` 发出，表示当前曲目信息已更新。
+    /// Emitted by `smtc_handler`, indicating that the current track information
+    /// has been updated.
     TrackChanged(NowPlayingInfo),
-    /// 由 `smtc_handler` 发出，表示活动的 SMTC 会话已更改。
+    /// Emitted by `smtc_handler`, indicating that the active SMTC session has
+    /// changed.
     ActiveSmtcSessionChanged { pid: Option<u32> },
-    /// 由 `audio_session_monitor` 的回调发出，表示被监听的会话状态已发生变化。
+    /// Emitted by a callback from `audio_session_monitor`, indicating a change
+    /// in the monitored session's state.
     AudioSessionStateChanged {
         session_id: String,
         new_state: AudioSessionState,
     },
-    /// 由 `smtc_handler` 发出，表示可用的 SMTC 会话列表已更新。
+    /// Emitted by `smtc_handler`, indicating that the list of available SMTC
+    /// sessions has changed.
     SmtcSessionListChanged(Vec<SmtcSessionInfo>),
-    /// 由 `smtc_handler` 发出，表示之前选中的会话已消失。
+    /// Emitted by `smtc_handler`, indicating that the previously selected
+    /// session has vanished.
     SelectedSmtcSessionVanished(String),
-    /// 由 `audio_capturer` 发出，包含一个捕获到的音频数据包。
+    /// Emitted by `audio_capturer`, containing a captured audio data packet.
     AudioDataPacket(Vec<u8>),
-    /// 由 `audio_capturer` 发出，代表一个错误。
+    /// Emitted by `audio_capturer`, representing an error.
     AudioCaptureError(String),
-    /// 由 `volume_control` (通过 `smtc_handler` 转发) 发出，表示某个应用的音量已变化。
+    /// Emitted by `volume_control` (forwarded via `smtc_handler`), indicating a
+    /// change in an application's volume.
     AudioSessionVolumeChanged {
         session_id: String,
         volume: f32,
@@ -101,8 +104,6 @@ impl MediaWorker {
         command_rx: TokioReceiver<MediaCommand>,
         update_tx: TokioSender<MediaUpdate>,
     ) -> Result<()> {
-        log::info!("[MediaWorker] Worker 正在启动...");
-
         let (smtc_update_tx, smtc_update_rx) = channel::<InternalUpdate>(32);
         let (smtc_control_tx, smtc_control_rx) = channel::<InternalCommand>(32);
         let (diagnostics_tx, diagnostics_rx) = channel::<DiagnosticInfo>(32);
@@ -156,9 +157,9 @@ impl MediaWorker {
                 biased;
 
                 Some(command) = self.command_rx.recv() => {
-                    log::trace!("[MediaWorker] 收到外部命令: {command:?}");
+                    log::trace!("[MediaWorker] Received external command: {command:?}");
                     if matches!(command, MediaCommand::Shutdown) {
-                        log::debug!("[MediaWorker] 收到外部关闭命令，准备退出...");
+                        log::debug!("[MediaWorker] Received external shutdown command, preparing to exit...");
                         break;
                     }
                     self.handle_command_from_app(command).await;
@@ -176,7 +177,7 @@ impl MediaWorker {
                 }, if self.diagnostics_rx.is_some() => {
                     if let Some(diag_info) = diag_result
                         && self.update_tx.send(MediaUpdate::Diagnostic(diag_info)).await.is_err() {
-                            log::error!("[MediaWorker] 发送 Diagnostic 更新到外部失败。");
+                            log::error!("[MediaWorker] Failed to send Diagnostic update externally.");
                         }
                 },
 
@@ -189,8 +190,8 @@ impl MediaWorker {
                     if let Some(update) = audio_result {
                          self.handle_internal_update(update, "Audio").await;
                     } else {
-                        log::warn!("[MediaWorker] 音频捕获更新通道已断开 (线程可能已退出)。");
-                        let _ = self.update_tx.send(MediaUpdate::Error("音频捕获异常".to_string())).await;
+                        log::warn!("[MediaWorker] Audio capture update channel disconnected (thread may have exited).");
+                        let _ = self.update_tx.send(MediaUpdate::Error("Audio capture failure".to_string())).await;
                         self.stop_audio_capture_internal();
                     }
                 }
@@ -240,7 +241,7 @@ impl MediaWorker {
                 if let Some(tx) = &self.audio_monitor_command_tx
                     && tx.send(command).await.is_err()
                 {
-                    log::error!("[MediaWorker] 发送命令到音频会话监视器失败。");
+                    log::error!("[MediaWorker] Failed to send command to audio session monitor.");
                 }
                 None
             }
@@ -248,14 +249,16 @@ impl MediaWorker {
                 session_id,
                 new_state,
             } => {
-                log::debug!("[MediaWorker] 音频会话 '{session_id}' 状态变为: {new_state:?}");
+                log::debug!(
+                    "[MediaWorker] Audio session '{session_id}' state changed to: {new_state:?}"
+                );
 
                 if new_state == AudioSessionStateExpired {
-                    log::info!("[MediaWorker] 音频会话已过期，停止监听。");
+                    log::info!("[MediaWorker] Audio session has expired, stopping monitoring.");
                     if let Some(tx) = &self.audio_monitor_command_tx
                         && tx.send(AudioMonitorCommand::StopMonitoring).await.is_err()
                     {
-                        log::error!("[MediaWorker] 发送 StopMonitoring 命令失败。");
+                        log::error!("[MediaWorker] Failed to send StopMonitoring command.");
                     }
                 }
                 None
@@ -283,26 +286,26 @@ impl MediaWorker {
         if let Some(public_update) = maybe_public_update
             && self.update_tx.send(public_update).await.is_err()
         {
-            log::error!("[MediaWorker] 发送更新 (来自 {source}) 到外部失败。");
+            log::error!("[MediaWorker] Failed to send update (from {source}).");
         }
     }
 
     async fn send_internal_command_to_smtc(&self, command: InternalCommand) {
         if let Some(sender) = &self.smtc_control_tx {
             if sender.send(command).await.is_err() {
-                log::error!("[MediaWorker] 发送命令到 SMTC 处理器失败。");
+                log::error!("[MediaWorker] Failed to send command to SMTC handler.");
             }
         } else {
-            log::error!("[MediaWorker] SMTC 控制通道无效，无法发送命令。");
+            log::error!("[MediaWorker] SMTC control channel is invalid, cannot send command.");
         }
     }
 
     fn start_audio_capture_internal(&mut self) {
         if self.audio_capturer.is_some() {
-            log::warn!("[MediaWorker] 音频捕获已在运行，无需重复启动。");
+            log::warn!("[MediaWorker] Audio capture is already running, skipping start request.");
             return;
         }
-        log::debug!("[MediaWorker] 正在启动音频捕获...");
+        log::debug!("[MediaWorker] Starting audio capture...");
 
         let (audio_update_tx, audio_update_rx) = channel::<InternalUpdate>(256);
 
@@ -311,10 +314,9 @@ impl MediaWorker {
             Ok(()) => {
                 self.audio_capturer = Some(capturer);
                 self.audio_update_rx = Some(audio_update_rx);
-                log::info!("[MediaWorker] 音频捕获已成功启动。");
             }
             Err(e) => {
-                log::error!("[MediaWorker] 启动音频捕获失败: {e}");
+                log::error!("[MediaWorker] Failed to start audio capture: {e}");
                 self.audio_capturer = None;
                 self.audio_update_rx = None;
             }
@@ -323,16 +325,16 @@ impl MediaWorker {
 
     fn stop_audio_capture_internal(&mut self) {
         if let Some(mut capturer) = self.audio_capturer.take() {
-            log::debug!("[MediaWorker] 正在停止音频捕获...");
+            log::debug!("[MediaWorker] Stopping audio capture...");
             capturer.stop_capture();
         }
         if self.audio_update_rx.take().is_some() {
-            log::debug!("[MediaWorker] 音频更新通道已清理。");
+            log::debug!("[MediaWorker] Audio update channel cleaned up.");
         }
     }
 
     async fn shutdown_all_subsystems(&mut self) {
-        log::info!("[MediaWorker] 正在关闭所有子系统...");
+        log::info!("[MediaWorker] Shutting down all subsystems...");
         self.smtc_control_tx.take();
         self.audio_monitor_command_tx.take();
 
@@ -345,7 +347,7 @@ impl MediaWorker {
                     .await
                     .is_err()
             {
-                log::warn!("[MediaWorker] 音频监视器退出超时，将强制中止。");
+                log::warn!("[MediaWorker] Audio monitor shutdown timed out, aborting task.");
                 handle.abort();
             }
         };
@@ -359,7 +361,7 @@ impl MediaWorker {
                     .await
                     .is_err()
             {
-                log::warn!("[MediaWorker] SMTC 监听器退出超时，将强制中止。");
+                log::warn!("[MediaWorker] SMTC listener shutdown timed out, aborting task.");
                 handle.abort();
             }
         };
@@ -373,7 +375,9 @@ impl MediaWorker {
 impl Drop for MediaWorker {
     fn drop(&mut self) {
         if self.smtc_control_tx.is_some() {
-            log::warn!("[MediaWorker] MediaWorker 实例被意外丢弃 (可能发生 panic)。");
+            log::warn!(
+                "[MediaWorker] MediaWorker instance was dropped unexpectedly (panic may have occurred)."
+            );
         }
     }
 }
@@ -401,7 +405,9 @@ pub fn start_media_worker_thread(
             let _com_guard = match ComGuard::new() {
                 Ok(guard) => guard,
                 Err(e) => {
-                    log::error!("[MediaWorker Thread] COM 初始化失败: {e}，线程无法启动。");
+                    log::error!(
+                        "[MediaWorker Thread] COM initialization failed: {e}, thread cannot start."
+                    );
                     return;
                 }
             };
@@ -410,11 +416,11 @@ pub fn start_media_worker_thread(
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
-                .expect("无法为 MediaWorker 创建 Tokio 运行时");
+                .expect("Failed to create Tokio runtime for MediaWorker");
 
             local_set.block_on(&rt, async {
                 if let Err(e) = MediaWorker::run(command_rx, update_tx).await {
-                    log::error!("[MediaWorker Thread] Worker 运行失败: {e}");
+                    log::error!("[MediaWorker Thread] Worker failed to run: {e}");
                 }
             });
         })

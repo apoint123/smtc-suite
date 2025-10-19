@@ -67,7 +67,7 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
                 is_muted: bNewMute.as_bool(),
             };
             if let Err(e) = tx.try_send(update) {
-                log::warn!("[音量监听器] 发送音量更新失败: {e}");
+                log::warn!("[Volume Monitor] Failed to send volume update: {e}");
             }
         }
         Ok(())
@@ -86,9 +86,8 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
     }
     fn OnStateChanged(&self, new_state: AudioSessionState) -> windows::core::Result<()> {
         log::debug!(
-            "[音量监听器] 会话 '{}' 状态变为: {:?}",
+            "[Volume Monitor] Session '{}' status changed to: {new_state:?}",
             self.session_id,
-            new_state
         );
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
@@ -98,7 +97,7 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
                 new_state,
             };
             if tx.try_send(update).is_err() {
-                log::warn!("[音量监听器] 发送状态更新失败。");
+                log::warn!("[Volume Monitor] Failed to send status update.");
             }
         }
         Ok(())
@@ -108,9 +107,8 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
         disconnect_reason: windows::Win32::Media::Audio::AudioSessionDisconnectReason,
     ) -> windows::core::Result<()> {
         log::debug!(
-            "[音量监听器] 会话 '{}' 断开 ({:?})",
+            "[Volume Monitor] Session '{}' disconnected ({disconnect_reason:?})",
             self.session_id,
-            disconnect_reason
         );
         if let Ok(guard) = self.tx.lock()
             && let Some(tx) = guard.as_ref()
@@ -120,7 +118,7 @@ impl IAudioSessionEvents_Impl for VolumeChangeNotifier_Impl {
                 new_state: AudioSessionStateExpired,
             };
             if tx.try_send(update).is_err() {
-                log::warn!("[音量监听器] 发送断开连接事件失败。");
+                log::warn!("[Volume Monitor] Failed to send disconnect event.");
             }
         }
         Ok(())
@@ -159,7 +157,7 @@ impl AudioSessionMonitor {
 
                 Some(command) = self.command_rx.recv() => {
                     if let Err(e) = self.handle_command(&command) {
-                        log::error!("[音量监听器] 处理命令失败: {e:?}");
+                        log::error!("[Volume Monitor] Failed to process command: {e:?}");
                     }
                 },
 
@@ -169,7 +167,7 @@ impl AudioSessionMonitor {
             }
         }
         if let Err(e) = self.stop_monitoring_internal() {
-            log::warn!("[音量监听器] 退出时注销回调失败: {e:?}");
+            log::warn!("[Volume Monitor] Logout callback failed when exiting: {e:?}");
         }
     }
 
@@ -206,7 +204,9 @@ impl AudioSessionMonitor {
                             };
 
                             if self.update_tx.try_send(initial_update).is_err() {
-                                log::warn!("[音量监听器] 发送初始音量更新失败。");
+                                log::warn!(
+                                    "[Volume Monitor] Failed to send initial volume update."
+                                );
                             }
 
                             let notifier = VolumeChangeNotifier {

@@ -38,16 +38,20 @@ use crate::{
     worker::InternalUpdate,
 };
 
-/// 目标采样率 (单位: Hz)。所有捕获的音频最终会重采样到这个频率。
+/// The target sampling rate (in Hz). All captured audio will eventually be
+/// resampled to this frequency.
 const TARGET_SAMPLE_RATE: u32 = 48000;
-/// 目标声道数。2 代表立体声。
+
+/// Target number of channels. 2 for stereo.
 const TARGET_CHANNELS: u16 = 2;
-/// WASAPI 内部缓冲区建议的参考时长 (单位: 毫秒)。
+
+/// The recommended reference length of the WASAPI internal buffer (in ms).
 const WASAPI_BUFFER_DURATION_MS: u64 = 20;
-/// 大约每隔多少毫秒尝试发送一次处理好的音频数据包。
+
+/// Approximately how often in milliseconds should we attempt to send processed
+/// audio packets.
 const AUDIO_PACKET_SEND_INTERVAL_MS: u64 = 100;
 
-/// 模块内部使用的错误类型。
 #[derive(Error, Debug)]
 pub enum AudioCaptureError {
     #[error("COM Error: {0}")]
@@ -69,7 +73,6 @@ pub enum AudioCaptureError {
     BytesToSampleConversion,
 }
 
-/// RAII Guard: 确保 `IAudioClient` 在离开作用域时被正确停止。
 struct AudioClientGuard<'a> {
     client: &'a IAudioClient,
 }
@@ -82,12 +85,11 @@ impl<'a> AudioClientGuard<'a> {
 impl Drop for AudioClientGuard<'_> {
     fn drop(&mut self) {
         if let Err(e) = unsafe { self.client.Stop() } {
-            log::warn!("[AudioClientGuard] 停止音频客户端失败: {e:?}");
+            log::warn!("[AudioClientGuard] Failed to stop the audio client: {e:?}");
         }
     }
 }
 
-/// RAII Guard: 确保从 `GetMixFormat` 获取的内存被正确释放。
 struct WaveFormatGuard(*mut WAVEFORMATEX);
 impl Drop for WaveFormatGuard {
     fn drop(&mut self) {
@@ -97,12 +99,13 @@ impl Drop for WaveFormatGuard {
     }
 }
 
-// HANDLE 本质上是一个指针，不是线程安全的。
-// 但在这里，我们创建的 Event Handle 的用法是线程安全的（一个线程等待，另一个线程触发）。
+// A HANDLE is essentially a pointer and is not thread-safe.
+//
+// However, the event handler we created here is thread-safe (one thread waits
+// while another thread triggers).
 unsafe impl Send for EventHandleGuard {}
 unsafe impl Sync for EventHandleGuard {}
 
-/// RAII Guard: 确保 Windows Event Handle 被正确关闭。
 struct EventHandleGuard(HANDLE);
 impl EventHandleGuard {
     fn new(manual_reset: bool, initial_state: bool) -> Result<Self> {
@@ -125,7 +128,6 @@ impl Drop for EventHandleGuard {
     }
 }
 
-/// 辅助函数：处理音频数据的声道转换，并通过通道发送。
 fn process_and_send_audio_data(
     audio_f32_interleaved: Vec<f32>,
     update_tx: &TokioSender<InternalUpdate>,
@@ -154,7 +156,7 @@ fn process_and_send_audio_data(
             .collect()
     } else {
         log::warn!(
-            "[音频处理] 不支持的声道转换: 从 {channels_in_audio_data}声道 到 {target_channels_for_output}声道。将直接使用原始声道数据。"
+            "[Audio Processing] Unsupported channel conversion: from {channels_in_audio_data} channels to {target_channels_for_output} channels. The original channel data will be used directly."
         );
         audio_f32_interleaved
     };
@@ -167,8 +169,8 @@ fn process_and_send_audio_data(
             .blocking_send(InternalUpdate::AudioDataPacket(audio_data_bytes))
             .is_err()
         {
-            let err_msg = "发送音频数据包失败。通道可能已关闭。".to_string();
-            log::error!("[音频处理] {err_msg}");
+            let err_msg = "Failed to send audio packet. The channel may be closed.".to_string();
+            log::error!("[Audio Processing] {err_msg}");
             return Err(SmtcError::AudioCapture(AudioCaptureError::SendError(
                 err_msg,
             )));
@@ -177,10 +179,8 @@ fn process_and_send_audio_data(
     Ok(())
 }
 
-/// `AudioCapturer` 结构体负责管理音频捕获线程的生命周期。
 pub struct AudioCapturer {
     capture_thread_handle: Option<JoinHandle<()>>,
-    /// 用于从外部向捕获线程发送停止信号的事件句柄。
     stop_event: Option<Arc<EventHandleGuard>>,
 }
 
@@ -192,7 +192,6 @@ impl AudioCapturer {
         }
     }
 
-    /// 启动音频捕获线程。
     pub fn start_capture(&mut self, update_tx: TokioSender<InternalUpdate>) -> Result<()> {
         if self.capture_thread_handle.is_some() {
             return Ok(());
@@ -204,60 +203,55 @@ impl AudioCapturer {
         let thread_builder = thread::Builder::new().name("audio_capture_thread".to_string());
         self.capture_thread_handle = Some(thread_builder.spawn(move || {
             if let Err(e) = Self::run_capture_entrypoint(&stop_event, &update_tx.clone()) {
-                log::error!("[音频捕获线程] 捕获过程遇到致命错误: {e}。线程即将退出。");
+                log::error!("[Audio capture thread] Capture process encountered error: {e}. Thread will exit.");
                 if update_tx
                     .blocking_send(InternalUpdate::AudioCaptureError(e.to_string()))
                     .is_err()
                 {
-                    log::error!("[音频捕获线程] 发送错误通知时失败。");
+                    log::error!("[Audio capture thread] Failed to send error notification.");
                 }
             }
         })?);
         Ok(())
     }
 
-    /// 请求停止音频捕获线程并等待其结束。
     pub fn stop_capture(&mut self) {
         if let Some(handle) = self.capture_thread_handle.take() {
-            if let Some(stop_event) = self.stop_event.take() {
-                // 向停止事件发送信号，这将唤醒在 WaitForMultipleObjects 处等待的捕获线程。
-                if unsafe { SetEvent(stop_event.0) }.is_err() {
-                    log::error!("[音频捕获器] 无法向停止事件发送信号。");
-                }
+            if let Some(stop_event) = self.stop_event.take()
+                && unsafe { SetEvent(stop_event.0) }.is_err()
+            {
+                log::error!("[Audio capture thread] Unable to signal a stop event.");
             }
-            handle.join().expect("无法等待音频捕获线程结束");
+            handle
+                .join()
+                .expect("Unable to wait for audio capture thread to stop");
         }
     }
 
-    /// 音频捕获线程的入口点和总协调函数。
     fn run_capture_entrypoint(
         stop_event: &Arc<EventHandleGuard>,
         update_tx: &TokioSender<InternalUpdate>,
     ) -> Result<()> {
-        // 尝试提升线程优先级
         unsafe {
             let task_name_hstring = HSTRING::from("Pro Audio");
             let mut task_index = 0u32;
             if AvSetMmThreadCharacteristicsW(&task_name_hstring, &raw mut task_index).is_err() {
-                log::warn!("[音频捕获线程] 无法设置线程特性为 'Pro Audio'。");
+                log::warn!(
+                    "[Audio capture thread] Unable to set thread characteristics to 'Pro Audio'."
+                );
             }
         }
 
-        // 初始化 WASAPI 组件
         let (audio_client, capture_client, wave_format, _format_guard) = Self::init_wasapi()?;
 
-        // 为 WASAPI 创建一个自动重置的事件，用于接收数据就绪通知
         let wasapi_event = EventHandleGuard::new(false, false)?;
         unsafe { audio_client.SetEventHandle(wasapi_event.0)? };
 
         let original_channels_usize = wave_format.nChannels as usize;
         let mut resampler = Self::setup_resampler(&wave_format)?;
 
-        // 启动音频流并进入事件驱动的主循环
         let final_accumulated_buffer = {
             let _client_guard = AudioClientGuard::new(&audio_client)?;
-            log::debug!("[音频捕获线程] 音频捕获流已启动，进入事件等待循环。");
-
             Self::capture_loop(
                 stop_event.0,
                 wasapi_event.0,
@@ -269,7 +263,6 @@ impl AudioCapturer {
             )?
         };
 
-        // 处理流末尾可能剩余的数据
         Self::finalize_stream(
             &mut resampler,
             final_accumulated_buffer,
@@ -279,7 +272,6 @@ impl AudioCapturer {
         Ok(())
     }
 
-    /// 步骤 1: 初始化所有 WASAPI 组件。
     fn init_wasapi() -> Result<(
         IAudioClient,
         IAudioCaptureClient,
@@ -342,7 +334,6 @@ impl AudioCapturer {
         Ok((audio_client, capture_client, wave_format, format_guard))
     }
 
-    /// 步骤 2: 根据需要设置重采样器。
     fn setup_resampler(wave_format: &WAVEFORMATEX) -> Result<Option<SincFixedIn<f32>>> {
         if wave_format.nSamplesPerSec == TARGET_SAMPLE_RATE {
             return Ok(None);
@@ -369,7 +360,6 @@ impl AudioCapturer {
         Ok(Some(resampler))
     }
 
-    /// 辅助函数：处理音频数据的重采样。
     fn handle_audio_resampling(
         captured_f32_interleaved: &[f32],
         resampler: &mut Option<SincFixedIn<f32>>,
@@ -417,7 +407,6 @@ impl AudioCapturer {
         Ok(data_to_send_interleaved)
     }
 
-    /// 主捕获循环
     fn capture_loop(
         stop_handle: HANDLE,
         wasapi_handle: HANDLE,
@@ -435,105 +424,98 @@ impl AudioCapturer {
         let handles = [stop_handle, wasapi_handle];
 
         loop {
-            // 阻塞式地等待任一事件被触发。
             let wait_result: WAIT_EVENT =
                 unsafe { WaitForMultipleObjects(&handles, false, INFINITE) };
 
-            // 检查是哪个事件被触发了
             match wait_result {
-                // 停止事件
                 WAIT_OBJECT_0 => {
-                    log::debug!("[音频捕获线程] 收到停止信号，退出捕获循环。");
+                    log::debug!(
+                        "[Audio capture thread] Received stop signal, exit the capture loop."
+                    );
                     break;
                 }
-                // WASAPI数据就绪事件
-                wait_event if wait_event.0 == WAIT_OBJECT_0.0 + 1 => {
-                    // 循环读取，直到缓冲区被清空。
-                    loop {
-                        let packet_length_frames = unsafe { capture_client.GetNextPacketSize() }?;
-                        if packet_length_frames == 0 {
-                            // 没有更多数据包了，退出内部循环，继续等待下一个事件。
-                            break;
-                        }
+                wait_event if wait_event.0 == WAIT_OBJECT_0.0 + 1 => loop {
+                    let packet_length_frames = unsafe { capture_client.GetNextPacketSize() }?;
+                    if packet_length_frames == 0 {
+                        break;
+                    }
 
-                        {
-                            let (mut p_data, mut num_frames_captured, mut dw_flags) =
-                                (std::ptr::null_mut(), 0, 0);
-                            unsafe {
-                                capture_client.GetBuffer(
-                                    &raw mut p_data,
-                                    &raw mut num_frames_captured,
-                                    &raw mut dw_flags,
-                                    None,
-                                    None,
-                                )?;
-                            };
-
-                            struct BufferGuard<'a> {
-                                client: &'a IAudioCaptureClient,
-                                frames: u32,
-                            }
-                            impl Drop for BufferGuard<'_> {
-                                fn drop(&mut self) {
-                                    unsafe {
-                                        let _ = self.client.ReleaseBuffer(self.frames);
-                                    }
-                                }
-                            }
-                            let _guard = BufferGuard {
-                                client: capture_client,
-                                frames: num_frames_captured,
-                            };
-
-                            if dw_flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
-                                continue;
-                            }
-
-                            if num_frames_captured > 0 && !p_data.is_null() {
-                                captured_f32_interleaved.clear();
-                                let bytes_per_frame =
-                                    original_channels * (original_bits_per_sample / 8) as usize;
-                                let captured_bytes_slice = unsafe {
-                                    std::slice::from_raw_parts(
-                                        p_data,
-                                        num_frames_captured as usize * bytes_per_frame,
-                                    )
-                                };
-                                for sample_bytes in captured_bytes_slice
-                                    .chunks_exact((original_bits_per_sample / 8) as usize)
-                                {
-                                    captured_f32_interleaved.push(f32::from_le_bytes(
-                                        sample_bytes.try_into().map_err(|_| {
-                                            SmtcError::AudioCapture(
-                                                AudioCaptureError::BytesToSampleConversion,
-                                            )
-                                        })?,
-                                    ));
-                                }
-                                let processed_data = Self::handle_audio_resampling(
-                                    &captured_f32_interleaved,
-                                    resampler,
-                                    &mut accumulated_audio_planar,
-                                    original_channels,
-                                )?;
-                                data_to_send_interleaved.extend(processed_data);
-                            }
-                        }
-                        if !data_to_send_interleaved.is_empty() {
-                            let data_to_send = std::mem::take(&mut data_to_send_interleaved);
-                            process_and_send_audio_data(
-                                data_to_send,
-                                update_tx,
-                                original_channels,
-                                TARGET_CHANNELS,
+                    {
+                        let (mut p_data, mut num_frames_captured, mut dw_flags) =
+                            (std::ptr::null_mut(), 0, 0);
+                        unsafe {
+                            capture_client.GetBuffer(
+                                &raw mut p_data,
+                                &raw mut num_frames_captured,
+                                &raw mut dw_flags,
+                                None,
+                                None,
                             )?;
+                        };
+
+                        struct BufferGuard<'a> {
+                            client: &'a IAudioCaptureClient,
+                            frames: u32,
+                        }
+                        impl Drop for BufferGuard<'_> {
+                            fn drop(&mut self) {
+                                unsafe {
+                                    let _ = self.client.ReleaseBuffer(self.frames);
+                                }
+                            }
+                        }
+                        let _guard = BufferGuard {
+                            client: capture_client,
+                            frames: num_frames_captured,
+                        };
+
+                        if dw_flags & (AUDCLNT_BUFFERFLAGS_SILENT.0 as u32) != 0 {
+                            continue;
+                        }
+
+                        if num_frames_captured > 0 && !p_data.is_null() {
+                            captured_f32_interleaved.clear();
+                            let bytes_per_frame =
+                                original_channels * (original_bits_per_sample / 8) as usize;
+                            let captured_bytes_slice = unsafe {
+                                std::slice::from_raw_parts(
+                                    p_data,
+                                    num_frames_captured as usize * bytes_per_frame,
+                                )
+                            };
+                            for sample_bytes in captured_bytes_slice
+                                .chunks_exact((original_bits_per_sample / 8) as usize)
+                            {
+                                captured_f32_interleaved.push(f32::from_le_bytes(
+                                    sample_bytes.try_into().map_err(|_| {
+                                        SmtcError::AudioCapture(
+                                            AudioCaptureError::BytesToSampleConversion,
+                                        )
+                                    })?,
+                                ));
+                            }
+                            let processed_data = Self::handle_audio_resampling(
+                                &captured_f32_interleaved,
+                                resampler,
+                                &mut accumulated_audio_planar,
+                                original_channels,
+                            )?;
+                            data_to_send_interleaved.extend(processed_data);
                         }
                     }
-                }
-                // 等待失败或其他未知情况
+                    if !data_to_send_interleaved.is_empty() {
+                        let data_to_send = std::mem::take(&mut data_to_send_interleaved);
+                        process_and_send_audio_data(
+                            data_to_send,
+                            update_tx,
+                            original_channels,
+                            TARGET_CHANNELS,
+                        )?;
+                    }
+                },
                 _ => {
                     let err = windows::core::Error::from_thread();
-                    log::error!("[音频捕获线程] WaitForMultipleObjects 失败: {err:?}");
+                    log::error!("[Audio capture thread] WaitForMultipleObjects failed: {err:?}");
                     return Err(SmtcError::AudioCapture(err.into()));
                 }
             }
@@ -541,7 +523,6 @@ impl AudioCapturer {
         Ok(accumulated_audio_planar)
     }
 
-    /// 步骤 4: 处理流末尾的剩余数据。
     fn finalize_stream(
         resampler: &mut Option<SincFixedIn<f32>>,
         mut accumulated_audio_planar: Vec<Vec<f32>>,
@@ -590,7 +571,6 @@ impl AudioCapturer {
 
 impl Drop for AudioCapturer {
     fn drop(&mut self) {
-        log::trace!("[音频捕获器] AudioCapturer 实例正在被 Drop，正在停止捕获线程...");
         self.stop_capture();
     }
 }

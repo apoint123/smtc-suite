@@ -9,7 +9,7 @@
 #include <stdlib.h>
 
 /**
- * C-ABI 兼容的命令类型标签。
+ * C-ABI compatible command type tag.
  */
 typedef enum CControlCommandType {
   Pause,
@@ -23,7 +23,7 @@ typedef enum CControlCommandType {
 } CControlCommandType;
 
 /**
- * C-ABI 兼容的日志级别枚举。
+ * C-ABI compatible log level enum.
  */
 typedef enum CLogLevel {
   Error = 1,
@@ -33,6 +33,9 @@ typedef enum CLogLevel {
   Trace = 5,
 } CLogLevel;
 
+/**
+ * C-ABI compatible repeat mode enum.
+ */
 enum CRepeatMode {
   Off = 0,
   One = 1,
@@ -41,119 +44,103 @@ enum CRepeatMode {
 typedef uint8_t CRepeatMode;
 
 /**
- * C-ABI 兼容的文本转换模式枚举。
- *
- * 这个枚举可以安全地在 C 和 Rust 之间传递。
+ * C-ABI compatible text conversion mode enum.
  */
 enum CTextConversionMode {
   /**
-   * 关闭转换功能。
+   * No conversion.
    */
   Off = 0,
   /**
-   * 繁体转简体 (t2s.json)。
+   * Traditional to Simplified (t2s.json).
    */
   TraditionalToSimplified = 1,
   /**
-   * 简体转繁体 (s2t.json)。
+   * Simplified to Traditional (s2t.json).
    */
   SimplifiedToTraditional = 2,
   /**
-   * 简体转台湾正体 (s2tw.json)。
+   * Simplified to Taiwan Standard (s2tw.json).
    */
   SimplifiedToTaiwan = 3,
   /**
-   * 台湾正体转简体 (tw2s.json)。
+   * Taiwan Standard to Simplified (tw2s.json).
    */
   TaiwanToSimplified = 4,
   /**
-   * 简体转香港繁体 (s2hk.json)。
+   * Simplified to Hong Kong Traditional (s2hk.json).
    */
   SimplifiedToHongKong = 5,
   /**
-   * 香港繁体转简体 (hk2s.json)。
+   * Hong Kong Traditional to Simplified (hk2s.json).
    */
   HongKongToSimplified = 6,
 };
 typedef uint8_t CTextConversionMode;
 
 /**
- * 定义从 Rust 发送到 C 的更新事件类型。
+ * Defines the update event types sent from Rust to C.
  */
 typedef enum CUpdateType {
   /**
-   * data 指针类型: `*const CNowPlayingInfo` (常规更新)
+   * data pointer type: `*const CNowPlayingInfo` (regular update)
    */
   TrackChanged,
   /**
-   * data 指针类型: `*const CSessionList`
+   * data pointer type: `*const CSessionList`
    */
   SessionsChanged,
   /**
-   * data 指针类型: `*const CAudioDataPacket`
+   * data pointer type: `*const CAudioDataPacket`
    */
   AudioData,
   /**
-   * data 指针类型: `*const c_char` (错误信息字符串)
+   * data pointer type: `*const c_char` (error message string)
    */
   Error,
   /**
-   * data 指针类型: `*const CVolumeChangedEvent`
+   * data pointer type: `*const CVolumeChangedEvent`
    */
   VolumeChanged,
   /**
-   * data 指针类型: `*const c_char` (已消失会话的 ID)
+   * data pointer type: `*const c_char` (ID of the vanished session)
    */
   SelectedSessionVanished,
   /**
-   * data 指针类型: `*const CDiagnosticInfo`
+   * data pointer type: `*const CDiagnosticInfo`
    */
   Diagnostic,
 } CUpdateType;
 
-/**
- * FFI 函数的通用返回码。
- */
 typedef enum SmtcResult {
-  /**
-   * 操作成功。
-   */
   Success,
-  /**
-   * 传入的句柄是 NULL 或无效（例如已销毁）。
-   */
   InvalidHandle,
-  /**
-   * 创建 SMTCS 实例失败。
-   */
   CreationFailed,
-  /**
-   * 内部发生错误，通常伴有日志输出。
-   */
   InternalError,
-  /**
-   * 命令因通道已满而发送失败。
-   */
   ChannelFull,
 } SmtcResult;
 
 /**
- * Rust 端的核心控制器句柄。
+ * The core controller handle on the Rust side.
  */
 typedef struct SmtcHandle SmtcHandle;
 
 /**
- * 定义从 C 端接收更新的回调函数指针类型。
+ * Defines the callback function pointer type for receiving updates from the C
+ * side.
  *
- * # 参数
- * - `update_type`: 事件的类型，用于决定如何转换 `data` 指针。
- * - `data`: 一个 `const void*` 指针，指向与事件类型对应的 C 结构体。
- * - `userdata`: 调用者在注册时传入的自定义上下文指针。
+ * # Arguments
+ * - `update_type`: The type of the event, used to determine how to cast the
+ *   `data` pointer.
+ * - `data`: A `const void*` pointer to a C struct corresponding to the event
+ *   type.
+ * - `userdata`: The custom context pointer passed by the caller during
+ *   registration.
  */
 typedef void (*UpdateCallback)(enum CUpdateType update_type, const void *data, void *userdata);
 
 /**
- * C-ABI 兼容的联合体，用于存放不同命令的数据。
+ * C-ABI compatible union to hold data for different commands.
  */
 typedef union ControlCommandData {
   uint64_t seek_to_ms;
@@ -163,29 +150,28 @@ typedef union ControlCommandData {
 } ControlCommandData;
 
 /**
- * C-ABI 兼容的、完整的控制命令结构体。
- *
- * 这个结构体可以安全地在 C 和 Rust 之间传递。
+ * C-ABI compatible control command struct.
  */
 typedef struct CSmtcControlCommand {
   /**
-   * 命令的类型
+   * The type of the command.
    */
   enum CControlCommandType command_type;
   /**
-   * 命令关联的数据
+   * The data associated with the command.
    */
   union ControlCommandData data;
 } CSmtcControlCommand;
 
 /**
- * 定义 C 端日志回调函数的指针类型。
+ * Defines the pointer type for the C side log callback function.
  *
- * # 参数
- * - `level`: 日志消息的级别。
- * - `target`: 日志来源的模块路径 (例如 "`my_lib::my_module`")。
- * - `message`: UTF-8 编码、Null 结尾的日志消息。
- * - `userdata`: 调用者在注册时传入的自定义上下文指针。
+ * # Arguments
+ * - `level`: The level of the log message.
+ * - `target`: The module path of the log source (e.g., "`my_lib::my_module`").
+ * - `message`: The UTF-8 encoded, Null-terminated log message.
+ * - `userdata`: The custom context pointer passed by the caller during
+ *   registration.
  */
 typedef void (*LogCallback)(enum CLogLevel level,
                             const char *target,
@@ -193,174 +179,208 @@ typedef void (*LogCallback)(enum CLogLevel level,
                             void *userdata);
 
 /**
- * 创建一个新的 SMTC 控制器实例。
+ * Creates a new SMTC controller instance.
  *
- * # 参数
- * - `out_handle`: 一个指向 `*mut SmtcHandle` 的指针，用于接收成功创建的句柄。
+ * # Arguments
+ * - `out_handle`: A pointer to `*mut SmtcHandle` to receive the successfully
+ *   created handle.
  *
- * # 返回
- * - `SmtcResult::Success` 表示成功，`out_handle` 将被设置为有效的句柄。
- * - `SmtcResult::CreationFailed` 表示失败，`out_handle` 将被设置为 `NULL`。
+ * # Returns
+ * - `SmtcResult::Success` on success, `out_handle` will be set to a valid
+ *   handle.
+ * - `SmtcResult::CreationFailed` on failure, `out_handle` will be set to
+ *   `NULL`.
  *
- * # 安全性
- * 调用者有责任确保 `out_handle` 指向一个有效的 `*mut SmtcHandle` 内存位置。
- * 返回的句柄必须在不再需要时通过 `smtc_suite_destroy` 释放，以避免资源泄漏。
- * 导出此函数是安全的，因为它不依赖于任何不安全的前置条件，并且其操作是独立的。
+ * # Safety
+ * The caller is responsible for ensuring `out_handle` points to a valid memory
+ * location for a `*mut SmtcHandle`. The returned handle must be freed via
+ * `smtc_suite_destroy` when no longer needed to avoid resource leaks.
+ * Exporting this function is safe as it has no unsafe preconditions and its
+ * operation is self-contained.
  */
 enum SmtcResult smtc_suite_create(struct SmtcHandle **out_handle);
 
 /**
- * 销毁 SMTC 控制器实例，并释放所有相关资源。
+ * Destroys the SMTC controller instance and releases all associated resources.
  *
- * 这是一个安全的操作，即使传入 `NULL` 指针也不会导致问题。
- * 此函数会优雅地关闭后台线程。它会同步阻塞，等待回调线程退出，
- * 但最多等待 5 秒。如果回调线程在此时间内未退出（例如被 C 端回调阻塞），
- * 函数将记录警告并返回，这可能导致线程资源泄漏。
+ * This is a safe operation, even if a `NULL` pointer is passed.
+ * This function gracefully shuts down the background thread. It will block
+ * synchronously to wait for the callback thread to exit, but for a maximum of
+ * 5 seconds. If the callback thread does not exit within this time (e.g.,
+ * blocked by a C-side callback), the function will log a warning and return,
+ * which may lead to a thread resource leak.
  *
- * # 安全性
- * - `handle_ptr` 必须是一个由 `smtc_suite_create` 返回且尚未被销毁的有效指针。
- * - 在调用此函数后，`handle_ptr` 将变为无效（悬垂）指针，不应再次使用。
- *   导出此函数是安全的，因为它正确处理了 `NULL` 输入并管理其拥有的资源的生命周期。
+ * # Safety
+ * - `handle_ptr` must be a valid pointer returned by `smtc_suite_create` that
+ *   has not yet been destroyed.
+ * - After calling this function, `handle_ptr` becomes an invalid (dangling)
+ *   pointer and should not be used again. Exporting this function is safe as
+ *   it correctly handles `NULL` input and manages the lifecycle of the
+ *   resources it owns.
  */
 void smtc_suite_destroy(struct SmtcHandle *handle_ptr);
 
 /**
- * 为给定的句柄注册一个回调函数，以接收所有媒体更新。
+ * Registers a callback function for the given handle to receive all media
+ * updates.
  *
- * 每次调用都会替换掉之前的回调。要注销回调，请传入一个 `NULL` 函数指针。
+ * Each call will replace the previous callback. To unregister, pass a `NULL`
+ * function pointer.
  *
- * # 注意
- * - **线程模型**: 回调函数将在一个由本库管理的**独立后台线程**上被调用。
- *   调用者需要确保在回调函数中的所有操作都是线程安全的。
- * - **数据生命周期**: 传递给回调函数的 `data` 指针（例如 `CNowPlayingInfo*`）
- *   **仅在回调函数的执行期间有效**。如果需要保留这些数据，必须在回调内部进行深拷贝。
- * - **阻塞警告**: 回调函数不应长时间阻塞，否则可能导致 `smtc_suite_destroy` 调用超时。
+ * # Notes
+ * - Threading Model: The callback function will be invoked on a separate
+ *   background thread managed by this library. The caller must ensure that all
+ *   operations within the callback are thread-safe.
+ * - Data Lifetime: The `data` pointer passed to the callback (e.g.,
+ *   `CNowPlayingInfo*`) is only valid for the duration of the callback's
+ *   execution. If you need to retain this data, you must perform a deep copy
+ *   inside the callback.
+ * - Blocking Warning: The callback function should not block for long periods,
+ *   as this could cause the `smtc_suite_destroy` call to time out.
  *
- * # 参数
- * - `handle_ptr`: 一个由 `smtc_suite_create` 返回的有效句柄。
- * - `callback`: 用于接收更新的函数指针。传入 `NULL` 以注销当前的回调。
- * - `userdata`: 一个用户自定义的上下文指针，它将被原样传递给回调函数。
+ * # Arguments
+ * - `handle_ptr`: A valid handle returned by `smtc_suite_create`.
+ * - `callback`: A function pointer to receive updates. Pass `NULL` to
+ *   unregister the current callback.
+ * - `userdata`: A user-defined context pointer that will be passed back to the
+ *   callback as-is.
  *
- * # 安全性
- * - `handle_ptr` 必须是一个有效的、尚未被销毁的 `SmtcHandle` 指针。
- * - 调用者必须保证 `userdata` 指针在所有回调的生命周期内都保持有效。
- *   导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ * # Safety
+ * - `handle_ptr` must be a valid, non-destroyed `SmtcHandle` pointer.
+ * - The caller must guarantee that the `userdata` pointer remains valid for
+ *   the entire lifetime of any callback. Exporting this function is safe as it
+ *   interacts with internal state via the handle and validates its inputs.
  */
 enum SmtcResult smtc_suite_register_update_callback(struct SmtcHandle *handle_ptr,
                                                     UpdateCallback callback,
                                                     void *userdata);
 
 /**
- * 获取当前库的版本字符串。
+ * Gets the current library version string.
  *
- * # 返回
- * 一个指向静态 UTF-8 字符串的指针，表示库的版本（例如 "0.1.0"）。
- * 该指针永久有效，调用者无需释放。
+ * # Returns
+ * A pointer to a static UTF-8 string literal representing the library version
+ * (e.g., "0.1.0"). The caller does not need to free it.
  *
- * # 安全性
- * 导出此函数是安全的，因为它不接受任何输入并返回一个静态的、常量的数据。
+ * # Safety
+ * Exporting this function is safe as it takes no input and returns static,
+ * constant data.
  */
 const char *smtc_suite_get_version(void);
 
 /**
- * 请求一次全面的状态刷新。
- * 此函数会触发 `SessionsChanged` 和 `TrackChangedForced` 事件。
+ * Requests a comprehensive status refresh.
+ * This will trigger `SessionsChanged` event.
  */
 enum SmtcResult smtc_suite_request_update(struct SmtcHandle *handle_ptr);
 
 /**
- * 向 SMTC 套件发送一个媒体控制命令。
+ * Sends a media control command to the smtc-suite.
  *
- * # 安全性
- * `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
- * 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ * # Safety
+ * `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+ * Exporting this function is safe as it interacts with internal state via the
+ * handle and validates its inputs.
  */
 enum SmtcResult smtc_suite_control_command(struct SmtcHandle *handle_ptr,
                                            struct CSmtcControlCommand command);
 
 /**
- * 启用或禁用高频进度更新。
+ * Enables or disables high-frequency progress updates.
  *
- * 当启用时，库会以 100ms 的固定间隔主动发送 `TrackChanged` 更新事件，
- * 以便实现平滑的进度条。禁用后，`TrackChanged` 事件仅在 SMTC
- * 报告真实变化时才发送。
+ * When enabled, the library will proactively send `TrackChanged` update events
+ * at a fixed interval of 100ms to allow for smooth progress bars. When
+ * disabled, `TrackChanged` events are only sent when SMTC reports a genuine
+ * change.
  *
- * # 参数
- * - `handle_ptr`: 一个由 `smtc_suite_create` 返回的有效句柄。
- * - `enabled`: `true` 表示启用高频更新，`false` 表示禁用。
+ * # Arguments
+ * - `handle_ptr`: A valid handle returned by `smtc_suite_create`.
+ * - `enabled`: `true` to enable high-frequency updates, `false` to disable.
  *
- * # 返回
- * - `SmtcResult::Success` 表示命令已成功发送。
- * - `SmtcResult::InvalidHandle` 如果句柄无效。
- * - `SmtcResult::InternalError` 如果命令发送失败（例如后台线程已关闭）。
+ * # Returns
+ * - `SmtcResult::Success` if the command was sent successfully.
+ * - `SmtcResult::InvalidHandle` if the handle is invalid.
+ * - `SmtcResult::InternalError` if the command fails to send (e.g., background
+ *   thread is down).
  *
- * # 安全性
- * `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
- * 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ * # Safety
+ * `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+ * Exporting this function is safe as it interacts with internal state via the
+ * handle and validates its inputs.
  */
 enum SmtcResult smtc_suite_set_high_frequency_progress_updates(struct SmtcHandle *handle_ptr,
                                                                bool enabled);
 
 /**
- * 选择一个 SMTC 会话进行监控。
+ * Selects an SMTC session for monitoring.
  *
- * # 参数
- * - `session_id`: 目标会话的 ID (UTF-8 编码, Null 结尾)。传入空字符串或 `NULL` 以切换到自动选择模式。
+ * # Arguments
+ * - `session_id`: The ID of the target session (UTF-8 encoded,
+ *   Null-terminated). Pass an empty string or `NULL` to switch to
+ *   auto-selection mode.
  *
- * # 安全性
- * `handle_ptr` 必须有效。如果 `session_id` 非 `NULL`，它必须指向一个有效的 C 字符串。
- * 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ * # Safety
+ * `handle_ptr` must be valid. If `session_id` is not `NULL`, it must point to
+ * a valid C string. Exporting this function is safe as it interacts with
+ * internal state via the handle and validates its inputs.
  */
-enum SmtcResult smtc_suite_select_session(struct SmtcHandle *handle_ptr,
-                                          const char *session_id);
+enum SmtcResult smtc_suite_select_session(struct SmtcHandle *handle_ptr, const char *session_id);
 
 /**
- * 设置 SMTC 元数据的文本转换模式。
+ * Sets the text conversion mode for SMTC metadata.
  *
- * 这是从 C 语言调用以控制简繁转换行为的函数。
+ * This is the function called from C to control the Simplified/Traditional
+ * Chinese conversion behavior.
  *
- * # 安全性
+ * # Safety
  *
- * 调用者必须确保 `controller_ptr` 是一个由 `smtc_start` 返回的有效指针，
- * 并且在调用此函数时没有被释放。
+ * The caller must ensure that `handle_ptr` is a valid pointer returned by
+ * `smtc_suite_create` and has not been freed at the time this function is
+ * called.
  */
 enum SmtcResult smtc_suite_set_text_conversion_mode(struct SmtcHandle *handle_ptr,
                                                     CTextConversionMode mode);
 
 /**
- * 请求开始音频捕获。
+ * Requests to start audio capture.
  *
- * # 安全性
- * `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
- * 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ * # Safety
+ * `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+ * Exporting this function is safe as it interacts with internal state via the
+ * handle and validates its inputs.
  */
 enum SmtcResult smtc_suite_start_audio_capture(struct SmtcHandle *handle_ptr);
 
 /**
- * 请求停止音频捕获。
+ * Requests to stop audio capture.
  *
- * # 安全性
- * `handle_ptr` 必须是一个由 `smtc_suite_create` 返回的有效指针。
- * 导出此函数是安全的，因为它通过句柄与内部状态交互，并对输入进行验证。
+ * # Safety
+ * `handle_ptr` must be a valid pointer returned by `smtc_suite_create`.
+ * Exporting this function is safe as it interacts with internal state via the
+ * handle and validates its inputs.
  */
 enum SmtcResult smtc_suite_stop_audio_capture(struct SmtcHandle *handle_ptr);
 
 /**
- * 初始化日志系统，并将所有日志消息重定向到指定的 C 回调函数。
+ * Initializes the logging system and redirects all log messages to the
+ * specified C callback function.
  *
- * 这个函数在整个程序的生命周期中只应被调用一次。
+ * This function should only be called once during the entire program's
+ * lifetime.
  *
- * # 参数
- * - `callback`: 用于接收日志消息的函数指针。不能为 NULL。
- * - `userdata`: 将被原样传递给回调函数的用户自定义指针。
- * - `max_level`: 要捕获的最高日志级别。
+ * # Arguments
+ * - `callback`: A function pointer to receive log messages. Cannot be NULL.
+ * - `userdata`: A user-defined pointer that will be passed back to the
+ *   callback as-is.
+ * - `max_level`: The highest log level to capture.
  *
- * # 返回
- * - `SmtcResult::Success`: 如果成功初始化。
- * - `SmtcResult::InternalError`: 如果日志系统已经被初始化过，或者发生其他内部错误。
+ * # Returns
+ * - `SmtcResult::Success`: If initialization is successful.
+ * - `SmtcResult::InternalError`: If the logging system has already been
+ *   initialized, or another internal error occurs.
  *
- * # 安全性
- * 必须保证 `callback` 是一个有效的指针。
+ * # Safety
+ * `callback` must be a valid function pointer.
  */
 enum SmtcResult smtc_suite_init_logging(LogCallback callback,
                                         void *userdata,
