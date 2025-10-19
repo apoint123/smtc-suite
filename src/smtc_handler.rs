@@ -42,6 +42,7 @@ use crate::{
 };
 
 const SEEK_DETECTION_THRESHOLD_MS: u64 = 2000;
+const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
 
 struct MonitoredSessionGuard {
     session: MediaSession,
@@ -226,6 +227,24 @@ struct PlaybackInfoUpdate {
     controls: Controls,
 }
 
+struct TaskHandles {
+    volume_easing: Option<(JoinHandle<()>, CancellationToken)>,
+    media_properties: Option<JoinHandle<()>>,
+    cover_fetch: Option<JoinHandle<()>>,
+    progress_timer: Option<(JoinHandle<()>, CancellationToken)>,
+}
+
+impl TaskHandles {
+    const fn new() -> Self {
+        Self {
+            volume_easing: None,
+            media_properties: None,
+            cover_fetch: None,
+            progress_timer: None,
+        }
+    }
+}
+
 /// Encapsulates all mutable state for the `run_smtc_listener` main event loop.
 struct SmtcState {
     /// RAII guard for the currently monitored session and its event handlers.
@@ -239,11 +258,8 @@ struct SmtcState {
     text_conversion_mode: TextConversionMode,
     /// The `OpenCC` converter instance created based on the current mode.
     text_converter: Option<OpenCC>,
-    /// The handle and cancellation token for the active volume easing task.
-    active_volume_easing_task: Option<(JoinHandle<()>, CancellationToken)>,
-    active_media_properties_task: Option<JoinHandle<()>>,
-    active_cover_fetch_task: Option<JoinHandle<()>>,
-    active_progress_timer_task: Option<(JoinHandle<()>, CancellationToken)>,
+    /// Active background task handles.
+    tasks: TaskHandles,
     is_manager_ready: bool,
     next_easing_task_id: Arc<std::sync::atomic::AtomicU64>,
     last_failed_cover_track: Option<(String, String)>,
@@ -258,10 +274,7 @@ impl SmtcState {
             target_session_id: None,
             text_conversion_mode: TextConversionMode::default(),
             text_converter: None,
-            active_volume_easing_task: None,
-            active_media_properties_task: None,
-            active_cover_fetch_task: None,
-            active_progress_timer_task: None,
+            tasks: TaskHandles::new(),
             is_manager_ready: false,
             next_easing_task_id: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_failed_cover_track: None,
@@ -307,6 +320,10 @@ struct SmtcRunner {
 }
 
 impl SmtcRunner {
+    fn is_event_for_current_session(&self, event_session_id: &str) -> bool {
+        self.context.state.borrow().current_session_id().as_deref() == Some(event_session_id)
+    }
+
     async fn run(&mut self) -> Result<()> {
         let (smtc_event_tx, mut smtc_event_rx) = tokio_channel::<SmtcEventSignal>(32);
         let (progress_signal_tx, mut progress_signal_rx) = tokio_channel::<()>(32);
@@ -520,18 +537,16 @@ impl SmtcRunner {
     fn on_set_progress_timer(&self, enabled: bool, progress_signal_tx: &TokioSender<()>) {
         let mut state = self.context.state.borrow_mut();
         if enabled {
-            if state.active_progress_timer_task.is_none() {
-                log::debug!("[SmtcRunner] Enabling progress timer.");
+            if state.tasks.progress_timer.is_none() {
                 let cancel_token = CancellationToken::new();
                 let handle = tokio::task::spawn_local(tasks::progress_timer_task(
                     self.context.player_state_arc.clone(),
                     progress_signal_tx.clone(),
                     cancel_token.clone(),
                 ));
-                state.active_progress_timer_task = Some((handle, cancel_token));
+                state.tasks.progress_timer = Some((handle, cancel_token));
             }
-        } else if let Some((task, token)) = state.active_progress_timer_task.take() {
-            log::debug!("[SmtcRunner] Disabling progress timer.");
+        } else if let Some((task, token)) = state.tasks.progress_timer.take() {
             token.cancel();
             tokio::task::spawn_local(async move {
                 let _ = task.await;
@@ -600,13 +615,13 @@ impl SmtcRunner {
     }
 
     fn handle_media_properties_signal(&self, event_session_id: String) {
-        let mut state = self.context.state.borrow_mut();
-
-        if state.current_session_id().as_deref() != Some(event_session_id.as_str()) {
+        if !self.is_event_for_current_session(&event_session_id) {
             return;
         }
 
-        if let Some(old_task) = state.active_media_properties_task.take() {
+        let mut state = self.context.state.borrow_mut();
+
+        if let Some(old_task) = state.tasks.media_properties.take() {
             old_task.abort();
         }
 
@@ -620,16 +635,14 @@ impl SmtcRunner {
             }
         });
 
-        state.active_media_properties_task = Some(new_task_handle);
+        state.tasks.media_properties = Some(new_task_handle);
     }
 
     async fn handle_playback_info_update(
         &self,
         (event_session_id, update): (String, PlaybackInfoUpdate),
     ) -> WinResult<()> {
-        if self.context.state.borrow().current_session_id().as_deref()
-            != Some(event_session_id.as_str())
-        {
+        if !self.is_event_for_current_session(&event_session_id) {
             return Ok(());
         }
 
@@ -658,9 +671,7 @@ impl SmtcRunner {
         let mut payload = {
             let mut state_guard = self.context.player_state_arc.lock().await;
 
-            if self.context.state.borrow().current_session_id().as_deref()
-                != Some(event_session_id.as_str())
-            {
+            if !self.is_event_for_current_session(&event_session_id) {
                 return Ok(());
             }
 
@@ -720,7 +731,7 @@ impl SmtcRunner {
             {
                 let session_id_str = hstring_to_string(&id_hstr);
                 if !session_id_str.is_empty() {
-                    if let Some((old_task, old_token)) = state.active_volume_easing_task.take() {
+                    if let Some((old_task, old_token)) = state.tasks.volume_easing.take() {
                         old_token.cancel();
                         tokio::task::spawn_local(async move {
                             let _ = old_task.await;
@@ -735,7 +746,7 @@ impl SmtcRunner {
                         session_id_str,
                         context.connector_update_tx.clone(),
                     );
-                    state.active_volume_easing_task = Some((handle, cancel_token));
+                    state.tasks.volume_easing = Some((handle, cancel_token));
                 }
             }
             return Ok(());
@@ -1011,7 +1022,7 @@ impl SmtcRunner {
 
         let session_candidates = self.get_sessions().await?;
 
-        let new_session_to_monitor = self.select_session_to_monitor(session_candidates).await?;
+        let new_session_to_monitor = self.select_session_to_monitor(session_candidates)?;
 
         self.update_monitoring_session(new_session_to_monitor, smtc_event_tx)
             .await?;
@@ -1066,7 +1077,7 @@ impl SmtcRunner {
         Ok(session_candidates)
     }
 
-    async fn select_session_to_monitor(
+    fn select_session_to_monitor(
         &self,
         candidates: Vec<(String, MediaSession)>,
     ) -> WinResult<Option<MediaSession>> {
@@ -1087,29 +1098,18 @@ impl SmtcRunner {
 
         if let Some(target_id) = target_session_id.as_ref() {
             if let Some((_, session)) = candidates.into_iter().find(|(id, _)| id == target_id) {
-                Ok(Some(session))
-            } else {
-                log::warn!("[Session Handler] Target session '{target_id}' has vanished.");
-                let _ = self
-                    .context
-                    .connector_update_tx
-                    .send(InternalUpdate::SelectedSmtcSessionVanished(
-                        target_id.clone(),
-                    ))
-                    .await;
-                self.context.state.borrow_mut().target_session_id = None;
-                match manager.GetCurrentSession() {
-                    Ok(session) => Ok(Some(session)),
-                    Err(e) if e.code().is_ok() => Ok(None),
-                    Err(e) => Err(e),
-                }
+                return Ok(Some(session));
             }
-        } else {
-            match manager.GetCurrentSession() {
-                Ok(session) => Ok(Some(session)),
-                Err(e) if e.code().is_ok() => Ok(None),
-                Err(e) => Err(e),
-            }
+            log::warn!("[Session Handler] Target session '{target_id}' has vanished.");
+            let _ = self.context.connector_update_tx.try_send(
+                InternalUpdate::SelectedSmtcSessionVanished(target_id.clone()),
+            );
+        }
+
+        match manager.GetCurrentSession() {
+            Ok(session) => Ok(Some(session)),
+            Err(e) if e.code().is_ok() => Ok(None),
+            Err(e) => Err(e),
         }
     }
 
@@ -1320,7 +1320,6 @@ fn parse_and_convert_properties(
 
     let title = get_prop_string(props.Title(), "Title");
 
-    const IGNORED_TITLES: &[&str] = &["正在连接…", "Connecting…"];
     if IGNORED_TITLES.iter().any(|&ignored| title == ignored) {
         return None;
     }
@@ -1407,7 +1406,7 @@ fn spawn_cover_fetch_task(
 ) {
     if let Ok(thumb_ref) = props.Thumbnail() {
         let mut state = context.state.borrow_mut();
-        if let Some(old_task) = state.active_cover_fetch_task.take() {
+        if let Some(old_task) = state.tasks.cover_fetch.take() {
             old_task.abort();
         }
 
@@ -1419,7 +1418,7 @@ fn spawn_cover_fetch_task(
             SmtcRunner::on_cover_data_ready(context_clone, result).await;
         });
 
-        state.active_cover_fetch_task = Some(cover_task);
+        state.tasks.cover_fetch = Some(cover_task);
     }
 }
 
@@ -1526,10 +1525,10 @@ pub async fn run_smtc_listener(
     let tasks_to_clean = {
         let mut state = runner.context.state.borrow_mut();
         (
-            state.active_volume_easing_task.take(),
-            state.active_cover_fetch_task.take(),
-            state.active_media_properties_task.take(),
-            state.active_progress_timer_task.take(),
+            state.tasks.volume_easing.take(),
+            state.tasks.cover_fetch.take(),
+            state.tasks.media_properties.take(),
+            state.tasks.progress_timer.take(),
         )
     };
 
