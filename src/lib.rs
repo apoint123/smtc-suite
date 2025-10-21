@@ -110,8 +110,8 @@ mod volume_control;
 mod worker;
 
 pub use api::{
-    Controls, MediaCommand, MediaController, MediaUpdate, NowPlayingInfo, PlaybackStatus,
-    RepeatMode, SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
+    Controls, MediaCommand, MediaController, MediaType, MediaUpdate, NowPlayingInfo,
+    PlaybackStatus, RepeatMode, SmtcControlCommand, SmtcSessionInfo, TextConversionMode,
 };
 pub use error::{Result, SmtcError};
 
