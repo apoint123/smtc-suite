@@ -8,6 +8,48 @@
 #include <stdint.h>
 #include <stdlib.h>
 
+typedef enum SmtcResult {
+  Success,
+  InvalidHandle,
+  CreationFailed,
+  InternalError,
+  ChannelFull,
+} SmtcResult;
+
+/**
+ * Defines the update event types sent from Rust to C.
+ */
+typedef enum CUpdateType {
+  /**
+   * data pointer type: `*const CNowPlayingInfo` (regular update)
+   */
+  TrackChanged,
+  /**
+   * data pointer type: `*const CSessionList`
+   */
+  SessionsChanged,
+  /**
+   * data pointer type: `*const CAudioDataPacket`
+   */
+  AudioData,
+  /**
+   * data pointer type: `*const c_char` (error message string)
+   */
+  Error,
+  /**
+   * data pointer type: `*const CVolumeChangedEvent`
+   */
+  VolumeChanged,
+  /**
+   * data pointer type: `*const c_char` (ID of the vanished session)
+   */
+  SelectedSessionVanished,
+  /**
+   * data pointer type: `*const CDiagnosticInfo`
+   */
+  Diagnostic,
+} CUpdateType;
+
 /**
  * C-ABI compatible command type tag.
  */
@@ -21,17 +63,6 @@ typedef enum CControlCommandType {
   SetShuffle,
   SetRepeatMode,
 } CControlCommandType;
-
-/**
- * C-ABI compatible log level enum.
- */
-typedef enum CLogLevel {
-  Error = 1,
-  Warn = 2,
-  Info = 3,
-  Debug = 4,
-  Trace = 5,
-} CLogLevel;
 
 /**
  * C-ABI compatible repeat mode enum.
@@ -79,46 +110,15 @@ enum CTextConversionMode {
 typedef uint8_t CTextConversionMode;
 
 /**
- * Defines the update event types sent from Rust to C.
+ * C-ABI compatible log level enum.
  */
-typedef enum CUpdateType {
-  /**
-   * data pointer type: `*const CNowPlayingInfo` (regular update)
-   */
-  TrackChanged,
-  /**
-   * data pointer type: `*const CSessionList`
-   */
-  SessionsChanged,
-  /**
-   * data pointer type: `*const CAudioDataPacket`
-   */
-  AudioData,
-  /**
-   * data pointer type: `*const c_char` (error message string)
-   */
-  Error,
-  /**
-   * data pointer type: `*const CVolumeChangedEvent`
-   */
-  VolumeChanged,
-  /**
-   * data pointer type: `*const c_char` (ID of the vanished session)
-   */
-  SelectedSessionVanished,
-  /**
-   * data pointer type: `*const CDiagnosticInfo`
-   */
-  Diagnostic,
-} CUpdateType;
-
-typedef enum SmtcResult {
-  Success,
-  InvalidHandle,
-  CreationFailed,
-  InternalError,
-  ChannelFull,
-} SmtcResult;
+typedef enum CLogLevel {
+  Error = 1,
+  Warn = 2,
+  Info = 3,
+  Debug = 4,
+  Trace = 5,
+} CLogLevel;
 
 /**
  * The core controller handle on the Rust side.
