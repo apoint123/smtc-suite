@@ -716,7 +716,7 @@ pub unsafe extern "C" fn smtc_suite_control_command(
 /// Enables or disables high-frequency progress updates.
 ///
 /// When enabled, the library will proactively send `TrackChanged` update events
-/// at a fixed interval of 100ms to allow for smooth progress bars. When
+/// at a fixed interval of 16ms to allow for smooth progress bars. When
 /// disabled, `TrackChanged` events are only sent when SMTC reports a genuine
 /// change.
 ///

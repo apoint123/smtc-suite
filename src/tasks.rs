@@ -98,7 +98,7 @@ pub async fn progress_timer_task(
     progress_signal_tx: tokio::sync::mpsc::Sender<()>,
     cancel_token: CancellationToken,
 ) {
-    let mut interval = tokio::time::interval(TokioDuration::from_millis(100));
+    let mut interval = tokio::time::interval(TokioDuration::from_millis(16));
 
     loop {
         tokio::select! {

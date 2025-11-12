@@ -406,7 +406,7 @@ pub enum MediaCommand {
     /// Enables or disables high-frequency progress updates.
     ///
     /// When enabled, smtc-suite will actively send `TrackChanged` events at a
-    /// 100ms interval to simulate a smooth progress bar.
+    /// 16ms interval to simulate a smooth progress bar.
     SetHighFrequencyProgressUpdates(bool),
     /// Sets an offset for the current playback position in milliseconds.
     SetProgressOffset(i64),
