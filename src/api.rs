@@ -141,7 +141,7 @@ impl SharedPlayerState {
         };
 
         // Apply the user offset and the Apple Music optimization offset.
-        let total_offset = self.apple_music_optimization_offset_ms - self.position_offset_ms;
+        let total_offset = -self.apple_music_optimization_offset_ms - self.position_offset_ms;
         let offset_pos = (base_pos as i64 + total_offset).max(0) as u64;
 
         // Ensure the estimated position does not
