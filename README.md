@@ -1,5 +1,8 @@
 # smtc-suite
 
+> [!WARNING]
+> This crate is abandoned because there are too many specific business logics and not stable for production use
+
 [![Crates.io](https://img.shields.io/crates/v/smtc-suite.svg)](https://crates.io/crates/smtc-suite)
 [![Docs.rs](https://docs.rs/smtc-suite/badge.svg)](https://docs.rs/smtc-suite)
 
